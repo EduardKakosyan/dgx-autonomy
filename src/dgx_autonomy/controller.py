@@ -84,7 +84,16 @@ from .runtime import (
     DockerError,
     agent_container_name,
 )
-from .state import Demo, Operation, OperationKind, Recovery, Run, StateStore, WriterLockError
+from .state import (
+    Demo,
+    Operation,
+    OperationKind,
+    Recovery,
+    Run,
+    StateStore,
+    WriterLockError,
+    operation_id,
+)
 
 log = logging.getLogger("dgx_autonomy.controller")
 
@@ -399,18 +408,27 @@ class Controller:
         run = self._resolve(args)
         view = self._run_view(run)
         view["stop_requested"] = run.stop_requested
-        if run.phase == "stopped" and run.conversation_id is not None:
-            # The Agent Server is gone; read what the SDK persisted.
-            conv_dir = self.paths(run.id).conversations_dir
-            view["conversation_status"] = persisted_status(conv_dir, run.conversation_id)
-            last = persisted_events(conv_dir, run.conversation_id, 0, 1, last=True)
-            view["last_event"] = asdict(last[0]) if last else None
-        else:
+        snap = None
+        if run.phase != "stopped":
             snap = self._snapshots.get(run.id)
             if snap is None and run.conversation_id is not None:
                 snap = self._try_inspect(run)
-            view["conversation_status"] = snap.status if snap else None
-            view["last_event"] = asdict(snap.last_event) if snap and snap.last_event else None
+        if snap is not None:
+            view["conversation_status"] = snap.status
+            view["last_event"] = asdict(snap.last_event) if snap.last_event else None
+        elif run.conversation_id is not None and run.terminal:
+            # The Agent Server is gone (stopped, or not brought back after a restart);
+            # read what the SDK persisted.
+            conv_dir = self.paths(run.id).conversations_dir
+            saved = persisted_status(conv_dir, run.conversation_id)
+            # An Agent Server killed mid-step never saved its last status; `running`
+            # on disk for an ended run only says the stop cut it off.
+            view["conversation_status"] = "interrupted" if saved == "running" else saved
+            last = persisted_events(conv_dir, run.conversation_id, 0, 1, last=True)
+            view["last_event"] = asdict(last[0]) if last else None
+        else:
+            view["conversation_status"] = None
+            view["last_event"] = None
         view["operations"] = [
             {"kind": o.kind, "status": o.status, "resource_id": o.resource_id, "error": o.error}
             for o in self._state.operations(run.id)
@@ -684,6 +702,7 @@ class Controller:
            running resource it created is adopted; otherwise the step creates or
            starts it again. Either way the attempt's timeouts restart now.
         3. An open recovery restarts from inspection, not from its recorded steps.
+        4. The retained demos of runs that had already ended come back (demo-only).
 
         The reconcile loop does the rest: it brings back a llama-server or sandbox
         that is down, and attaches to the run's one conversation.
@@ -707,10 +726,51 @@ class Controller:
             "expired": expired,
             "retried": retried,
             "resuming": [r.id for r in self._state.active_runs() if r.phase != "stopping"],
+            "demos": self._restore_retained_demos(),
         }
         log.info("startup reconciliation: %s", summary)
         self._wake.set()
         return summary
+
+    def _restore_retained_demos(self) -> list[str]:
+        """Bring back the demos of runs that had ended before the restart.
+
+        A sandbox that went down (with the DGX, or on its own) is started again
+        demo-only and the recorded demo command is relaunched; the agent does not come
+        back. A sandbox that no longer exists (the operator removed it) stays gone.
+        """
+        restored = []
+        for run in self._state.list_runs():
+            if not run.terminal:
+                continue
+            demo = self._state.get_demo(run.id)
+            if demo is None or demo.command is None or demo.state not in ("starting", "running"):
+                continue
+            try:
+                container = self._runtime.inspect_container(agent_container_name(run.id))
+                if container is None or container.running:
+                    continue
+                # Before the start: the supervisor must not bring the Agent Server back.
+                self._write_control(run.id, "mode", "demo-only\n")
+                op = self._state.get_operation(run.id, "workspace.create")
+                self._ensure_workspace(
+                    run.id, op.id if op else operation_id(run.id, "workspace.create")
+                )
+                handle = self._runtime.ensure_demo(DemoSpec(run.id, demo.command, demo.port))
+            except (DockerError, EgressPolicyError) as exc:
+                log.warning("%s: cannot bring the retained demo back: %s", run.id, exc)
+                continue
+            demo = self._state.set_demo_state(
+                run.id,
+                state="starting",
+                message="relaunched from the recorded spec after the sandbox restarted",
+                now=self._clock.now(),
+                session_id=handle.session_id,
+            )
+            self._publish_demo_status(demo)
+            log.info("%s (%s): retained demo relaunched demo-only", run.id, run.phase)
+            restored.append(run.id)
+        return restored
 
     def _observe_resource(self, run: Run, op: Operation) -> ContainerState | None:
         """What an interrupted attempt of `op` left behind, found by inspection."""
@@ -768,6 +828,16 @@ class Controller:
                 except Exception:
                     # Keep the loop alive; the next tick retries from durable state.
                     log.exception("reconcile %s failed", run.id)
+            # A demo relaunched for an ended run (by a stop, or at startup) still has
+            # to be seen listening; ended runs are not reconciled otherwise.
+            for demo in self._state.demos_in_state("starting"):
+                ended = self._state.get_run(demo.run_id)
+                if ended is None or not ended.terminal or demo.session_id is None:
+                    continue
+                try:
+                    self._check_demo_start(ended, demo)
+                except Exception:
+                    log.exception("demo check %s failed", ended.id)
 
     def _phase_is(self, run_id: str, *phases: str) -> bool:
         """Re-read the phase: a stop may have moved the run on during a slow step."""

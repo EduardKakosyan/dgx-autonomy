@@ -222,6 +222,12 @@ policy: the controller decides whether they come back. Nothing needs the laptop.
   starts at once; further ones within an hour back off from 30 s, doubling, up to
   15 minutes. Recovery never ends the run; the deadline does. `status` lists every
   recovery with its cause and steps.
+- **Retained demos.** On startup, a run that had already ended gets its demo back
+  if its sandbox is down but still exists: the sandbox is started `demo-only` (no
+  Agent Server) and the recorded demo command is relaunched. A sandbox the operator
+  removed stays removed, and a demo that had failed is not retried. `status` then
+  reads the conversation from what the SDK saved; `interrupted` means the Agent
+  Server was killed mid-step (its last saved status was `running`).
 
 `fault.inject` (control op, used by `tests/dgx/test_controller_kill.py`) crashes the
 controller, a run's sandbox or the llama-server on purpose; `confirm` must repeat

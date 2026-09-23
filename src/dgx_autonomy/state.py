@@ -705,6 +705,13 @@ class StateStore:
         assert demo is not None
         return demo
 
+    def demos_in_state(self, state: DemoState) -> list[Demo]:
+        with self._lock:
+            rows = self._db.execute(
+                "select * from demos where state = ? order by run_id", (state,)
+            ).fetchall()
+        return [_demo(r) for r in rows]
+
     def get_demo(self, run_id: str) -> Demo | None:
         with self._lock:
             row = self._db.execute("select * from demos where run_id = ?", (run_id,)).fetchone()

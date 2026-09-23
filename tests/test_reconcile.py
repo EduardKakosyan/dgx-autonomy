@@ -167,7 +167,7 @@ def test_a_killed_controller_reattaches_to_the_same_conversation(harness: Harnes
     assert run is not None
 
     summary = _restart(h, timedelta(seconds=20))
-    assert summary == {"expired": [], "retried": [], "resuming": [run_id]}
+    assert summary == {"expired": [], "retried": [], "resuming": [run_id], "demos": []}
     for _ in range(3):
         h.controller.reconcile_once()
 
