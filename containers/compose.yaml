@@ -1,0 +1,61 @@
+# The operator runs this once, with sudo (see ../README.md):
+#
+#   sudo docker compose --profile images build
+#   sudo docker compose up -d controller
+#
+# Only the controller is a long-running compose service. The inference and agent
+# containers are created by the controller per run; their services here exist only
+# so `--profile images build` builds all three images.
+#
+# Values come from .env next to this file. scripts/deploy.sh writes it on the DGX.
+
+name: dgx-autonomy
+
+services:
+  controller:
+    image: dgx-autonomy/controller:local
+    build:
+      context: ..
+      dockerfile: containers/controller.Dockerfile
+    restart: unless-stopped
+    environment:
+      DGX_AUTONOMY_DATA: ${DGX_AUTONOMY_DATA:-/var/lib/dgx-autonomy}
+      DGX_AUTONOMY_MODELS: ${DGX_AUTONOMY_MODELS:-/home/jim/models}
+      DGX_AUTONOMY_OPERATOR_UID: ${DGX_AUTONOMY_OPERATOR_UID:?set the operator uid in .env}
+      DGX_AUTONOMY_OPERATOR_GID: ${DGX_AUTONOMY_OPERATOR_GID:?set the operator gid in .env}
+      DGX_AUTONOMY_INFERENCE_IMAGE: dgx-autonomy/inference:f95b0d9
+      DGX_AUTONOMY_AGENT_IMAGE: dgx-autonomy/agent:1.49.4
+    volumes:
+      # The only Docker socket mount in the system.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Same path inside and out, so the bind-mount sources the controller passes to
+      # `docker run` are valid host paths.
+      - ${DGX_AUTONOMY_DATA:-/var/lib/dgx-autonomy}:${DGX_AUTONOMY_DATA:-/var/lib/dgx-autonomy}
+    networks:
+      - internal
+      - egress
+    # No ports: the control API is a unix socket under the data directory.
+
+  inference-image:
+    image: dgx-autonomy/inference:f95b0d9
+    build:
+      context: .
+      dockerfile: inference.Dockerfile
+    profiles: [images]
+
+  agent-image:
+    image: dgx-autonomy/agent:1.49.4
+    build:
+      context: .
+      dockerfile: agent.Dockerfile
+    profiles: [images]
+
+networks:
+  # Controller <-> Agent Server <-> llama-server. No route out.
+  internal:
+    name: dgx-autonomy-internal
+    internal: true
+  # Internet access for the agent's dependency installs and research. Phase 3 puts
+  # host-enforced egress rules on this network; a Docker bridge alone is not a policy.
+  egress:
+    name: dgx-autonomy-egress

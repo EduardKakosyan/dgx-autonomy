@@ -1,0 +1,25 @@
+# Models the controller can serve with its own llama-server.
+#
+# `gguf` is relative to the host models directory (DGX_AUTONOMY_MODELS, default
+# /home/jim/models), which the inference container mounts read-only at /models.
+# `ctx` and `parallel` are starting values, not measurements; Phase 8 replaces
+# them with the qualified settings and flips `status`.
+default: qwen3.6-35b-a3b
+
+models:
+  qwen3.6-35b-a3b:
+    # Apache-2.0 fallback. About 17 GB of weights, so it fits next to claude-qwen.
+    repo: unsloth/Qwen3.6-35B-A3B-GGUF
+    revision: a483e9e6cbd595906af30beda3187c2663a1118c
+    files:
+      - Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf
+    gguf: qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf
+    size_bytes: 16845511648
+    ctx: 65536
+    parallel: 1
+    # "embedded" = the Jinja chat template stored in the GGUF metadata.
+    template: embedded
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    extra_args: []
+    status: unqualified

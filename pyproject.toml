@@ -1,0 +1,58 @@
+[project]
+name = "dgx-autonomy"
+version = "0.1.0"
+description = "Trusted controller for unattended OpenHands coding runs on the DGX Spark"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # Matched set: openhands-tools imports SDK internals, so the three move together.
+    "openhands-sdk==1.49.4",
+    "openhands-tools==1.49.4",
+    "openhands-workspace==1.49.4",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+dgx-autonomy = "dgx_autonomy.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8.3",
+    "ruff>=0.6",
+    "types-pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dgx_autonomy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "dgx: target-host smoke test; needs hugo-dgx1, the running controller and a downloaded model",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dgx_autonomy"]
+# Test helpers imported by bare name (pytest puts tests/ and tests/dgx/ on sys.path).
+known-local-folder = ["fakes", "dgx_helpers"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["dgx_autonomy"]
