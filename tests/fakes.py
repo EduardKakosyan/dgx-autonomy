@@ -672,7 +672,8 @@ def _controller(h: Harness) -> Controller:
         state=h.state,
         catalog=load_models(h.settings.models_file),
         runtime=h.runtime,
-        inference=InferenceManager(h.settings, h.runtime, h.http),
+        # The host's memory is not the test's business (test_runtime.py covers the guard).
+        inference=InferenceManager(h.settings, h.runtime, h.http, available=lambda: None),
         conversations=h.conversation,
         http=h.http,
         clock=h.clock,

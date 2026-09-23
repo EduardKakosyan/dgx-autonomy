@@ -8,8 +8,9 @@ published on the host.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -98,20 +99,56 @@ class InferenceStatus:
         }
 
 
+# Memory a new llama-server must leave available for the agent, its demo and the
+# evaluator's browser (qualification measured about 24 GiB spare on hugo-dgx1).
+LOAD_HEADROOM_BYTES = 8 * 1024**3
+
+
+def mem_available(path: Path = Path("/proc/meminfo")) -> int | None:
+    """Host MemAvailable in bytes (a container sees the host's /proc/meminfo)."""
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 class InferenceManager:
-    def __init__(self, settings: Settings, runtime: ContainerPort, http: HttpClient) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        runtime: ContainerPort,
+        http: HttpClient,
+        available: Callable[[], int | None] = mem_available,
+    ) -> None:
         self._settings = settings
         self._runtime = runtime
         self._http = http
+        self._available = available
 
     def ensure(self, model: ModelConfig) -> ContainerState:
-        """Start (or keep) the owned llama-server for `model`. Never swaps models silently."""
+        """Start (or keep) the owned llama-server for `model`. Never swaps models silently.
+
+        A new server is created only when the host has memory for its weights plus
+        headroom; a model that does not fit next to claude-qwen needs the reservation.
+        """
         current = self._runtime.inspect_container(self._settings.inference_name)
         if current is not None:
             serving = current.labels.get(LABEL_MODEL)
             if serving != model.key:
                 raise ModelMismatchError(
                     f"{self._settings.inference_name} serves {serving!r}, run wants {model.key!r}"
+                )
+        else:
+            available = self._available()
+            needed = model.size_bytes + LOAD_HEADROOM_BYTES
+            if available is not None and available < needed:
+                raise InferenceError(
+                    f"not enough memory to load {model.key}: {available / 1024**3:.1f} GiB"
+                    f" available, {needed / 1024**3:.1f} GiB needed. Hold the reservation"
+                    " first (`dgx-autonomy reserve`), or use a smaller model."
                 )
         return self._runtime.ensure_container(inference_container_spec(self._settings, model))
 

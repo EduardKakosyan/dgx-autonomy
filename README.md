@@ -41,11 +41,17 @@ evaluator containers (uid 10002, no caps, no socket), one per acceptance check:
   The controller starts one disposable evaluator per automated acceptance check when
   the builder claims completion (see [Acceptance checks](#acceptance-checks)).
 
-The default model is `qwen3.6-35b-a3b` (Q3, about 17 GB). It fits next to
-`claude-qwen`, so runs work without displacing it. `dgx-autonomy reserve` displaces
-`claude-qwen` explicitly (see [the reservation](#the-inference-reservation)). That and
-the agent's egress policy are the only host changes the environment makes. Both are
-installed by the operator from `host/`.
+The default model is `qwen3.8-flash-next` (Qwen3.8-Flash-Next, Q3, 83.8 GiB, 125B
+total / 6B active). It qualified on hugo-dgx1 with the whole workload running: all
+tool-call probes passed, a 51K-token prompt ran at 633 tokens/s prefill and 19.5 tokens/s
+decode, and at least 23.9 GiB stayed available. It does not fit next to
+`claude-qwen`, so it needs the reservation (`dgx-autonomy reserve`, see [the
+reservation](#the-inference-reservation)). The controller refuses to load a model that
+the host lacks the memory for. The qualified fallback is `qwen3.6-35b-a3b` (Q3, about
+17 GB, 52.5 tokens/s decode at 51K). It runs next to `claude-qwen`: pass
+`--model qwen3.6-35b-a3b` to `plan` or `launch`. The reservation and the agent's
+egress policy are the only host changes the environment makes. Both are installed by
+the operator from `host/`.
 
 ## Operator setup (once, privileged)
 
@@ -164,7 +170,7 @@ dgx-autonomy stop RUN_ID              # end agent execution now; the demo stays 
 dgx-autonomy tunnel [RUN_ID]          # prints: ssh -N -L <p>:127.0.0.1:<p> hugo-dgx1
 dgx-autonomy ps [RUN_ID]              # the sandbox's processes, by role
 dgx-autonomy runs
-dgx-autonomy inference [status|up]
+dgx-autonomy inference [status|up|stop] [--model M]   # stop, then up, switches models
 dgx-autonomy reserve [--model M]      # displace claude-qwen, start the owned llama-server
 dgx-autonomy release                  # remove the owned llama-server, restore claude-qwen
 dgx-autonomy reservation              # held or not, since when, memory available

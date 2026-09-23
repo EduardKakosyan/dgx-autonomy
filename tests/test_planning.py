@@ -247,7 +247,8 @@ def test_launch_freezes_exactly_the_reviewed_draft(harness: Harness) -> None:
     assert run is not None
     assert run.frozen_digest == reviewed == result["frozen_digest"]
     assert run.launched_at == now and run.deadline_at == now + timedelta(hours=2)
-    assert run.model_key == "qwen3.6-35b-a3b"
+    plan = h.state.get_plan(plan_id)
+    assert plan is not None and run.model_key == plan.model_key  # the planning model
     assert [(c.key, c.kind) for c in h.state.criteria(run.id)] == [
         ("home", "automated"),
         ("version", "automated"),

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from dgx_autonomy.config import PACKAGED_MODELS_FILE, load_models
 from dgx_autonomy.controller import RequestError
 from dgx_autonomy.openhands_adapter import ConversationError, conversation_id_for
 from dgx_autonomy.ports import EventSummary
@@ -14,6 +15,7 @@ from dgx_autonomy.runtime import AGENT_PROJECT_DIR, agent_container_name
 from fakes import Harness
 
 BRIEF = "Create hello.txt in the project directory containing today's date.\n"
+DEFAULT_MODEL = load_models(PACKAGED_MODELS_FILE).default
 
 
 def _launch(h: Harness, **extra: object) -> str:
@@ -91,7 +93,7 @@ def test_launch_to_running_to_finished(harness: Harness) -> None:
     assert request.conversation_id == conversation_id_for(run_id)
     assert request.working_dir == AGENT_PROJECT_DIR
     assert request.llm.base_url == f"{h.settings.inference_url}/v1"
-    assert request.llm.model == "qwen3.6-35b-a3b"
+    assert request.llm.model == DEFAULT_MODEL  # the catalog's default
     assert request.llm.max_output_tokens == 16384
     assert BRIEF.strip() in request.message
     run = h.state.get_run(run_id)

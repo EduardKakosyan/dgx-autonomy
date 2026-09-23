@@ -588,6 +588,9 @@ def cmd_logs(args: argparse.Namespace) -> int:
 def cmd_inference(args: argparse.Namespace) -> int:
     if args.action == "up":
         result = call(_socket(args), "inference.ensure", {"model_key": args.model}, timeout=300)
+    elif args.action == "stop":
+        # Refused while a run or plan uses the model; `up` then loads another one.
+        result = call(_socket(args), "inference.stop", timeout=300)
     else:
         result = call(_socket(args), "inference.status")
     _print(result, args.json)
@@ -801,8 +804,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=float, default=3.0, help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_logs)
 
-    s = sub.add_parser("inference", help="owned llama-server: status, or start it")
-    s.add_argument("action", choices=["status", "up"], nargs="?", default="status")
+    s = sub.add_parser("inference", help="owned llama-server: status, start or stop it")
+    s.add_argument("action", choices=["status", "up", "stop"], nargs="?", default="status")
     s.add_argument("--model", default=None)
     s.set_defaults(func=cmd_inference)
 

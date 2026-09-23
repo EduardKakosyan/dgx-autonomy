@@ -2,9 +2,15 @@
 #
 # `gguf` is relative to the host models directory (DGX_AUTONOMY_MODELS, default
 # /home/jim/models), which the inference container mounts read-only at /models.
-# `ctx` and `parallel` are starting values, not measurements; Phase 8 replaces
-# them with the qualified settings and flips `status`.
-default: qwen3.6-35b-a3b
+# `status: qualified` means `dgx-autonomy qualify` passed on hugo-dgx1 with these
+# settings; `measured` is what it recorded (the controller does not read it). The
+# records are in /var/lib/dgx-autonomy/qualification/<model>/.
+#
+# The default is the preferred model, qualified 2026-09-23. It needs the
+# reservation (`dgx-autonomy reserve`): the controller refuses to load it while
+# claude-qwen holds its memory. Choose the fallback with `--model qwen3.6-35b-a3b`
+# to run next to claude-qwen.
+default: qwen3.8-flash-next
 
 models:
   qwen3.6-35b-a3b:
@@ -21,8 +27,21 @@ models:
     template: embedded
     cache_type_k: q8_0
     cache_type_v: q8_0
+    max_output_tokens: 16384
     extra_args: []
-    status: unqualified
+    status: qualified
+    measured:
+      # dgx-autonomy qualify, 2026-09-23T23:27Z (claude-qwen displaced), record
+      # qualification/qwen3.6-35b-a3b/20260923T232752.json
+      load_seconds: 20.4
+      memory_gib: 17.6
+      tool_call_probes: 5/5
+      long_prompt_tokens: 51415
+      prefill_tokens_per_s: 2119.8
+      decode_tokens_per_s_at_51k: 52.5
+      min_available_gib_with_workload: 23.9
+      swap_growth_gib: 0.0
+      workload_run: 20260923-232902-394983 (VERIFIED)
 
   qwen3.8-flash-next:
     # The preferred model (Qwen Community License 1.0): 125B total / 6B active MoE.
@@ -44,4 +63,16 @@ models:
     cache_type_v: q8_0
     max_output_tokens: 16384
     extra_args: []
-    status: unqualified
+    status: qualified
+    measured:
+      # dgx-autonomy qualify, 2026-09-23T23:20Z (reservation held), record
+      # qualification/qwen3.8-flash-next/20260923T232041.json
+      load_seconds: 40.4
+      memory_gib: 87.7
+      tool_call_probes: 5/5
+      long_prompt_tokens: 51457
+      prefill_tokens_per_s: 632.8
+      decode_tokens_per_s_at_51k: 19.5
+      min_available_gib_with_workload: 23.9
+      swap_growth_gib: 0.0
+      workload_run: 20260923-232304-23ca30 (VERIFIED)

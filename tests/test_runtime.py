@@ -93,7 +93,7 @@ def test_inference_argv_gets_the_gpu_and_a_read_only_model_dir(settings: Setting
     assert _flag_values(argv, "--mount") == [
         f"type=bind,source={settings.models_dir},target=/models,readonly"
     ]
-    assert "dgx-autonomy.model=qwen3.6-35b-a3b" in _flag_values(argv, "--label")
+    assert f"dgx-autonomy.model={model.key}" in _flag_values(argv, "--label")
     assert _flag_values(argv, "--model") == [f"/models/{model.gguf}"]
     assert _flag_values(argv, "--ctx-size") == [str(model.ctx)]
     # A response is bounded even when the client sends no max_tokens.
@@ -356,3 +356,27 @@ def test_run_to_completion_is_attached_and_removed(settings: Settings) -> None:
     argv = runner.commands("run")[0]
     assert argv[:3] == ["docker", "run", "--rm"] and "-d" not in argv
     assert _flag_values(argv, "--dns") == ["1.1.1.1"]
+
+
+def test_a_model_is_not_loaded_without_memory_for_it(tmp_path: Path) -> None:
+    from dgx_autonomy.config import PACKAGED_MODELS_FILE, load_models
+    from dgx_autonomy.inference import InferenceError, InferenceManager, mem_available
+
+    from fakes import FakeHttp, FakeRuntime
+
+    settings = Settings.from_env({})
+    runtime = FakeRuntime(settings)
+    big = load_models(PACKAGED_MODELS_FILE).get("qwen3.8-flash-next")
+    manager = InferenceManager(settings, runtime, FakeHttp(), available=lambda: 56 * 1024**3)
+    with pytest.raises(InferenceError, match="Hold the reservation first"):
+        manager.ensure(big)
+    assert runtime.runs == []
+    roomy = InferenceManager(settings, runtime, FakeHttp(), available=lambda: 110 * 1024**3)
+    roomy.ensure(big)
+    assert runtime.runs == [settings.inference_name]
+    # An existing server is kept (or started again) without a memory check.
+    manager.ensure(big)
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 10 kB\nMemAvailable: 2048 kB\n")
+    assert mem_available(meminfo) == 2048 * 1024
+    assert mem_available(tmp_path / "missing") is None
