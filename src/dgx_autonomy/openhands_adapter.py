@@ -217,7 +217,9 @@ class OpenHandsConversations:
     def inspect(self, server: ServerRef, conversation_id: str) -> ConversationSnapshot:
         info = self._call(server, "GET", f"{CONVERSATIONS}/{conversation_id}", timeout=10.0)
         body = info.body if isinstance(info.body, dict) else {}
-        status = str(body.get("execution_status", "unknown"))
+        # The SDK's ConversationExecutionStatus values: idle, running, paused,
+        # waiting_for_confirmation, finished, error, stuck, deleting.
+        status = str(body.get("execution_status", "unknown")).lower()
         last = self._call(
             server,
             "GET",

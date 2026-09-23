@@ -242,6 +242,15 @@ class DockerRuntime:
             raise DockerError(f"docker rm {name}: {res.stderr.strip()}")
         return True
 
+    def kill_container(self, name: str) -> bool:
+        current = self.inspect_container(name)
+        if current is None or not current.running:
+            return False
+        res = self._docker("kill", name)
+        if res.returncode != 0:
+            raise DockerError(f"docker kill {name}: {res.stderr.strip()}")
+        return True
+
     def network_bridge(self, network: str) -> str | None:
         res = self._docker("network", "inspect", network)
         if res.returncode != 0:

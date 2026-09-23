@@ -112,6 +112,9 @@ class ContainerPort(Protocol):
         ...
 
     def container_logs(self, name: str, tail: int = 40) -> str: ...
+    def kill_container(self, name: str) -> bool:
+        """SIGKILL the container, like a crash (`fault.inject`). False if not running."""
+        ...
 
 
 @dataclass(frozen=True)

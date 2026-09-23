@@ -303,6 +303,18 @@ def test_restart_sandbox(settings: Settings) -> None:
     ]
 
 
+@pytest.mark.parametrize(("running", "killed"), [(True, True), (False, False)])
+def test_kill_container_sigkills_only_a_running_container(
+    settings: Settings, running: bool, killed: bool
+) -> None:
+    name = "dgx-autonomy-agent-r1"
+    runner = FakeRunner(
+        {"docker container inspect": CommandResult(0, _inspect_json(name, running), "")}
+    )
+    assert DockerRuntime(settings, runner).kill_container(name) is killed
+    assert runner.commands("kill") == ([["docker", "kill", name]] if killed else [])
+
+
 def test_network_bridge_reads_the_fixed_name_or_dockers_default(settings: Settings) -> None:
     named = [
         {"Id": "8cd12396a84d0000", "Options": {"com.docker.network.bridge.name": "dgx-egress"}}

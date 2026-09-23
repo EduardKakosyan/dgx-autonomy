@@ -8,29 +8,37 @@ Tables:
   a stable id that is also put on the container as a docker label.
 - `demos`: the demo the agent asked for, and the loopback host port it is published
   on. The controller relaunches exactly this spec if the sandbox has to restart.
+- `recoveries`: each time the controller brought a run's inference or sandbox back
+  after it went down (a crash, a DGX restart), with what it found and did.
+- `controller_lock`: the one controller allowed to write. See `acquire_writer`.
 
-`pragma user_version` records the schema version. Version 1 (Phase 1) databases are
-migrated in place on open.
+`pragma user_version` records the schema version. Older databases are migrated in
+place on open.
 """
 
 from __future__ import annotations
 
+import fcntl
+import json
+import os
 import sqlite3
 import threading
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 RunPhase = Literal["launched", "running", "stopping", "stopped", "finished", "failed"]
 RunOutcome = Literal["finished", "expired", "stopped", "blocked", "failed"]
 OperationKind = Literal["inference.start", "workspace.create", "conversation.start"]
 OperationStatus = Literal["intended", "done", "failed"]
 DemoState = Literal["reserved", "starting", "running", "failed", "refused"]
+RecoveryStatus = Literal["intended", "done", "failed"]
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TERMINAL_PHASES: frozenset[str] = frozenset({"stopped", "finished", "failed"})
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "launched": frozenset({"running", "failed", "stopping"}),
@@ -98,8 +106,43 @@ create table if not exists demos (
 """
 
 
+_RECOVERIES_TABLE = """
+create table if not exists recoveries (
+    id            text primary key,   -- <run_id>.recover.<n>
+    run_id        text not null references runs(id),
+    n             integer not null,
+    cause         text not null,
+    status        text not null check (status in ('intended', 'done', 'failed')),
+    -- The conversation's persisted status before anything was restarted: the Agent
+    -- Server rewrites an interrupted RUNNING conversation to ERROR when it loads it.
+    status_before text,
+    steps         text not null default '{}',   -- JSON: what this attempt did
+    error         text,
+    started_at    text not null,
+    attempted_at  text not null,   -- timeouts count from here; reset on controller start
+    finished_at   text,
+    unique (run_id, n)
+);
+"""
+
+_CONTROLLER_LOCK_TABLE = """
+create table if not exists controller_lock (
+    id          integer primary key check (id = 1),
+    token       text not null,
+    pid         integer not null,
+    host        text not null,
+    boot_id     text not null,
+    acquired_at text not null
+);
+"""
+
+
 class StateError(RuntimeError):
     """A lifecycle rule would be broken."""
+
+
+class WriterLockError(StateError):
+    """Another controller holds the state store, or this one lost it."""
 
 
 def _iso(ts: datetime) -> str:
@@ -139,6 +182,9 @@ class Operation:
     resource_id: str | None
     error: str | None
     created_at: datetime
+    # When the current attempt began. Equal to created_at unless startup
+    # reconciliation retried the operation.
+    attempted_at: datetime
 
 
 @dataclass(frozen=True)
@@ -154,6 +200,32 @@ class Demo:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class Recovery:
+    id: str
+    run_id: str
+    n: int
+    cause: str
+    status: RecoveryStatus
+    status_before: str | None
+    steps: dict[str, Any]
+    error: str | None
+    started_at: datetime
+    attempted_at: datetime
+    finished_at: datetime | None
+
+
+@dataclass(frozen=True)
+class WriterHolder:
+    """Who holds (or last held) the controller writer lock."""
+
+    token: str
+    pid: int
+    host: str
+    boot_id: str
+    acquired_at: datetime
+
+
 def operation_id(run_id: str, kind: OperationKind) -> str:
     return f"{run_id}.{kind}"
 
@@ -162,33 +234,19 @@ def _migrate(db: sqlite3.Connection) -> None:
     version = int(db.execute("pragma user_version").fetchone()[0])
     if version >= SCHEMA_VERSION:
         return
-    has_runs = db.execute(
-        "select 1 from sqlite_master where type = 'table' and name = 'runs'"
-    ).fetchone()
     # Table rebuilds need foreign keys off, and that pragma is a no-op inside a
     # transaction (https://sqlite.org/lang_altertable.html#otheralter).
     db.execute("pragma foreign_keys = off")
     db.execute("begin immediate")
     try:
-        if not has_runs:
-            db.execute(_RUNS_TABLE.format(name="runs"))
-        else:
-            # v1 -> v2: the phase check gains stopping/stopped, three columns are added.
-            db.execute(_RUNS_TABLE.format(name="runs_v2"))
-            db.execute(
-                "insert into runs_v2 (id, phase, model_key, launched_at, deadline_at,"
-                " brief_path, conversation_id, outcome)"
-                " select id, phase, model_key, launched_at, deadline_at, brief_path,"
-                " conversation_id, case when phase in ('finished', 'failed') then phase end"
-                " from runs"
-            )
-            db.execute("drop trigger if exists runs_deadline_immutable")
-            db.execute("drop table runs")
-            db.execute("alter table runs_v2 rename to runs")
-        # execute(), not executescript(): the latter would commit this transaction.
-        db.execute(_DEADLINE_TRIGGER)
-        db.execute(_OPERATIONS_TABLE)
-        db.execute(_DEMOS_TABLE)
+        if version < 2:
+            _migrate_to_v2(db)
+        if version < 3:
+            # v2 -> v3: operations can be retried after a restart; recoveries and the
+            # writer lock are new.
+            db.execute("alter table operations add column attempted_at text")
+            db.execute(_RECOVERIES_TABLE)
+            db.execute(_CONTROLLER_LOCK_TABLE)
         problems = db.execute("pragma foreign_key_check").fetchall()
         if problems:
             raise StateError(f"schema migration broke foreign keys: {problems}")
@@ -199,13 +257,47 @@ def _migrate(db: sqlite3.Connection) -> None:
     db.execute("commit")
 
 
+def _migrate_to_v2(db: sqlite3.Connection) -> None:
+    has_runs = db.execute(
+        "select 1 from sqlite_master where type = 'table' and name = 'runs'"
+    ).fetchone()
+    if not has_runs:
+        db.execute(_RUNS_TABLE.format(name="runs"))
+    else:
+        # v1 -> v2: the phase check gains stopping/stopped, three columns are added.
+        db.execute(_RUNS_TABLE.format(name="runs_v2"))
+        db.execute(
+            "insert into runs_v2 (id, phase, model_key, launched_at, deadline_at,"
+            " brief_path, conversation_id, outcome)"
+            " select id, phase, model_key, launched_at, deadline_at, brief_path,"
+            " conversation_id, case when phase in ('finished', 'failed') then phase end"
+            " from runs"
+        )
+        db.execute("drop trigger if exists runs_deadline_immutable")
+        db.execute("drop table runs")
+        db.execute("alter table runs_v2 rename to runs")
+    # execute(), not executescript(): the latter would commit this transaction.
+    db.execute(_DEADLINE_TRIGGER)
+    db.execute(_OPERATIONS_TABLE)
+    db.execute(_DEMOS_TABLE)
+
+
 class StateStore:
     """Thread-safe: the control socket, the reconcile loop and the deadline watchdog
-    share one store."""
+    share one store.
+
+    The controller calls `acquire_writer` before anything else. From then on every
+    write checks that it still holds the lock, so a controller that lost it cannot
+    change lifecycle state. A store that never acquired it (tests, tooling) is not
+    fenced.
+    """
 
     def __init__(self, path: Path | str) -> None:
-        if str(path) != ":memory:":
+        self._path = str(path)
+        if self._path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._writer_token: str | None = None
+        self._lock_fd: int | None = None
         self._lock = threading.RLock()
         self._db = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
@@ -218,17 +310,85 @@ class StateStore:
     def close(self) -> None:
         with self._lock:
             self._db.close()
+            self._release_file_lock()
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
             self._db.execute("begin immediate")
             try:
+                if self._writer_token is not None:
+                    self._check_writer(self._db)
                 yield self._db
             except BaseException:
                 self._db.execute("rollback")
                 raise
             self._db.execute("commit")
+
+    # --- the writer lock -----------------------------------------------------------
+
+    @property
+    def lock_path(self) -> Path | None:
+        return None if self._path == ":memory:" else Path(self._path).with_suffix(".lock")
+
+    def acquire_writer(
+        self, *, pid: int, host: str, boot_id: str, now: datetime
+    ) -> WriterHolder | None:
+        """Become the only controller writing this store. Returns the previous holder.
+
+        Liveness comes from an exclusive flock on a file next to the database: the
+        kernel releases it when the holder dies, however it dies, so a restarted
+        controller takes over at once, while a second live controller is refused.
+        The lock row records who holds it (and fences writes, see `_tx`); its boot
+        id tells a restart of the controller from a restart of the DGX.
+        """
+        path = self.lock_path
+        if path is not None and self._lock_fd is None:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                holder = self.writer_holder()
+                who = (
+                    f"pid {holder.pid} on {holder.host} since {holder.acquired_at.isoformat()}"
+                    if holder
+                    else "an unknown process"
+                )
+                raise WriterLockError(f"another controller is running ({who})") from None
+            self._lock_fd = fd
+        token = uuid.uuid4().hex
+        with self._lock:
+            self._db.execute("begin immediate")
+            try:
+                row = self._db.execute("select * from controller_lock where id = 1").fetchone()
+                self._db.execute(
+                    "insert or replace into controller_lock"
+                    " (id, token, pid, host, boot_id, acquired_at) values (1, ?, ?, ?, ?, ?)",
+                    (token, pid, host, boot_id, _iso(now)),
+                )
+            except BaseException:
+                self._db.execute("rollback")
+                raise
+            self._db.execute("commit")
+            self._writer_token = token
+        return _holder(row) if row else None
+
+    def writer_holder(self) -> WriterHolder | None:
+        with self._lock:
+            row = self._db.execute("select * from controller_lock where id = 1").fetchone()
+        return _holder(row) if row else None
+
+    def _check_writer(self, db: sqlite3.Connection) -> None:
+        row = db.execute("select token, pid, host from controller_lock where id = 1").fetchone()
+        if row is None or row["token"] != self._writer_token:
+            who = f"pid {row['pid']} on {row['host']}" if row else "nobody"
+            raise WriterLockError(f"this controller lost the writer lock (now held by {who})")
+
+    def _release_file_lock(self) -> None:
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)  # closing the descriptor drops the flock
+            self._lock_fd = None
 
     # --- runs ----------------------------------------------------------------------
 
@@ -382,6 +542,23 @@ class StateStore:
             )
         return self._require_op(op_id)
 
+    def retry_operation(
+        self, op_id: str, now: datetime, *, resource_id: str | None = None
+    ) -> Operation:
+        """Start a new attempt of an operation that is still intended.
+
+        Startup reconciliation uses this after inspecting what the interrupted attempt
+        left behind: `resource_id` is what it observed (None when nothing exists), and
+        the attempt's timeouts count from `now`, not from before the downtime.
+        """
+        with self._tx() as db:
+            db.execute(
+                "update operations set resource_id = ?, attempted_at = ?"
+                " where id = ? and status = 'intended'",
+                (resource_id, _iso(now), op_id),
+            )
+        return self._require_op(op_id)
+
     def fail_operation(self, op_id: str, error: str) -> Operation:
         with self._tx() as db:
             db.execute(
@@ -410,6 +587,90 @@ class StateStore:
         if row is None:
             raise StateError(f"no operation {op_id}")
         return _op(row)
+
+    # --- recoveries ----------------------------------------------------------------
+
+    def begin_recovery(
+        self, run_id: str, *, cause: str, status_before: str | None, now: datetime
+    ) -> Recovery:
+        """Persist the intent to bring a run's resources back, before touching them.
+
+        Returns the open recovery instead if the run already has one.
+        """
+        with self._tx() as db:
+            open_row = db.execute(
+                "select id from recoveries where run_id = ? and status = 'intended'", (run_id,)
+            ).fetchone()
+            if open_row is not None:
+                rec_id = str(open_row["id"])
+            else:
+                n = int(
+                    db.execute(
+                        "select coalesce(max(n), 0) + 1 from recoveries where run_id = ?",
+                        (run_id,),
+                    ).fetchone()[0]
+                )
+                rec_id = f"{run_id}.recover.{n}"
+                db.execute(
+                    "insert into recoveries (id, run_id, n, cause, status, status_before,"
+                    " started_at, attempted_at) values (?, ?, ?, ?, 'intended', ?, ?, ?)",
+                    (rec_id, run_id, n, cause, status_before, _iso(now), _iso(now)),
+                )
+        return self._require_recovery(rec_id)
+
+    def recoveries(self, run_id: str) -> list[Recovery]:
+        with self._lock:
+            rows = self._db.execute(
+                "select * from recoveries where run_id = ? order by n", (run_id,)
+            ).fetchall()
+        return [_recovery(r) for r in rows]
+
+    def open_recovery(self, run_id: str) -> Recovery | None:
+        with self._lock:
+            row = self._db.execute(
+                "select * from recoveries where run_id = ? and status = 'intended'", (run_id,)
+            ).fetchone()
+        return _recovery(row) if row else None
+
+    def record_recovery_steps(self, rec_id: str, steps: dict[str, Any]) -> Recovery:
+        with self._tx() as db:
+            db.execute(
+                "update recoveries set steps = ? where id = ? and status = 'intended'",
+                (json.dumps(steps, sort_keys=True), rec_id),
+            )
+        return self._require_recovery(rec_id)
+
+    def retry_recovery(self, rec_id: str, now: datetime) -> Recovery:
+        """A new attempt of an open recovery (the controller restarted in the middle).
+
+        What the interrupted attempt did is inspected again rather than trusted, so its
+        steps are cleared; cause and status_before are kept.
+        """
+        with self._tx() as db:
+            db.execute(
+                "update recoveries set steps = '{}', attempted_at = ?"
+                " where id = ? and status = 'intended'",
+                (_iso(now), rec_id),
+            )
+        return self._require_recovery(rec_id)
+
+    def finish_recovery(
+        self, rec_id: str, *, status: Literal["done", "failed"], error: str | None, now: datetime
+    ) -> Recovery:
+        with self._tx() as db:
+            db.execute(
+                "update recoveries set status = ?, error = ?, finished_at = ?"
+                " where id = ? and status = 'intended'",
+                (status, error, _iso(now), rec_id),
+            )
+        return self._require_recovery(rec_id)
+
+    def _require_recovery(self, rec_id: str) -> Recovery:
+        with self._lock:
+            row = self._db.execute("select * from recoveries where id = ?", (rec_id,)).fetchone()
+        if row is None:
+            raise StateError(f"no recovery {rec_id}")
+        return _recovery(row)
 
     # --- demos ---------------------------------------------------------------------
 
@@ -521,6 +782,33 @@ def _op(row: sqlite3.Row) -> Operation:
         resource_id=row["resource_id"],
         error=row["error"],
         created_at=_parse(row["created_at"]),
+        attempted_at=_parse(row["attempted_at"] or row["created_at"]),
+    )
+
+
+def _recovery(row: sqlite3.Row) -> Recovery:
+    return Recovery(
+        id=row["id"],
+        run_id=row["run_id"],
+        n=int(row["n"]),
+        cause=row["cause"],
+        status=cast(RecoveryStatus, row["status"]),
+        status_before=row["status_before"],
+        steps=json.loads(row["steps"] or "{}"),
+        error=row["error"],
+        started_at=_parse(row["started_at"]),
+        attempted_at=_parse(row["attempted_at"]),
+        finished_at=_parse(row["finished_at"]) if row["finished_at"] else None,
+    )
+
+
+def _holder(row: sqlite3.Row) -> WriterHolder:
+    return WriterHolder(
+        token=row["token"],
+        pid=int(row["pid"]),
+        host=row["host"],
+        boot_id=row["boot_id"],
+        acquired_at=_parse(row["acquired_at"]),
     )
 
 

@@ -110,12 +110,23 @@ def _print_status(result: dict[str, Any]) -> None:
     last = result.pop("last_event", None)
     demo = result.pop("demo", None)
     evidence = result.pop("stop_evidence", None)
+    recoveries = result.pop("recoveries", [])
+    containers = result.pop("containers", None)
     _print(result, False)
     for op in ops:
         line = f"  {op['kind']:<20} {op['status']}"
         if op.get("error"):
             line += f"  {op['error']}"
         print(line)
+    for c in containers or []:
+        print(f"container   {c['name']} {c['status']}")
+    for rec in recoveries:
+        line = f"recovery #{rec['n']} {rec['status']} ({rec['started_at']}): {rec['cause']}"
+        if rec.get("steps", {}).get("resumed_from"):
+            line += f"; conversation resumed from {rec['steps']['resumed_from']}"
+        print(line)
+        if rec.get("error"):
+            print(f"            {rec['error']}")
     if last:
         print(f"last_event  [{last['kind']}/{last['source']}] {last['text']}")
     if demo:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from dgx_autonomy.state import StateError, StateStore, operation_id
+from dgx_autonomy.state import SCHEMA_VERSION, StateError, StateStore, operation_id
 
 LAUNCH = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
 DEADLINE = LAUNCH + timedelta(hours=40)
@@ -210,11 +210,53 @@ def test_a_phase_1_database_is_migrated_in_place(tmp_path: Path) -> None:
     raw = sqlite3.connect(path)
     with pytest.raises(sqlite3.DatabaseError, match="immutable"):
         raw.execute("update runs set deadline_at = 'x' where id = 'r1'")
-    assert raw.execute("pragma user_version").fetchone()[0] == 2
+    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION
     assert raw.execute("pragma foreign_key_check").fetchall() == []
     raw.close()
     store.close()
     StateStore(path).close()  # opening again is a no-op
+
+
+def test_a_phase_3_database_gains_retries_recoveries_and_the_writer_lock(tmp_path: Path) -> None:
+    from dgx_autonomy import state as st
+
+    path = tmp_path / "state" / "controller.sqlite3"
+    path.parent.mkdir()
+    db = sqlite3.connect(path)
+    db.execute(st._RUNS_TABLE.format(name="runs"))
+    for ddl in (st._DEADLINE_TRIGGER, st._OPERATIONS_TABLE, st._DEMOS_TABLE):
+        db.execute(ddl)
+    db.execute(
+        "insert into runs (id, phase, model_key, launched_at, deadline_at, brief_path)"
+        " values ('r1', 'running', 'm', ?, ?, 'b')",
+        (LAUNCH.isoformat(), DEADLINE.isoformat()),
+    )
+    db.execute(
+        "insert into operations values ('r1.inference.start', 'r1', 'inference.start',"
+        " 'intended', null, null, ?)",
+        (LAUNCH.isoformat(),),
+    )
+    db.execute("pragma user_version = 2")
+    db.commit()
+    db.close()
+
+    store = StateStore(path)
+    [op] = store.operations("r1")
+    assert op.attempted_at == op.created_at == LAUNCH
+    later = LAUNCH + timedelta(hours=1)
+    op = store.retry_operation(op.id, later, resource_id="cid")
+    assert (op.attempted_at, op.created_at, op.resource_id) == (later, LAUNCH, "cid")
+    rec = store.begin_recovery(
+        "r1", cause="the agent sandbox is exited", status_before="running", now=later
+    )
+    assert rec.id == "r1.recover.1" and rec.status == "intended"
+    assert store.begin_recovery("r1", cause="other", status_before=None, now=later) == rec
+    store.finish_recovery(rec.id, status="done", error=None, now=later)
+    assert store.begin_recovery("r1", cause="again", status_before=None, now=later).n == 2
+    assert store.acquire_writer(pid=1, host="h", boot_id="b", now=later) is None
+    run = store.get_run("r1")
+    assert run is not None and run.deadline_at == DEADLINE
+    store.close()
 
 
 def test_stop_request_is_durable_and_first_reason_wins(tmp_path: Path) -> None:

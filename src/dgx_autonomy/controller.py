@@ -18,6 +18,16 @@ this loop, so an SDK call that hangs here cannot delay it. Deadline and `stop` s
 one sequence, `stop_agent`: persist the stop, pause the conversation and cancel its
 LLM call, wait (bounded) for quiet, end every agent process in the sandbox, verify
 none is left, and keep (or relaunch) the demo.
+
+Crashes and restarts. Only the controller holding the state store's writer lock
+operates it. On startup (`reconcile_on_start`) it first expires every run whose
+deadline passed while it, or the DGX, was down, then inspects what each interrupted
+operation left behind before repeating it. After that, a launched or running run
+whose llama-server or sandbox is not running (the DGX restarted, a container
+crashed) is brought back by a recovery: durable intent first, then llama-server,
+the sandbox and its Agent Server, the recorded demo, and finally the run's one
+conversation, which is resumed with a note about what happened. Nothing replays an
+agent tool action, and no recovery moves the deadline.
 """
 
 from __future__ import annotations
@@ -28,6 +38,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import stat
 import threading
 import time
@@ -50,12 +61,14 @@ from .openhands_adapter import (
 )
 from .ports import (
     Clock,
+    ContainerState,
     ConversationPort,
     ConversationRequest,
     ConversationSnapshot,
     DemoSpec,
     DemoStatus,
     EventSummary,
+    EvidenceMessage,
     HttpClient,
     LlmEndpoint,
     RuntimePort,
@@ -67,14 +80,22 @@ from .ports import (
 from .runtime import (
     AGENT_BRIEF_PATH,
     AGENT_PROJECT_DIR,
+    LABEL_OP,
     DockerError,
     agent_container_name,
 )
-from .state import Demo, Operation, OperationKind, Run, StateStore
+from .state import Demo, Operation, OperationKind, Recovery, Run, StateStore, WriterLockError
 
 log = logging.getLogger("dgx_autonomy.controller")
 
 FAILED_CONVERSATION_STATUSES = frozenset({"error", "stuck"})
+# A conversation in one of these states before the restart had ended; recovery
+# leaves it for _observe instead of resuming it.
+_ENDED_CONVERSATION_STATUSES = frozenset({"finished", "error", "stuck"})
+# After a restart: the Agent Server turns an interrupted RUNNING conversation into
+# ERROR (SDK 1.49.4, EventService.start); paused and idle need a run as well.
+_RESUMABLE_CONVERSATION_STATUSES = frozenset({"error", "paused", "idle"})
+FAULT_TARGETS = ("controller", "sandbox", "inference")
 MAX_BRIEF_BYTES = 256 * 1024
 MAX_DEMO_REQUEST_BYTES = 16 * 1024
 MAX_DEMO_COMMAND = 4096
@@ -90,6 +111,10 @@ class SystemClock:
 
 class RequestError(ValueError):
     """A control request is invalid; the message goes back to the CLI as-is."""
+
+
+class RecoveryFailed(RuntimeError):
+    """This recovery attempt cannot finish; a later one retries after a backoff."""
 
 
 @dataclass(frozen=True)
@@ -170,6 +195,33 @@ def agent_message(brief: str) -> str:
     )
 
 
+def recovery_notice(cause: str, *, sandbox_restarted: bool, demo_relaunched: bool) -> str:
+    """What the resumed conversation is told about the interruption."""
+    if sandbox_restarted:
+        lines = [
+            f"Your sandbox was restarted while you were working ({cause}).",
+            "Every process you had started has ended: terminal sessions, servers and"
+            " background jobs.",
+            f"Your files in {AGENT_PROJECT_DIR} are as they were. A tool call that was in"
+            " progress did not complete; check its effects before repeating it.",
+        ]
+    else:
+        lines = [
+            f"The model server was restarted while you were working ({cause}).",
+            "Your last step may have failed because of that.",
+        ]
+    if demo_relaunched:
+        lines.append("The demo was relaunched with the command you gave start_demo.")
+    lines.append("Check the state of the project and continue with the brief.")
+    return "\n".join(lines)
+
+
+def _describe(container: ContainerState | None) -> str:
+    if container is None:
+        return "missing"
+    return f"{container.status} (exit code {container.exit_code})"
+
+
 def _new_run_id(now: datetime) -> str:
     return f"{now:%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
 
@@ -217,6 +269,7 @@ class Controller:
         clock: Clock,
         chown: Callable[[Path, int, int], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        crash: Callable[[], None] | None = None,
     ) -> None:
         self._settings = settings
         self._state = state
@@ -228,6 +281,7 @@ class Controller:
         self._clock = clock
         self._chown = chown if chown is not None else _default_chown
         self._sleep = sleep
+        self._crash = crash if crash is not None else _crash_now
         self._wake = threading.Event()
         self._reconcile_lock = threading.Lock()
         self._snapshots: dict[str, ConversationSnapshot] = {}
@@ -274,7 +328,7 @@ class Controller:
 
     def handle(self, op: str, args: Mapping[str, Any]) -> Any:
         handlers: dict[str, Callable[[Mapping[str, Any]], Any]] = {
-            "ping": lambda a: {"pong": True},
+            "ping": lambda a: {"pong": True, "controller": self._holder_view()},
             "launch": self.launch,
             "status": self.status,
             "runs": lambda a: [self._run_view(r) for r in self._state.list_runs()],
@@ -287,6 +341,7 @@ class Controller:
             "inference.stop": self.inference_stop,
             "network.policy": lambda a: check_policy(self._settings, self._runtime).as_dict(),
             "network.probe": self.network_probe,
+            "fault.inject": self.fault_inject,
         }
         handler = handlers.get(op)
         if handler is None:
@@ -362,7 +417,39 @@ class Controller:
         ]
         view["demo"] = self._demo_view(run)
         view["stop_evidence"] = json.loads(run.stop_evidence) if run.stop_evidence else None
+        view["recoveries"] = [
+            {
+                "n": r.n,
+                "cause": r.cause,
+                "status": r.status,
+                "status_before": r.status_before,
+                "started_at": r.started_at.isoformat(),
+                "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+                "error": r.error,
+                "steps": r.steps,
+            }
+            for r in self._state.recoveries(run.id)
+        ]
+        view["containers"] = self._containers_view(run)
         return view
+
+    def _containers_view(self, run: Run) -> list[dict[str, Any]] | None:
+        """The run's labeled containers as Docker reports them (None if it cannot)."""
+        try:
+            snapshot = self._runtime.inspect(run.id)
+        except DockerError as exc:
+            log.warning("%s: cannot list containers: %s", run.id, exc)
+            return None
+        return [
+            {
+                "name": c.name,
+                "id": c.id,
+                "running": c.running,
+                "status": c.status,
+                "op": c.labels.get(LABEL_OP),
+            }
+            for c in snapshot.containers
+        ]
 
     def logs(self, args: Mapping[str, Any]) -> dict[str, Any]:
         run = self._resolve(args)
@@ -470,6 +557,37 @@ class Controller:
         result["policy"] = check_policy(self._settings, self._runtime).as_dict()
         return result
 
+    def fault_inject(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Crash one component on purpose, as the recovery tests do (diagnostic).
+
+        target: `controller` (this process dies at once, without cleanup; compose
+        restarts it), `sandbox` (SIGKILL the run's agent container) or `inference`
+        (SIGKILL the owned llama-server). `confirm` must repeat the target.
+        """
+        target = args.get("target")
+        if target not in FAULT_TARGETS:
+            raise RequestError(f"target must be one of {', '.join(FAULT_TARGETS)}")
+        if args.get("confirm") != target:
+            raise RequestError(f"fault.inject needs confirm={target!r}")
+        if target == "controller":
+            log.warning("fault injection: the controller crashes now")
+            # After the reply is on its way.
+            threading.Timer(0.5, self._crash).start()
+            return {"target": target, "crashing": True}
+        if target == "sandbox":
+            run = self._resolve(args)
+            if run.terminal:
+                raise RequestError(f"run {run.id} is {run.phase}; its sandbox only serves the demo")
+            name = agent_container_name(run.id)
+        else:
+            name = self._settings.inference_name
+        try:
+            killed = self._runtime.kill_container(name)
+        except DockerError as exc:
+            raise RequestError(str(exc)) from None
+        log.warning("fault injection: %s %s", name, "killed" if killed else "was not running")
+        return {"target": target, "container": name, "killed": killed}
+
     def inference_request(self, args: Mapping[str, Any]) -> dict[str, Any]:
         try:
             res = self._inference.request(
@@ -518,6 +636,111 @@ class Controller:
             log.warning("%s: cannot check the demo: %s", demo.run_id, exc)
             return None
 
+    # --- the writer lock and startup ----------------------------------------------
+
+    def _boot_id(self) -> str:
+        try:
+            return self._settings.boot_id_file.read_text().strip() or "unknown"
+        except OSError:
+            return "unknown"
+
+    def acquire_writer(self) -> None:
+        """Become the only controller operating the state. Raises WriterLockError."""
+        boot_id = self._boot_id()
+        previous = self._state.acquire_writer(
+            pid=os.getpid(), host=socket.gethostname(), boot_id=boot_id, now=self._clock.now()
+        )
+        if previous is None:
+            log.info("writer lock acquired")
+        else:
+            log.warning(
+                "writer lock taken over from pid %s on %s (held since %s); %s",
+                previous.pid,
+                previous.host,
+                previous.acquired_at.isoformat(),
+                "the controller restarted"
+                if previous.boot_id == boot_id
+                else "the DGX restarted since",
+            )
+
+    def _holder_view(self) -> dict[str, Any] | None:
+        holder = self._state.writer_holder()
+        if holder is None:
+            return None
+        return {
+            "token": holder.token,
+            "pid": holder.pid,
+            "host": holder.host,
+            "boot_id": holder.boot_id,
+            "acquired_at": holder.acquired_at.isoformat(),
+        }
+
+    def reconcile_on_start(self) -> dict[str, list[str]]:
+        """Once, with the writer lock held, before the control socket and the loop start.
+
+        1. A run whose deadline passed while the controller (or the DGX) was down is
+           expired: agent execution ends, the demo is kept, nothing is resumed.
+        2. Every operation still `intended` is inspected before it is repeated. A
+           running resource it created is adopted; otherwise the step creates or
+           starts it again. Either way the attempt's timeouts restart now.
+        3. An open recovery restarts from inspection, not from its recorded steps.
+
+        The reconcile loop does the rest: it brings back a llama-server or sandbox
+        that is down, and attaches to the run's one conversation.
+        """
+        now = self._clock.now()
+        expired = self.deadline_watchdog().check_once()
+        retried: list[str] = []
+        for run in self._state.active_runs():
+            if run.phase not in ("launched", "running"):
+                continue
+            for op in self._state.operations(run.id):
+                if op.status == "intended":
+                    self._retry_intent(run, op, now)
+                    retried.append(op.id)
+            rec = self._state.open_recovery(run.id)
+            if rec is not None:
+                self._state.retry_recovery(rec.id, now)
+                log.warning("%s: recovery #%d was interrupted; starting it over", run.id, rec.n)
+                retried.append(rec.id)
+        summary = {
+            "expired": expired,
+            "retried": retried,
+            "resuming": [r.id for r in self._state.active_runs() if r.phase != "stopping"],
+        }
+        log.info("startup reconciliation: %s", summary)
+        self._wake.set()
+        return summary
+
+    def _observe_resource(self, run: Run, op: Operation) -> ContainerState | None:
+        """What an interrupted attempt of `op` left behind, found by inspection."""
+        if op.kind == "inference.start":
+            return self._runtime.inspect_container(self._settings.inference_name)
+        if op.kind == "workspace.create":
+            found = [
+                c for c in self._runtime.inspect(run.id).containers
+                if c.labels.get(LABEL_OP) == op.id
+            ]  # fmt: skip
+            return found[0] if found else None
+        # conversation.start: the step asks the Agent Server before creating anything.
+        return None
+
+    def _retry_intent(self, run: Run, op: Operation, now: datetime) -> None:
+        try:
+            observed = self._observe_resource(run, op)
+        except DockerError as exc:
+            log.warning("%s: cannot inspect %s: %s", run.id, op.kind, exc)
+            observed = None
+        live = observed if observed is not None and observed.running else None
+        self._state.retry_operation(op.id, now, resource_id=live.id if live else None)
+        if live is not None:
+            what = f"adopting running {live.name}"
+        elif observed is not None:
+            what = f"{observed.name} is {observed.status}; starting it again"
+        else:
+            what = "retrying"
+        log.warning("%s: %s was interrupted; %s", run.id, op.kind, what)
+
     # --- reconciliation ------------------------------------------------------------
 
     def wake(self) -> None:
@@ -556,6 +779,8 @@ class Controller:
             # Another thread (the watchdog, a `stop` command) may be on it already.
             self.stop_agent(run.id, block=False)
             return
+        if not self._ensure_live(run):
+            return
         if run.phase == "launched":
             if not self._step_inference(run) or not self._phase_is(run.id, "launched"):
                 return
@@ -587,7 +812,11 @@ class Controller:
         return op
 
     def _timed_out(self, op: Operation, limit_s: float) -> bool:
-        return (self._clock.now() - op.created_at).total_seconds() > limit_s
+        return (self._clock.now() - op.attempted_at).total_seconds() > limit_s
+
+    def _done(self, run_id: str, kind: OperationKind) -> Operation | None:
+        op = self._state.get_operation(run_id, kind)
+        return op if op is not None and op.status == "done" else None
 
     def _step_inference(self, run: Run) -> bool:
         op = self._intent(run, "inference.start")
@@ -733,6 +962,231 @@ class Controller:
         else:
             return
         self._publish_project(run.id)
+
+    # --- recovery ------------------------------------------------------------------
+
+    def _ensure_live(self, run: Run) -> bool:
+        """True when what the run has started so far is up.
+
+        Otherwise it brings the run back (a recovery) and returns False until that is
+        done, so nothing else happens to the run meanwhile.
+        """
+        rec = self._state.open_recovery(run.id)
+        if rec is None:
+            cause = self._down(run)
+            if cause is None:
+                return True
+            if not self._recovery_due(run.id):
+                return False
+            rec = self._state.begin_recovery(
+                run.id, cause=cause, status_before=self._status_before(run), now=self._clock.now()
+            )
+            log.warning(
+                "%s: %s; recovery #%d (conversation was %s)",
+                run.id,
+                cause,
+                rec.n,
+                rec.status_before,
+            )
+        return self._recover(run, rec)
+
+    def _down(self, run: Run) -> str | None:
+        """Why the run needs a recovery, or None when its started resources are up."""
+        causes = []
+        if self._done(run.id, "inference.start"):
+            c = self._runtime.inspect_container(self._settings.inference_name)
+            if c is None or not c.running:
+                causes.append(f"llama-server is {_describe(c)}")
+        if self._done(run.id, "workspace.create"):
+            c = self._runtime.inspect_container(agent_container_name(run.id))
+            if c is None or not c.running:
+                causes.append(f"the agent sandbox is {_describe(c)}")
+        return "; ".join(causes) or None
+
+    def _recovery_due(self, run_id: str) -> bool:
+        """Back off: each recovery within the window waits twice as long as the last."""
+        now = self._clock.now()
+        window_start = now - timedelta(seconds=self._settings.recovery_window_s)
+        recent = [r for r in self._state.recoveries(run_id) if r.started_at >= window_start]
+        if not recent:
+            return True
+        delay = min(
+            self._settings.recovery_backoff_s * 2 ** (len(recent) - 1),
+            self._settings.recovery_backoff_max_s,
+        )
+        last = recent[-1]
+        return now >= (last.finished_at or last.started_at) + timedelta(seconds=delay)
+
+    def _conversation_ref(self, run: Run) -> str | None:
+        """The run's one conversation, if it was (or may have been) created."""
+        if run.conversation_id is not None:
+            return run.conversation_id
+        if self._state.get_operation(run.id, "conversation.start") is not None:
+            return conversation_id_for(run.id)
+        return None
+
+    def _status_before(self, run: Run) -> str | None:
+        """The conversation's status as the SDK persisted it before anything restarts.
+
+        Read now because the restarted Agent Server rewrites an interrupted RUNNING
+        conversation to ERROR. A recovery that failed passes its reading on: it may
+        already have restarted the Agent Server.
+        """
+        previous = self._state.recoveries(run.id)
+        if previous and previous[-1].status == "failed":
+            return previous[-1].status_before
+        cid = self._conversation_ref(run)
+        if cid is None:
+            return None
+        return persisted_status(self.paths(run.id).conversations_dir, cid)
+
+    def _recover(self, run: Run, rec: Recovery) -> bool:
+        """One tick of a recovery: llama-server, then the sandbox and its Agent Server,
+        then the demo, then the conversation. Each step inspects before it acts, so
+        the next tick, or the next controller, can pick the recovery up anywhere."""
+        steps = dict(rec.steps)
+        try:
+            if not self._recover_inference(run, rec, steps):
+                return False
+            if not self._phase_is(run.id, "launched", "running"):
+                return False
+            if not self._recover_sandbox(run, rec, steps):
+                return False
+            if not self._phase_is(run.id, "launched", "running"):
+                return False
+            self._recover_demo(run, rec, steps)
+            if not self._recover_conversation(run, rec, steps):
+                return False
+        except (RecoveryFailed, DockerError, InferenceError, EgressPolicyError) as exc:
+            self._state.finish_recovery(
+                rec.id, status="failed", error=str(exc), now=self._clock.now()
+            )
+            log.error("%s: recovery #%d failed: %s", run.id, rec.n, exc)
+            return False
+        self._state.finish_recovery(rec.id, status="done", error=None, now=self._clock.now())
+        log.info("%s: recovered (#%d): %s", run.id, rec.n, steps)
+        return True
+
+    def _save_steps(self, rec: Recovery, steps: dict[str, Any]) -> None:
+        self._state.record_recovery_steps(rec.id, steps)
+
+    def _waited(self, rec: Recovery, steps: dict[str, Any], key: str) -> float:
+        """Seconds since `key` was first recorded in this attempt (recorded now if new)."""
+        if key not in steps:
+            steps[key] = self._clock.now().isoformat()
+            self._save_steps(rec, steps)
+        return (self._clock.now() - datetime.fromisoformat(steps[key])).total_seconds()
+
+    def _recover_inference(self, run: Run, rec: Recovery, steps: dict[str, Any]) -> bool:
+        if not self._done(run.id, "inference.start"):
+            return True  # the launch step starts the model itself
+        status = self._inference.status()
+        if status.ready:
+            return True
+        if status.container != "running":
+            if "inference_started" in steps:
+                raise RecoveryFailed(f"llama-server stopped again: {status.detail}")
+            container = self._inference.ensure(self._catalog.get(run.model_key))
+            steps["inference_started"] = self._clock.now().isoformat()
+            steps["inference_container"] = container.id
+            self._save_steps(rec, steps)
+            return False
+        if self._waited(rec, steps, "inference_started") > self._settings.inference_load_timeout_s:
+            raise RecoveryFailed(f"llama-server not ready in time ({status.health})")
+        return False
+
+    def _recover_sandbox(self, run: Run, rec: Recovery, steps: dict[str, Any]) -> bool:
+        op = self._done(run.id, "workspace.create")
+        if op is None:
+            return True  # the launch step creates the sandbox itself
+        name = agent_container_name(run.id)
+        container = self._runtime.inspect_container(name)
+        if container is None or not container.running:
+            if "sandbox_started" in steps:
+                logs = self._runtime.container_logs(name)
+                raise RecoveryFailed(f"the agent sandbox stopped again: {_clip(logs)}")
+            # The same container again (docker start), or a new one by the same name
+            # over the same workspace if it is gone. Only inside the egress policy.
+            handle = self._ensure_workspace(run.id, op.id)
+            steps["sandbox_started"] = self._clock.now().isoformat()
+            steps["sandbox_container"] = handle.container_id
+            self._save_steps(rec, steps)
+        if self._http.request("GET", f"{self._server_ref(run.id).url}/health").ok:
+            return True
+        if self._waited(rec, steps, "sandbox_started") > self._settings.agent_start_timeout_s:
+            raise RecoveryFailed("the Agent Server did not become healthy in time")
+        return False
+
+    def _recover_demo(self, run: Run, rec: Recovery, steps: dict[str, Any]) -> None:
+        """Relaunch the recorded demo if its session did not survive."""
+        demo = self._state.get_demo(run.id)
+        if demo is None or demo.command is None or demo.state not in ("starting", "running"):
+            return
+        if demo.session_id is not None:
+            live = self._runtime.demo_status(run.id, demo.session_id, demo.port)
+            if live.alive:
+                return
+        handle = self._runtime.ensure_demo(DemoSpec(run.id, demo.command, demo.port))
+        demo = self._state.set_demo_state(
+            run.id,
+            state="starting",
+            message="relaunched from the recorded spec after the sandbox restarted",
+            now=self._clock.now(),
+            session_id=handle.session_id,
+        )
+        self._publish_demo_status(demo)
+        steps["demo_relaunched"] = handle.session_id
+        self._save_steps(rec, steps)
+
+    def _recover_conversation(self, run: Run, rec: Recovery, steps: dict[str, Any]) -> bool:
+        """Attach to the run's one conversation and resume it if the restart stopped it.
+
+        Never starts a new conversation: while none was created, the launch step
+        creates it.
+        """
+        cid = self._conversation_ref(run)
+        if cid is None or not self._done(run.id, "workspace.create"):
+            return True
+        server = self._server_ref(run.id)
+        try:
+            snap = self._conversations.inspect(server, cid)
+        except ConversationError as exc:
+            if not self._done(run.id, "conversation.start"):
+                return True  # never created; the launch step creates it
+            # The Agent Server may still hold the dead instance's lease on it (<= 45 s).
+            if self._waited(rec, steps, "conversation_wait") > self._settings.agent_start_timeout_s:
+                raise RecoveryFailed(f"cannot reach conversation {cid}: {exc}") from None
+            return False
+        steps["conversation_status"] = snap.status
+        if (
+            snap.status in _RESUMABLE_CONVERSATION_STATUSES
+            and rec.status_before not in _ENDED_CONVERSATION_STATUSES
+        ):
+            # Recorded before it is sent. If this controller dies in between, the next
+            # one sees the conversation running (sent) or still stopped (send again).
+            steps["resumed_from"] = snap.status
+            steps["resumed_at"] = self._clock.now().isoformat()
+            self._save_steps(rec, steps)
+            notice = recovery_notice(
+                rec.cause,
+                sandbox_restarted="sandbox_started" in steps,
+                demo_relaunched="demo_relaunched" in steps,
+            )
+            try:
+                self._conversations.deliver(server, cid, EvidenceMessage(notice))
+            except ConversationError as exc:
+                raise RecoveryFailed(f"cannot resume conversation {cid}: {exc}") from None
+            log.info("%s: conversation %s resumed from %s", run.id, cid, snap.status)
+        else:
+            self._save_steps(rec, steps)
+        return True
+
+    def _abandon_recovery(self, run_id: str, reason: str) -> None:
+        rec = self._state.open_recovery(run_id)
+        if rec is not None:
+            self._state.finish_recovery(
+                rec.id, status="failed", error=f"abandoned: {reason}", now=self._clock.now()
+            )
 
     # --- the demo ------------------------------------------------------------------
 
@@ -884,6 +1338,7 @@ class Controller:
     def _stop_agent_locked(self, run: Run) -> StopEvidence:
         started = self._clock.now()
         notes: list[str] = []
+        self._abandon_recovery(run.id, f"agent execution is ending ({run.outcome or 'stopped'})")
         # 1. A sandbox that (re)starts from now on never starts the Agent Server.
         self._write_control(run.id, "mode", "demo-only\n")
 
@@ -1052,6 +1507,11 @@ def _make_world_readable(root: Path) -> None:
                 os.chmod(path, stat.S_IMODE(st.st_mode) | extra)
 
 
+def _crash_now() -> None:
+    """Die like `docker kill`: no cleanup, no graceful shutdown."""
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
 def _default_chown(path: Path, uid: int, gid: int) -> None:
     # Outside the controller container (tests, a laptop) we are not root; the
     # ownership handoff only matters where the agent container mounts the path.
@@ -1089,6 +1549,13 @@ def serve(settings: Settings | None = None) -> None:
     # Controller state is never mounted anywhere else; keep it private on the host too.
     settings.state_db.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     controller = build_controller(settings)
+    try:
+        # Before anything else, including the socket: a second controller must not
+        # take over the first one's socket either.
+        controller.acquire_writer()
+    except WriterLockError as exc:
+        log.error("%s; not starting", exc)
+        raise SystemExit(1) from None
     stop = threading.Event()
     server = ControlServer(
         settings.socket_path,
@@ -1107,8 +1574,9 @@ def serve(settings: Settings | None = None) -> None:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
     # Before anything can resume a run: a deadline that passed while the controller
-    # was down ends that run's agent execution first.
-    watchdog.check_once()
+    # was down ends that run's agent execution first; interrupted operations are
+    # inspected before the loop repeats them.
+    controller.reconcile_on_start()
     watchdog.start()
     server.start()
     log.info("control socket at %s", settings.socket_path)

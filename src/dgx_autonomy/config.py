@@ -146,6 +146,13 @@ class Settings:
     stop_kill_grace_s: float = 5.0
     # How often the deadline watchdog looks at the clock. Independent of poll_seconds.
     watchdog_interval_s: float = 1.0
+    # Bringing a run's inference or sandbox back after it went down: the first
+    # recovery starts at once; each further one within the window waits twice as
+    # long as the previous, up to the maximum. Recovery never ends the run on its
+    # own; the deadline does.
+    recovery_backoff_s: float = 30.0
+    recovery_backoff_max_s: float = 15 * 60.0
+    recovery_window_s: float = 60 * 60.0
 
     @property
     def runs_dir(self) -> Path:

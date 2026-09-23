@@ -15,6 +15,7 @@ from typing import Any
 
 from dgx_autonomy.config import Settings
 from dgx_autonomy.controller import Controller
+from dgx_autonomy.openhands_adapter import conversation_id_for
 from dgx_autonomy.ports import (
     ContainerSpec,
     ContainerState,
@@ -90,6 +91,10 @@ class FakeRuntime:
         self.containers: dict[str, ContainerState] = {}
         self.specs: dict[str, ContainerSpec] = {}
         self.runs: list[str] = []  # names passed to a (fake) docker run
+        self.started: list[str] = []  # existing, stopped containers started again
+        self.killed: list[str] = []
+        # Called with the run id whenever a sandbox boots with its Agent Server.
+        self.on_agent_boot: list[Callable[[str], None]] = []
         self.logs: dict[str, str] = {}
         self.fail_run: dict[str, str] = {}
         self.trace = trace if trace is not None else []
@@ -128,6 +133,14 @@ class FakeRuntime:
             procs.append(SandboxProcess(pid, 1, pid, "S", "/usr/local/bin/openhands-agent-server"))
         self.procs[run_id] = procs
         self.listening[run_id] = False
+        if mode == "agent":
+            for hook in self.on_agent_boot:
+                hook(run_id)
+
+    def agent_server_up(self, run_id: str) -> bool:
+        return self._running(run_id) and any(
+            "openhands-agent-server" in p.cmd for p in self.procs.get(run_id, [])
+        )
 
     def agent_tool(self, run_id: str, cmd: str = "sleep 100000", *, sid: int | None = None) -> int:
         """Simulate a process the agent's tools started (e.g. under tmux)."""
@@ -145,16 +158,22 @@ class FakeRuntime:
             return current
         if spec.name in self.fail_run:
             raise DockerError(self.fail_run[spec.name])
-        self.runs.append(spec.name)
-        self.specs[spec.name] = spec
-        state = ContainerState(
-            id=f"cid-{spec.name}",
-            name=spec.name,
-            running=True,
-            status="running",
-            exit_code=0,
-            labels=dict(spec.labels),
-        )
+        if current is not None:
+            # docker start: the same container, with the spec it was created with.
+            self.started.append(spec.name)
+            state = replace(current, running=True, status="running", exit_code=0)
+            spec = self.specs[spec.name]
+        else:
+            self.runs.append(spec.name)
+            self.specs[spec.name] = spec
+            state = ContainerState(
+                id=f"cid-{spec.name}",
+                name=spec.name,
+                running=True,
+                status="running",
+                exit_code=0,
+                labels=dict(spec.labels),
+            )
         self.containers[spec.name] = state
         run_id = spec.labels.get(LABEL_RUN)
         if run_id is not None:
@@ -166,6 +185,23 @@ class FakeRuntime:
 
     def container_logs(self, name: str, tail: int = 40) -> str:
         return self.logs.get(name, "")
+
+    def kill_container(self, name: str) -> bool:
+        c = self.containers.get(name)
+        if c is None or not c.running:
+            return False
+        self.killed.append(name)
+        self.exit(name, code=137)
+        return True
+
+    def reboot(self) -> None:
+        """The DGX restarts: every container stops, every sandbox process is gone.
+
+        None of them has a restart policy; only the controller comes back by itself.
+        """
+        for name in list(self.containers):
+            self.exit(name, code=255)
+        self.procs = {run_id: [] for run_id in self.procs}
 
     def remove_container(self, name: str) -> bool:
         self.trace.append(f"rm {name}")
@@ -185,6 +221,9 @@ class FakeRuntime:
             self.containers[name], running=False, status="exited", exit_code=code
         )
         self.logs[name] = logs
+        run_id = self.containers[name].labels.get(LABEL_RUN)
+        if run_id is not None:
+            self.procs[run_id] = []
 
     def inspect(self, run_id: str) -> RuntimeSnapshot:
         found = tuple(c for c in self.containers.values() if c.labels.get(LABEL_RUN) == run_id)
@@ -309,10 +348,18 @@ class FakeConversation:
     event_log: list[EventSummary] = field(default_factory=list)
     fail_start: Exception | None = None
     fail_pause: Exception | None = None
+    fail_deliver: Exception | None = None
     pause_to: str | None = "paused"
     start_gate: threading.Event | None = None
     start_entered: threading.Event = field(default_factory=threading.Event)
     trace: list[str] = field(default_factory=list)
+
+    def server_restarted(self, run_id: str) -> None:
+        """What the Agent Server does when it loads a conversation that was RUNNING
+        when it died: it marks it ERROR (SDK 1.49.4, EventService.start)."""
+        mine = conversation_id_for(run_id)
+        if any(r.conversation_id == mine for r in self.started) and self.status == "running":
+            self.status = "error"
 
     def start(self, request: ConversationRequest) -> str:
         self.start_entered.set()
@@ -345,7 +392,13 @@ class FakeConversation:
         self.interrupted.append(conversation_id)
 
     def deliver(self, server: ServerRef, conversation_id: str, evidence: EvidenceMessage) -> None:
+        self.trace.append("deliver")
+        if self.fail_deliver is not None:
+            raise self.fail_deliver
         self.delivered.append(evidence)
+        # A user message with run=True runs a conversation that is not running.
+        if self.status in ("error", "paused", "idle"):
+            self.status = "running"
 
     def events(
         self, server: ServerRef, conversation_id: str, since: int, limit: int
@@ -377,8 +430,21 @@ class Harness:
         )
 
     def agent_healthy(self, run_id: str) -> None:
+        """The Agent Server answers /health whenever it runs in the sandbox."""
         url = f"http://dgx-autonomy-agent-{run_id}:{self.settings.agent_port}/health"
-        self.http.routes[url] = HttpResponse(200, "OK")
+
+        def health(method: str, body: Any) -> HttpResponse:
+            if self.runtime.agent_server_up(run_id):
+                return HttpResponse(200, "OK")
+            return HttpResponse(0, error="connection refused")
+
+        self.http.routes[url] = health
+
+    def restart_controller(self) -> Controller:
+        """A new controller process over the same state, containers and Agent Server:
+        what compose brings back after the old one was killed."""
+        self.controller = _controller(self)
+        return self.controller
 
     def running_run(self, **launch: Any) -> str:
         """A run that went launched -> running, with its Agent Server in the sandbox."""
@@ -407,9 +473,6 @@ def load_egress_policy(settings: Settings, boot_id: str = BOOT_ID) -> None:
 
 def make_harness(settings: Settings) -> Harness:
     """A Controller wired to fakes, with every side effect observable."""
-    from dgx_autonomy.config import load_models
-    from dgx_autonomy.inference import InferenceManager
-
     load_egress_policy(settings)
 
     clock = FakeClock()
@@ -419,17 +482,27 @@ def make_harness(settings: Settings) -> Harness:
     http = FakeHttp()
     conversation = FakeConversation(trace=trace)
     chowned: list[tuple[str, int, int]] = []
-    controller = Controller(
-        settings=settings,
-        state=state,
-        catalog=load_models(settings.models_file),
-        runtime=runtime,
-        inference=InferenceManager(settings, runtime, http),
-        conversations=conversation,
-        http=http,
-        clock=clock,
-        chown=lambda path, uid, gid: chowned.append((str(path), uid, gid)),
+    runtime.on_agent_boot.append(conversation.server_restarted)
+    h = Harness(settings, clock, state, runtime, http, conversation, None, chowned, trace)  # type: ignore[arg-type]
+    h.controller = _controller(h)
+    return h
+
+
+def _controller(h: Harness) -> Controller:
+    from dgx_autonomy.config import load_models
+    from dgx_autonomy.inference import InferenceManager
+
+    return Controller(
+        settings=h.settings,
+        state=h.state,
+        catalog=load_models(h.settings.models_file),
+        runtime=h.runtime,
+        inference=InferenceManager(h.settings, h.runtime, h.http),
+        conversations=h.conversation,
+        http=h.http,
+        clock=h.clock,
+        chown=lambda path, uid, gid: h.chowned.append((str(path), uid, gid)),
         # Waiting advances fake time, so bounded waits end instantly in tests.
-        sleep=lambda seconds: clock.advance(seconds=seconds),
+        sleep=lambda seconds: h.clock.advance(seconds=seconds),
+        crash=lambda: h.trace.append("controller crashed"),
     )
-    return Harness(settings, clock, state, runtime, http, conversation, controller, chowned, trace)

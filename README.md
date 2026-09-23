@@ -128,7 +128,7 @@ Put the CLI on the PATH once: `ln -sf ~/dgx-autonomy/.venv/bin/dgx-autonomy ~/.l
 
 ```bash
 dgx-autonomy launch --brief brief.md [--budget-hours 40] [--model qwen3.6-35b-a3b]
-dgx-autonomy status [RUN_ID]          # phase, outcome, deadline, demo, stop evidence
+dgx-autonomy status [RUN_ID]          # phase, outcome, deadline, demo, stop evidence, recoveries
 dgx-autonomy logs RUN_ID [--follow]   # summarized OpenHands events
 dgx-autonomy stop RUN_ID              # end agent execution now; the demo stays up
 dgx-autonomy tunnel [RUN_ID]          # prints: ssh -N -L <p>:127.0.0.1:<p> hugo-dgx1
@@ -189,6 +189,44 @@ itself (`&`, `nohup`) end when agent execution ends.
 To open a demo from the laptop, run the command `dgx-autonomy tunnel RUN_ID` prints
 on the DGX, keep it running, and browse to `http://127.0.0.1:<p>/`. The demo is bound
 to DGX loopback only.
+
+### Crashes and DGX restarts
+
+Compose restarts the controller (`restart: unless-stopped`), and Docker starts it
+again after the DGX boots. The llama-server and the sandboxes have no restart
+policy: the controller decides whether they come back. Nothing needs the laptop.
+
+- **Only one controller.** The controller takes an exclusive `flock` on
+  `state/controller.lock` before anything else, including the control socket. The
+  kernel drops it however the holder dies, so a restarted controller takes over at
+  once, and a second one exits. The `controller_lock` row records the holder (pid,
+  container, boot id) and fences every write: a controller that lost the lock
+  cannot change a run.
+- **Offline expiry first.** On startup, a run whose deadline passed while the
+  controller or the DGX was down is recorded `expired` and stopped as usual. Nothing
+  resumes it; the sandbox comes back `demo-only` with the recorded demo.
+- **Inspect before repeating.** Every step (start the model, create the sandbox,
+  start the conversation) commits an intent first and labels its container with the
+  intent's id. An intent left open by a crash is inspected on startup: a running
+  container is adopted, a stopped one is started again, a missing one is created,
+  and the step's timeout restarts. The conversation id is derived from the run id,
+  so a repeated start attaches to the existing conversation.
+- **Recovery.** A launched or running run whose llama-server or sandbox is down is
+  brought back in order: llama-server (until ready), the sandbox (the same
+  container, `docker start`) and its Agent Server, the recorded demo, then the
+  conversation. The status the SDK persisted is read before the Agent Server
+  restarts, because the restarted Agent Server marks a conversation that was
+  `running` as `error` (SDK 1.49.4, `EventService.start`). If it was working, it
+  gets one message saying what happened, which also resumes it. A conversation that
+  had already finished or failed is left for the usual handling. The first recovery
+  starts at once; further ones within an hour back off from 30 s, doubling, up to
+  15 minutes. Recovery never ends the run; the deadline does. `status` lists every
+  recovery with its cause and steps.
+
+`fault.inject` (control op, used by `tests/dgx/test_controller_kill.py`) crashes the
+controller, a run's sandbox or the llama-server on purpose; `confirm` must repeat
+the target. [`tests/dgx/test_reboot.md`](tests/dgx/test_reboot.md) is the checklist
+for a real DGX restart.
 
 ### The agent's network boundary
 
@@ -266,7 +304,8 @@ The sudoers entry (`host/sudoers-autonomy`) lets jim run exactly `reserve`,
 ```text
 /var/lib/dgx-autonomy/            controller-owned (root), mounted at the same path in the controller
   control/control.sock            0600, owned by jim
-  state/controller.sqlite3        runs, operations, demos (never mounted into agent/inference)
+  state/controller.sqlite3        runs, operations, demos, recoveries (never mounted into agent/inference)
+  state/controller.lock           the controller's writer lock (flock)
   policy/egress.json              written by dgx-autonomy-egress: boot id, rules sha256
   reservation/record.json         present while claude-qwen is displaced (host helper)
   reservation/prior/              the unit text and `systemctl cat` before reserve
@@ -298,6 +337,7 @@ not on the non-interactive SSH PATH, so call it by its full path:
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_tool_calls.py tests/dgx/test_trivial_run.py'
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_stop_retains_demo.py -s'
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_egress.py'
+ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_controller_kill.py -s'
 # stops claude-qwen for a few minutes; opt in explicitly:
 ssh hugo-dgx1 'cd ~/dgx-autonomy && DGX_AUTONOMY_RESERVATION_TEST=1 ~/.local/bin/uv run pytest -m dgx tests/dgx/test_reserve_release.py -s'
 ```
@@ -305,4 +345,6 @@ ssh hugo-dgx1 'cd ~/dgx-autonomy && DGX_AUTONOMY_RESERVATION_TEST=1 ~/.local/bin
 `test_stop_retains_demo.py` takes about 6 minutes (a 0.1 h budget). With `-s` it
 prints the stop evidence, including which processes were alive after the pause.
 `test_egress.py` tries every address of the DGX from the agent's network position
-and expects each to be rejected at once, not to time out.
+and expects each to be rejected at once, not to time out. `test_controller_kill.py`
+crashes the controller, and then the whole stack, in the middle of two short runs,
+and expects each run to finish its brief in the same conversation.
