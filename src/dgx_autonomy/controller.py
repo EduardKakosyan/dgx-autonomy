@@ -52,12 +52,21 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import frozen
+from . import frozen, planning
 from .agent_files import AgentFileError, make_world_readable, read_json
 from .config import ConfigError, ModelCatalog, Settings, load_models
 from .deadline import DeadlineWatchdog
 from .egress import EgressPolicyError, check_policy, probe, probe_targets
-from .evaluation import EvaluationError, Evaluator, app_url, failure_message
+from .evaluation import (
+    LABEL_CRITERION,
+    CriterionResult,
+    EvaluationError,
+    Evaluator,
+    app_url,
+    check_container_spec,
+    classify,
+    failure_message,
+)
 from .inference import InferenceError, InferenceManager
 from .openhands_adapter import (
     ConversationError,
@@ -89,8 +98,13 @@ from .runtime import (
     AGENT_CHECKS_DIR,
     AGENT_PROJECT_DIR,
     LABEL_OP,
+    LABEL_PLAN,
+    LABEL_ROLE,
     DockerError,
+    PlannerSpec,
     agent_container_name,
+    planner_container_name,
+    planner_container_spec,
 )
 from .snapshot import GitSnapshots, SnapshotError
 from .state import (
@@ -99,9 +113,11 @@ from .state import (
     Evaluation,
     Operation,
     OperationKind,
+    Plan,
     Recovery,
     Review,
     Run,
+    StateError,
     StateStore,
     WriterLockError,
     operation_id,
@@ -127,6 +143,8 @@ _CLAIM_LOOKBACK = 20
 _FINISH_ACTION = re.compile(r"(^|-> )finish \{")
 # Processes that are the Agent Server itself rather than something a tool started.
 _SERVER_MARKERS = ("openhands-agent-server", ".openvscode-server")
+# The planning REPL shows the planner's messages in full.
+_PLAN_TEXT_LIMIT = 20000
 
 
 class SystemClock:
@@ -191,6 +209,11 @@ class RunPaths:
     @property
     def secrets_dir(self) -> Path:
         return self.root / "secrets"
+
+    @property
+    def dry_runs_dir(self) -> Path:
+        """A plan's dry runs of its draft checks (controller-owned)."""
+        return self.root / "dryruns"
 
 
 @dataclass(frozen=True)
@@ -378,12 +401,18 @@ class Controller:
     def paths(self, run_id: str) -> RunPaths:
         return RunPaths(self._settings.runs_dir / run_id)
 
+    def plan_paths(self, plan_id: str) -> RunPaths:
+        """A plan's directories: the same layout as a run's, without a project."""
+        return RunPaths(self._settings.plans_dir / plan_id)
+
     def _prepare_run_dirs(self, run_id: str) -> RunPaths:
+        return self._prepare_dirs(self.paths(run_id), project=True)
+
+    def _prepare_dirs(self, p: RunPaths, *, project: bool) -> RunPaths:
         """Idempotent. The agent owns its workspace; the controller owns everything else."""
-        p = self.paths(run_id)
-        p.project_dir.mkdir(parents=True, exist_ok=True)
+        (p.project_dir if project else p.agent_dir).mkdir(parents=True, exist_ok=True)
         uid, gid = self._settings.agent_uid, self._settings.agent_gid
-        for d in (p.agent_dir, p.project_dir):
+        for d in (p.agent_dir, p.project_dir) if project else (p.agent_dir,):
             os.chmod(d, 0o755)
             self._chown(d, uid, gid)
         p.secrets_dir.mkdir(mode=0o700, exist_ok=True)
@@ -430,6 +459,16 @@ class Controller:
             "evaluate": self.evaluate,
             "review.request": self.review_request,
             "review.record": self.review_record,
+            "plan.start": self.plan_start,
+            "plan.status": self.plan_status,
+            "plans": lambda a: [self._plan_view(p) for p in self._state.list_plans()],
+            "plan.send": self.plan_send,
+            "plan.events": self.plan_events,
+            "plan.interrupt": self.plan_interrupt,
+            "plan.draft": self.plan_draft,
+            "plan.checks": self.plan_checks,
+            "plan.launch": self.plan_launch,
+            "plan.close": self.plan_close,
         }
         handler = handlers.get(op)
         if handler is None:
@@ -457,14 +496,7 @@ class Controller:
             frozen.validate(brief.encode(), checks)
         except frozen.FrozenError as exc:
             raise RequestError(str(exc)) from None
-        try:
-            budget = float(args.get("budget_hours", self._settings.max_budget_hours))
-        except (TypeError, ValueError):
-            raise RequestError("budget_hours must be a number") from None
-        if not 0 < budget <= self._settings.max_budget_hours:
-            raise RequestError(
-                f"budget_hours must be in (0, {self._settings.max_budget_hours:g}], got {budget:g}"
-            )
+        budget = self._budget_hours(args)
         try:
             model = self._catalog.get(args.get("model_key"))
         except ConfigError as exc:
@@ -472,14 +504,7 @@ class Controller:
 
         now = self._clock.now()
         run_id = _new_run_id(now)
-        paths = self._prepare_run_dirs(run_id)
-        try:
-            agreement = frozen.freeze(paths.frozen_dir, brief.encode(), checks)
-            # Read back what is on disk: that is what the agent and evaluator will see.
-            agreement = frozen.load(paths.frozen_dir, args.get("bundle_digest") or None)
-        except frozen.FrozenError as exc:
-            shutil.rmtree(paths.frozen_dir, ignore_errors=True)
-            raise RequestError(f"refusing to launch: {exc}") from None
+        agreement = self._freeze(run_id, brief.encode(), checks, args.get("bundle_digest") or None)
         run = self._state.create_run(
             run_id=run_id,
             model_key=model.key,
@@ -489,12 +514,39 @@ class Controller:
             frozen_digest=agreement.digest,
             criteria=[c.as_dict() for c in agreement.criteria],
         )
+        return self._launched(run, agreement, source=str(args.get("brief_source", "?")))
+
+    def _budget_hours(self, args: Mapping[str, Any]) -> float:
+        try:
+            budget = float(args.get("budget_hours", self._settings.max_budget_hours))
+        except (TypeError, ValueError):
+            raise RequestError("budget_hours must be a number") from None
+        if not 0 < budget <= self._settings.max_budget_hours:
+            raise RequestError(
+                f"budget_hours must be in (0, {self._settings.max_budget_hours:g}], got {budget:g}"
+            )
+        return budget
+
+    def _freeze(
+        self, run_id: str, brief: bytes, checks: Mapping[str, bytes], expected: str | None
+    ) -> frozen.Frozen:
+        """Write the run's frozen agreement and read it back; nothing is left on refusal."""
+        paths = self._prepare_run_dirs(run_id)
+        try:
+            frozen.freeze(paths.frozen_dir, brief, checks)
+            # Read back what is on disk: that is what the agent and evaluator will see.
+            return frozen.load(paths.frozen_dir, expected)
+        except frozen.FrozenError as exc:
+            shutil.rmtree(paths.frozen_dir, ignore_errors=True)
+            raise RequestError(f"refusing to launch: {exc}") from None
+
+    def _launched(self, run: Run, agreement: frozen.Frozen, *, source: str) -> dict[str, Any]:
         log.info(
             "launched %s (model %s, deadline %s, brief from %s, %d criteria, %s)",
             run.id,
-            model.key,
+            run.model_key,
             run.deadline_at,
-            args.get("brief_source", "?"),
+            source,
             len(agreement.criteria),
             agreement.digest,
         )
@@ -562,6 +614,8 @@ class Controller:
         ]
         view["containers"] = self._containers_view(run)
         view["frozen_digest"] = run.frozen_digest
+        plan = self._state.plan_for_run(run.id)
+        view["plan_id"] = plan.id if plan else None
         criteria = self._state.criteria(run.id)
         view["criteria"] = {
             "automated": sum(1 for c in criteria if c.kind == "automated"),
@@ -950,6 +1004,12 @@ class Controller:
             raise RequestError(
                 f"run {', '.join(active)} still uses the model; `dgx-autonomy stop` it first"
             )
+        planning = [p.id for p in self._state.active_plans()]
+        if planning:
+            raise RequestError(
+                f"plan {', '.join(planning)} still uses the model;"
+                " `dgx-autonomy plan --close PLAN` it first"
+            )
         try:
             removed = self._runtime.remove_container(self._settings.inference_name)
         except DockerError as exc:
@@ -1242,6 +1302,11 @@ class Controller:
                 except Exception:
                     # Keep the loop alive; the next tick retries from durable state.
                     log.exception("reconcile %s failed", run.id)
+            for plan in self._state.active_plans():
+                try:
+                    self._reconcile_plan(plan)
+                except Exception:
+                    log.exception("reconcile plan %s failed", plan.id)
             # A demo relaunched for an ended run (by a stop, or at startup) still has
             # to be seen listening; ended runs are not reconciled otherwise.
             for demo in self._state.demos_in_state("starting"):
@@ -1935,6 +2000,398 @@ class Controller:
             return
         self._state.mark_delivered(ev.id, self._clock.now())
         log.info("%s: evaluation #%d failures delivered to the builder", run.id, ev.n)
+
+    # --- planning --------------------------------------------------------------------
+
+    def _plan(self, args: Mapping[str, Any], *, active: bool = False) -> Plan:
+        """The plan named in `plan_id`, or the latest active one."""
+        plan_id = args.get("plan_id")
+        if plan_id:
+            plan = self._state.get_plan(str(plan_id))
+            if plan is None:
+                raise RequestError(f"no plan {plan_id}")
+        else:
+            plans = self._state.active_plans()
+            if not plans:
+                raise RequestError("no open plan; start one with `dgx-autonomy plan`")
+            plan = plans[-1]
+        if active and not plan.active:
+            which = f", run {plan.run_id}" if plan.run_id else ""
+            raise RequestError(f"plan {plan.id} is {plan.state}{which}")
+        return plan
+
+    def _planner_ref(self, plan_id: str) -> ServerRef:
+        key = (self.plan_paths(plan_id).secrets_dir / "session_api_key").read_text().strip()
+        url = f"http://{planner_container_name(plan_id)}:{self._settings.agent_port}"
+        return ServerRef(url=url, api_key=key)
+
+    def plan_start(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Open a planning session for `request` with the selected model."""
+        request = args.get("request")
+        if not isinstance(request, str) or not request.strip():
+            raise RequestError("plan needs a non-empty request: what do you want to build?")
+        if len(request.encode()) > planning.MAX_REQUEST_BYTES:
+            raise RequestError(f"the request is larger than {planning.MAX_REQUEST_BYTES} bytes")
+        try:
+            model = self._catalog.get(args.get("model_key"))
+        except ConfigError as exc:
+            raise RequestError(str(exc)) from None
+        now = self._clock.now()
+        plan_id = _new_run_id(now)
+        self._prepare_dirs(self.plan_paths(plan_id), project=False)
+        plan = self._state.create_plan(
+            plan_id=plan_id, model_key=model.key, request=request.strip(), now=now
+        )
+        log.info("plan %s opened (model %s)", plan_id, model.key)
+        self._wake.set()
+        return self._plan_view(plan)
+
+    def _plan_view(self, plan: Plan) -> dict[str, Any]:
+        return {
+            "plan_id": plan.id,
+            "state": plan.state,
+            "model_key": plan.model_key,
+            "created_at": plan.created_at.isoformat(),
+            "request": _clip(plan.request, 300),
+            "conversation_id": plan.conversation_id,
+            "error": plan.error,
+            "run_id": plan.run_id,
+            "launched_digest": plan.launched_digest,
+        }
+
+    def _plan_conversation_status(self, plan: Plan) -> str | None:
+        if plan.conversation_id is None:
+            return None
+        if plan.active:
+            try:
+                return self._conversations.inspect(
+                    self._planner_ref(plan.id), plan.conversation_id
+                ).status
+            except (ConversationError, OSError):
+                pass
+        saved = persisted_status(self.plan_paths(plan.id).conversations_dir, plan.conversation_id)
+        return "interrupted" if saved == "running" and not plan.active else saved
+
+    def plan_status(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        plan = self._plan(args)
+        view = self._plan_view(plan)
+        view["conversation_status"] = self._plan_conversation_status(plan)
+        try:
+            container = self._runtime.inspect_container(planner_container_name(plan.id))
+            view["sandbox"] = _describe(container) if container else "removed"
+        except DockerError as exc:
+            view["sandbox"] = f"unknown ({exc})"
+        draft = planning.read_draft(self.plan_paths(plan.id).agent_dir)
+        view["draft"] = {
+            "digest": draft.digest,
+            "problem": draft.problem,
+            "automated": sum(1 for c in draft.criteria if c.kind == "automated"),
+            "human_judgment": sum(1 for c in draft.criteria if c.kind == "human_judgment"),
+        }
+        view["dry_run"] = plan.dry_run
+        return view
+
+    def plan_send(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """The operator's next message; it runs the planner."""
+        plan = self._plan(args, active=True)
+        text = args.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise RequestError("text must be a non-empty message")
+        if len(text.encode()) > planning.MAX_REQUEST_BYTES:
+            raise RequestError(f"the message is larger than {planning.MAX_REQUEST_BYTES} bytes")
+        if plan.conversation_id is None:
+            raise RequestError(f"plan {plan.id} is still starting; wait for the planner")
+        try:
+            self._conversations.deliver(
+                self._planner_ref(plan.id), plan.conversation_id, EvidenceMessage(text)
+            )
+        except ConversationError as exc:
+            raise RequestError(f"the planner cannot take the message now: {exc}") from None
+        return {"plan_id": plan.id, "sent": True}
+
+    def plan_interrupt(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        plan = self._plan(args, active=True)
+        if plan.conversation_id is None:
+            raise RequestError(f"plan {plan.id} has no conversation yet")
+        try:
+            self._conversations.interrupt(self._planner_ref(plan.id), plan.conversation_id)
+        except ConversationError as exc:
+            raise RequestError(str(exc)) from None
+        return {"plan_id": plan.id, "interrupted": True}
+
+    def plan_events(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """The planning conversation, messages in full, from `since` on."""
+        plan = self._plan(args)
+        since = max(0, int(args.get("since", 0)))
+        limit = min(500, max(1, int(args.get("limit", 200))))
+        base = {"plan_id": plan.id, "state": plan.state, "error": plan.error}
+        if plan.conversation_id is None:
+            return {**base, "events": [], "next": since, "conversation_status": None}
+        events: list[EventSummary] | None = None
+        if plan.active:
+            try:
+                events = list(
+                    self._conversations.events(
+                        self._planner_ref(plan.id),
+                        plan.conversation_id,
+                        since,
+                        limit,
+                        text_limit=_PLAN_TEXT_LIMIT,
+                    )
+                )
+            except (ConversationError, OSError) as exc:
+                log.info("plan %s: planner unavailable (%s); reading saved events", plan.id, exc)
+        if events is None:
+            events = persisted_events(
+                self.plan_paths(plan.id).conversations_dir,
+                plan.conversation_id,
+                since,
+                limit,
+                text_limit=_PLAN_TEXT_LIMIT,
+            )
+        return {
+            **base,
+            "events": [asdict(e) for e in events],
+            "next": since + len(events),
+            "conversation_status": self._plan_conversation_status(plan),
+        }
+
+    def plan_draft(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """The draft as it is now, whether it can be launched, and its last dry run."""
+        plan = self._plan(args)
+        draft = planning.read_draft(self.plan_paths(plan.id).agent_dir)
+        view = draft.view()
+        view["plan_id"] = plan.id
+        view["dry_run"] = plan.dry_run
+        view["dry_run_current"] = bool(
+            plan.dry_run and draft.digest and plan.dry_run.get("digest") == draft.digest
+        )
+        return view
+
+    def _planner_busy(self, plan: Plan) -> bool:
+        return self._plan_conversation_status(plan) == "running"
+
+    def plan_checks(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Dry-run the draft checks against an empty target (blocking; minutes at most).
+
+        Each automated check runs in an evaluator container like at evaluation time,
+        over a controller-owned copy of the draft. Its result is recorded on the plan
+        with the draft digest, and told to the planner as context.
+        """
+        plan = self._plan(args, active=True)
+        lock = self._stop_lock(f"plan-dry-run:{plan.id}")
+        if not lock.acquire(blocking=False):
+            raise RequestError(f"a dry run of plan {plan.id} is already running")
+        try:
+            return self._dry_run(plan)
+        finally:
+            lock.release()
+
+    def _dry_run(self, plan: Plan) -> dict[str, Any]:
+        if self._planner_busy(plan):
+            raise RequestError("the planner is still working on the draft; wait for its reply")
+        draft = planning.read_draft(self.plan_paths(plan.id).agent_dir)
+        if (
+            draft.brief is None
+            or draft.digest is None
+            or not any(c.kind == "automated" for c in draft.criteria)
+        ):
+            raise RequestError(f"nothing to dry-run: {draft.problem}")
+        policy = check_policy(self._settings, self._runtime)
+        if not policy.ok:
+            raise RequestError("refusing to run checks: " + "; ".join(policy.problems))
+        root = self.plan_paths(plan.id).dry_runs_dir
+        root.mkdir(mode=0o755, parents=True, exist_ok=True)
+        n = 1 + sum(1 for d in root.iterdir() if d.name.startswith("dry-"))
+        attempt = root / f"dry-{n}"
+        attempt.mkdir(mode=0o755)
+        # The checks run from a controller-owned copy, exactly the draft's bytes.
+        agreement = frozen.freeze(attempt / "agreement", draft.brief, draft.checks)
+        results: dict[str, Any] = {}
+        automated = [c for c in agreement.criteria if c.kind == "automated"]
+        for index, c in enumerate(automated):
+            out = attempt / f"{index}-{c.key}"
+            out.mkdir(mode=0o755)
+            self._chown(out, self._settings.evaluator_uid, self._settings.evaluator_gid)
+            spec = check_container_spec(
+                self._settings,
+                name=f"dgx-autonomy-dryrun-{plan.id}-{n}-{index}",
+                labels={LABEL_PLAN: plan.id, LABEL_ROLE: "dry-run", LABEL_CRITERION: c.key},
+                key=c.key,
+                runner=c.runner,
+                test=c.test,
+                checks_dir=agreement.checks,
+                out_dir=out,
+                url=planning.EMPTY_TARGET,
+            )
+            logs = ""
+            try:
+                code, logs = self._runtime.run_to_completion(spec, self._settings.dry_run_timeout_s)
+            except DockerError as exc:
+                result = CriterionResult("error", f"the check did not complete: {exc}")
+            else:
+                result = classify(c.runner, code, out, logs)
+            _atomic_write(attempt / f"{index}-{c.key}.log", logs, 0o644)
+            results[c.key] = result.as_dict()
+        summary = planning.dry_run_summary(agreement.digest, agreement.criteria, results)
+        summary.update(n=n, at=self._clock.now().isoformat(), evidence_dir=str(attempt))
+        _atomic_write(attempt / "dry-run.json", json.dumps(summary, indent=2), 0o644)
+        make_world_readable(attempt)
+        self._state.record_dry_run(plan.id, summary, self._clock.now())
+        log.info("plan %s: dry run #%d %s", plan.id, n, "ok" if summary["ok"] else "has problems")
+        if plan.conversation_id is not None:
+            try:
+                self._conversations.deliver(
+                    self._planner_ref(plan.id),
+                    plan.conversation_id,
+                    EvidenceMessage(planning.dry_run_message(summary), run=False),
+                )
+            except ConversationError as exc:
+                log.warning("plan %s: cannot tell the planner about the dry run: %s", plan.id, exc)
+        return summary
+
+    def plan_launch(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Freeze exactly the reviewed draft (`digest`) and start the run.
+
+        The deadline is set now, from `budget_hours`. The run uses the plan's model.
+        """
+        plan = self._plan(args, active=True)
+        if plan.state != "open":
+            raise RequestError(f"plan {plan.id} is {plan.state}; it cannot launch yet")
+        reviewed = args.get("digest")
+        if not isinstance(reviewed, str) or not reviewed:
+            raise RequestError("launch needs the digest of the reviewed draft (/draft shows it)")
+        budget = self._budget_hours(args)
+        if self._planner_busy(plan):
+            raise RequestError(
+                "the planner is still working on the draft; wait for its reply (or /interrupt)"
+            )
+        draft = planning.read_draft(self.plan_paths(plan.id).agent_dir)
+        if draft.problem is not None or draft.brief is None:
+            raise RequestError(f"the draft cannot be launched: {draft.problem}")
+        if draft.digest != reviewed:
+            raise RequestError(
+                f"the draft changed since you reviewed it (now {draft.digest}); review it again"
+            )
+        now = self._clock.now()
+        run_id = _new_run_id(now)
+        agreement = self._freeze(run_id, draft.brief, draft.checks, reviewed)
+        try:
+            run = self._state.launch_plan(
+                plan.id,
+                run_id=run_id,
+                model_key=plan.model_key,
+                launched_at=now,
+                deadline_at=now + timedelta(hours=budget),
+                brief_path=str(agreement.brief),
+                frozen_digest=agreement.digest,
+                criteria=[c.as_dict() for c in agreement.criteria],
+            )
+        except StateError as exc:
+            shutil.rmtree(self.paths(run_id).root, ignore_errors=True)
+            raise RequestError(str(exc)) from None
+        self._remove_planner(plan.id)
+        result = self._launched(run, agreement, source=f"plan {plan.id}")
+        result["plan_id"] = plan.id
+        return result
+
+    def plan_close(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Abandon a plan: its sandbox goes, its conversation and draft stay on disk."""
+        plan = self._plan(args, active=True)
+        plan = self._state.set_plan_state(plan.id, "closed", self._clock.now())
+        self._remove_planner(plan.id)
+        log.info("plan %s closed by the operator", plan.id)
+        return self._plan_view(plan)
+
+    def _remove_planner(self, plan_id: str) -> None:
+        try:
+            self._runtime.remove_container(planner_container_name(plan_id))
+        except DockerError as exc:
+            log.warning("plan %s: cannot remove the planner sandbox: %s", plan_id, exc)
+        with contextlib.suppress(OSError):
+            make_world_readable(self.plan_paths(plan_id).agent_dir / planning.DRAFT_DIR_NAME)
+
+    def _fail_plan(self, plan: Plan, error: str) -> None:
+        log.error("plan %s failed: %s", plan.id, error)
+        self._state.set_plan_state(plan.id, "failed", self._clock.now(), error=error)
+        self._remove_planner(plan.id)
+
+    def _reconcile_plan(self, plan: Plan) -> None:
+        """One step towards a planner that answers: the model, the sandbox, the
+        conversation. Each step is idempotent (containers by name, the conversation
+        by its derived id), so a restart simply continues. An open plan whose sandbox
+        went down (a DGX restart) is brought back; its next message resumes it."""
+        starting = plan.state == "starting"
+        waited = (self._clock.now() - plan.created_at).total_seconds()
+        if starting and waited > self._settings.planner_start_timeout_s:
+            self._fail_plan(plan, f"the planner did not come up in {waited:.0f}s")
+            return
+        model = self._catalog.get(plan.model_key)
+        status = self._inference.status()
+        if status.container == "running" and status.model_key not in (None, model.key):
+            self._fail_plan(
+                plan, f"the owned llama-server serves {status.model_key}, the plan uses {model.key}"
+            )
+            return
+        if not status.ready:
+            if status.container != "running":
+                try:
+                    self._inference.ensure(model)
+                except (InferenceError, DockerError) as exc:
+                    self._fail_plan(plan, f"cannot start the model: {exc}")
+            return
+        name = planner_container_name(plan.id)
+        container = self._runtime.inspect_container(name)
+        if container is None or not container.running:
+            paths = self._prepare_dirs(self.plan_paths(plan.id), project=False)
+            if self._settings.require_egress_policy:
+                policy = check_policy(self._settings, self._runtime)
+                if not policy.ok:
+                    self._fail_plan(
+                        plan, "refusing to start the planner: " + "; ".join(policy.problems)
+                    )
+                    return
+            spec = PlannerSpec(
+                plan_id=plan.id,
+                agent_dir=str(paths.agent_dir),
+                control_dir=str(paths.control_dir),
+                session_api_key=(paths.secrets_dir / "session_api_key").read_text().strip(),
+                secret_key=(paths.secrets_dir / "secret_key").read_text().strip(),
+            )
+            try:
+                self._runtime.ensure_container(planner_container_spec(self._settings, spec))
+            except DockerError as exc:
+                self._fail_plan(plan, f"cannot start the planner sandbox: {exc}")
+            return
+        server = self._planner_ref(plan.id)
+        if not self._http.request("GET", f"{server.url}/health").ok:
+            return
+        if plan.conversation_id is not None:
+            return
+        request = ConversationRequest(
+            server=server,
+            conversation_id=conversation_id_for(f"plan-{plan.id}"),
+            working_dir=planning.PLANNER_WORKDIR,
+            llm=LlmEndpoint(
+                model=model.key,
+                base_url=f"{self._settings.inference_url}/v1",
+                max_input_tokens=model.ctx,
+            ),
+            message=planning.planning_message(
+                plan.request,
+                model_key=model.key,
+                max_budget_hours=self._settings.max_budget_hours,
+            ),
+            demo_tool=False,
+        )
+        try:
+            cid = self._conversations.start(request)
+        except ConversationError as exc:
+            log.warning("plan %s: planning conversation start will be retried: %s", plan.id, exc)
+            return
+        self._state.set_plan_conversation(plan.id, cid, self._clock.now())
+        self._state.set_plan_state(plan.id, "open", self._clock.now())
+        log.info("plan %s is open (conversation %s)", plan.id, cid)
 
     # --- the demo ------------------------------------------------------------------
 

@@ -88,7 +88,12 @@ def _budget(value: str) -> float:
 
 
 def cmd_launch(args: argparse.Namespace) -> int:
-    """Launch from a brief file, or a directory with brief.md and checks/."""
+    """Launch from a brief file, or a directory with brief.md and checks/, or a plan."""
+    if getattr(args, "plan", None):
+        return _launch_plan(args)
+    if not args.brief:
+        print("dgx-autonomy: launch needs --brief or --plan", file=sys.stderr)
+        return 2
     brief = Path(args.brief)
     # The controller runs in a container and cannot read the operator's files, so
     # the CLI sends their contents, and the digest of what it read. The controller
@@ -123,6 +128,61 @@ def cmd_launch(args: argparse.Namespace) -> int:
         what = f"{c.runner} checks/{c.test}" if c.kind == "automated" else "human judgment"
         optional = "" if c.required else " (optional)"
         print(f"  {c.key:<24} {what}{optional}")
+    return 0
+
+
+def _launch_plan(args: argparse.Namespace) -> int:
+    """Launch a plan's draft without the REPL: show it, confirm, freeze that digest."""
+    from .plan_repl import PlanSession
+
+    sock = _socket(args)
+
+    def answer(prompt: str) -> str:
+        if not args.yes:
+            return input(prompt)
+        if "force" in prompt:  # the draft's checks have not passed a dry run
+            return "force" if args.skip_dry_run else ""
+        return "y"
+
+    session = PlanSession(
+        lambda op, a=None, **kw: call(sock, op, a, **kw), args.plan, out=sys.stdout, read=answer
+    )
+    return 0 if session.launch(str(args.budget_hours)) else 1
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Plan a run with the model: start a session, or attach to one."""
+    from .plan_repl import PlanSession
+
+    sock = _socket(args)
+    if args.close:
+        result = call(sock, "plan.close", {"plan_id": args.close})
+        _print(result, args.json)
+        return 0
+    if args.attach is not None:
+        plan_id = args.attach or call(sock, "plan.status", {})["plan_id"]
+    else:
+        request = args.request
+        if not request:
+            print("What do you want to build? (end with an empty line)")
+            lines: list[str] = []
+            while (line := input("> " if not lines else "  ")).strip():
+                lines.append(line)
+            request = "\n".join(lines)
+        started = call(sock, "plan.start", {"request": request, "model_key": args.model})
+        plan_id = started["plan_id"]
+    session = PlanSession(lambda op, a=None, **kw: call(sock, op, a, **kw), plan_id, out=sys.stdout)
+    return session.run()
+
+
+def cmd_plans(args: argparse.Namespace) -> int:
+    plans = call(_socket(args), "plans")
+    if args.json:
+        _print(plans, True)
+        return 0
+    for p in plans:
+        run = f"  -> run {p['run_id']}" if p.get("run_id") else ""
+        print(f"{p['plan_id']}  {p['state']:<9} {p['model_key']}{run}  {p['request'][:60]}")
     return 0
 
 
@@ -483,16 +543,36 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("launch", help="start an unattended run from a brief (and its checks)")
-    s.add_argument(
+    source = s.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--brief",
-        required=True,
         help="a brief.md file, or a directory with brief.md and checks/ (criteria.yaml + checks)",
+    )
+    source.add_argument("--plan", help="a plan id: freeze its draft (shown first)")
+    s.add_argument("--yes", action="store_true", help="with --plan: do not ask to confirm")
+    s.add_argument(
+        "--skip-dry-run",
+        action="store_true",
+        help="with --plan --yes: launch even if the draft checks have not passed a dry run",
     )
     s.add_argument("--model", default=None, help="model key from models.yaml (default: default)")
     s.add_argument(
         "--budget-hours", type=_budget, default=MAX_BUDGET_HOURS, help="wall-clock budget (≤40)"
     )
     s.set_defaults(func=cmd_launch)
+
+    s = sub.add_parser("plan", help="plan a run with the model (interactive)")
+    s.add_argument("--request", help="what to build (asked for when missing)")
+    s.add_argument("--model", default=None, help="model key from models.yaml (default: default)")
+    s.add_argument(
+        "--attach", nargs="?", const="", default=None, metavar="PLAN_ID",
+        help="continue a plan (default: the latest open one)",
+    )  # fmt: skip
+    s.add_argument("--close", metavar="PLAN_ID", help="abandon a plan")
+    s.set_defaults(func=cmd_plan)
+
+    s = sub.add_parser("plans", help="list planning sessions")
+    s.set_defaults(func=cmd_plans)
 
     s = sub.add_parser("status", help="phase, deadline, demo and last event of a run")
     s.add_argument("run_id", nargs="?", help="run id (default: the latest run)")

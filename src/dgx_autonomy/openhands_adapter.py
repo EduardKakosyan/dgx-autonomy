@@ -77,8 +77,11 @@ def _texts(content: Any) -> str:
     return " ".join(p for p in parts if p)
 
 
-def summarize_event(raw: Mapping[str, Any]) -> EventSummary:
-    """One readable line per SDK event. Defensive: unknown shapes fall back to the kind."""
+def summarize_event(raw: Mapping[str, Any], text_limit: int = _TEXT_LIMIT) -> EventSummary:
+    """One readable line per SDK event. Defensive: unknown shapes fall back to the kind.
+
+    Messages keep their line breaks when `text_limit` is above the default (the
+    planning REPL shows them in full); everything else is one line."""
     kind = str(raw.get("kind", "Event"))
     text = ""
     if kind == "MessageEvent":
@@ -101,12 +104,18 @@ def summarize_event(raw: Mapping[str, Any]) -> EventSummary:
         text = f"{raw.get('code', '')}: {raw.get('detail', '')}"
     elif kind == "ConversationStateUpdateEvent":
         text = f"{raw.get('key', '')}={_clip(json.dumps(raw.get('value'), default=str), 80)}"
+    if not text:
+        text = kind
+    elif kind == "MessageEvent" and text_limit > _TEXT_LIMIT:
+        text = text.strip() if len(text) <= text_limit else text[: text_limit - 1] + "…"
+    else:
+        text = _clip(text, text_limit)
     return EventSummary(
         id=str(raw.get("id", "")),
         timestamp=str(raw.get("timestamp", "")),
         kind=kind,
         source=str(raw.get("source", "")),
-        text=_clip(text) if text else kind,
+        text=text,
     )
 
 
@@ -177,7 +186,8 @@ class OpenHandsConversations:
         from openhands.sdk import Tool
 
         agent = get_default_agent(llm=llm, cli_mode=True)
-        agent = agent.model_copy(update={"tools": [*agent.tools, Tool(name=DEMO_TOOL_NAME)]})
+        if request.demo_tool:
+            agent = agent.model_copy(update={"tools": [*agent.tools, Tool(name=DEMO_TOOL_NAME)]})
         workspace = RemoteWorkspace(
             host=request.server.url,
             working_dir=request.working_dir,
@@ -243,7 +253,7 @@ class OpenHandsConversations:
         self._call(server, "POST", f"{CONVERSATIONS}/{conversation_id}/interrupt", timeout=15.0)
 
     def deliver(self, server: ServerRef, conversation_id: str, evidence: EvidenceMessage) -> None:
-        self._send(server, conversation_id, evidence.text, run=True)
+        self._send(server, conversation_id, evidence.text, run=evidence.run)
 
     def recent(self, server: ServerRef, conversation_id: str, limit: int) -> Sequence[EventSummary]:
         res = self._call(
@@ -257,7 +267,13 @@ class OpenHandsConversations:
         return [summarize_event(i) for i in items or [] if isinstance(i, dict)]
 
     def events(
-        self, server: ServerRef, conversation_id: str, since: int, limit: int
+        self,
+        server: ServerRef,
+        conversation_id: str,
+        since: int,
+        limit: int,
+        *,
+        text_limit: int = _TEXT_LIMIT,
     ) -> Sequence[EventSummary]:
         """Events [since, since+limit) in timestamp order."""
         out: list[EventSummary] = []
@@ -272,7 +288,7 @@ class OpenHandsConversations:
             items = body.get("items") or []
             for raw in items:
                 if seen >= since and len(out) < limit:
-                    out.append(summarize_event(raw))
+                    out.append(summarize_event(raw, text_limit))
                 seen += 1
             page_id = body.get("next_page_id")
             if not page_id or not items:
@@ -309,6 +325,7 @@ def persisted_events(
     limit: int,
     *,
     last: bool = False,
+    text_limit: int = _TEXT_LIMIT,
 ) -> list[EventSummary]:
     """Events [since, since+limit) from the SDK's event files, in index order.
 
@@ -328,7 +345,7 @@ def persisted_events(
                 except (OSError, ValueError):
                     continue
                 if isinstance(raw, dict):
-                    out.append(summarize_event(raw))
+                    out.append(summarize_event(raw, text_limit))
             return out
     except (OSError, ValueError):
         return []

@@ -106,25 +106,52 @@ def evaluator_spec(
 ) -> ContainerSpec:
     """One criterion's evaluator: frozen checks read-only, its own output directory,
     the demo over the egress network, nothing else."""
-    test = f"{EVALUATOR_CHECKS_DIR}/{criterion.test}"
-    if criterion.runner == "pytest":
-        command: tuple[str, ...] = (
-            EVALUATOR_PYTHON, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rfE",
-            f"--junitxml={EVALUATOR_OUT_DIR}/junit.xml", "-o", "junit_family=xunit2", test,
-        )  # fmt: skip
-    elif criterion.runner == "playwright":
-        command = (EVALUATOR_PLAYWRIGHT, "test", f"--config={EVALUATOR_PLAYWRIGHT_CONFIG}", test)
-    else:
-        raise EvaluationError(f"criterion {criterion.key}: unknown runner {criterion.runner!r}")
-    return ContainerSpec(
+    return check_container_spec(
+        settings,
         name=evaluator_container_name(run_id, ev.n, index),
-        image=settings.evaluator_image,
         labels={
             LABEL_RUN: run_id,
             LABEL_OP: ev.id,
             LABEL_ROLE: "evaluator",
             LABEL_CRITERION: criterion.key,
         },
+        key=criterion.key,
+        runner=criterion.runner,
+        test=criterion.test,
+        checks_dir=checks_dir,
+        out_dir=out_dir,
+        url=url,
+    )
+
+
+def check_container_spec(
+    settings: Settings,
+    *,
+    name: str,
+    labels: Mapping[str, str],
+    key: str,
+    runner: str | None,
+    test: str | None,
+    checks_dir: Path,
+    out_dir: Path,
+    url: str,
+) -> ContainerSpec:
+    """A container that runs one check file against `url` (evaluation, or the
+    planning dry run): the checks read-only at /checks, /out for its report."""
+    path = f"{EVALUATOR_CHECKS_DIR}/{test}"
+    if runner == "pytest":
+        command: tuple[str, ...] = (
+            EVALUATOR_PYTHON, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rfE",
+            f"--junitxml={EVALUATOR_OUT_DIR}/junit.xml", "-o", "junit_family=xunit2", path,
+        )  # fmt: skip
+    elif runner == "playwright":
+        command = (EVALUATOR_PLAYWRIGHT, "test", f"--config={EVALUATOR_PLAYWRIGHT_CONFIG}", path)
+    else:
+        raise EvaluationError(f"criterion {key}: unknown runner {runner!r}")
+    return ContainerSpec(
+        name=name,
+        image=settings.evaluator_image,
+        labels=dict(labels),
         networks=(settings.egress_network,),
         dns=settings.agent_dns,
         mounts=(

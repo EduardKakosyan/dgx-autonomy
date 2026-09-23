@@ -44,6 +44,7 @@ from dgx_autonomy.runtime import (
     agent_container_name,
     agent_container_spec,
     docker_run_argv,
+    planner_container_name,
 )
 from dgx_autonomy.state import StateStore
 
@@ -119,6 +120,9 @@ class FakeRuntime:
         # running (a hung test). Unknown keys pass, in their runner's format.
         self.evaluator_outcomes: dict[str, EvaluatorOutcome | None] = {}
         self.evaluators: list[ContainerSpec] = []
+        # Dry runs of planning checks (run_to_completion): criterion key -> outcome.
+        # None: the check never finishes (a timeout).
+        self.dry_run_outcomes: dict[str, EvaluatorOutcome | None] = {}
         # Called when an evaluator starts, e.g. to have the "agent" change the project.
         self.on_evaluator: list[Callable[[ContainerSpec], None]] = []
         self._next_pid = 100
@@ -242,6 +246,22 @@ class FakeRuntime:
     def run_to_completion(self, spec: ContainerSpec, timeout_s: float) -> tuple[int, str]:
         docker_run_argv(spec, detach=False)  # same safety checks as the real adapter
         self.completed.append(spec)
+        if spec.labels.get(LABEL_ROLE) == "dry-run":
+            # A check against an empty target: by default it runs and fails.
+            key = spec.labels[LABEL_CRITERION]
+            playwright = "playwright" in " ".join(spec.command)
+            default = (
+                playwright_fails("net::ERR_CONNECTION_REFUSED at http://127.0.0.1:3000/")
+                if playwright
+                else pytest_fails("httpx.ConnectError: [Errno 111] Connection refused")
+            )
+            outcome = self.dry_run_outcomes.get(key, default)
+            if outcome is None:
+                raise DockerError(f"{spec.name}: no result in {timeout_s:.0f}s")
+            out = next(Path(m.source) for m in spec.mounts if m.target == EVALUATOR_OUT_DIR)
+            for name, text in outcome.files.items():
+                (out / name).write_text(text)
+            return outcome.exit_code, outcome.logs
         return self.completion_output
 
     def exit(self, name: str, code: int = 1, logs: str = "") -> None:
@@ -437,6 +457,7 @@ class FakeConversation:
     start_gate: threading.Event | None = None
     start_entered: threading.Event = field(default_factory=threading.Event)
     trace: list[str] = field(default_factory=list)
+    event_limits: list[int] = field(default_factory=list)
 
     def server_restarted(self, run_id: str) -> None:
         """What the Agent Server does when it loads a conversation that was RUNNING
@@ -482,12 +503,19 @@ class FakeConversation:
         self.delivered.append(evidence)
         # A user message with run=True runs a conversation that is not running; a
         # FINISHED one is set IDLE first (SDK 1.49.4, LocalConversation.send_message).
-        if self.status in ("error", "paused", "idle", "finished"):
+        if evidence.run and self.status in ("error", "paused", "idle", "finished"):
             self.status = "running"
 
     def events(
-        self, server: ServerRef, conversation_id: str, since: int, limit: int
+        self,
+        server: ServerRef,
+        conversation_id: str,
+        since: int,
+        limit: int,
+        *,
+        text_limit: int = 300,
     ) -> Sequence[EventSummary]:
+        self.event_limits.append(text_limit)
         return self.event_log[since : since + limit]
 
     def recent(self, server: ServerRef, conversation_id: str, limit: int) -> Sequence[EventSummary]:
@@ -536,6 +564,19 @@ class Harness:
 
         def health(method: str, body: Any) -> HttpResponse:
             if self.runtime.agent_server_up(run_id):
+                return HttpResponse(200, "OK")
+            return HttpResponse(0, error="connection refused")
+
+        self.http.routes[url] = health
+
+    def planner_healthy(self, plan_id: str) -> None:
+        """The planner's Agent Server answers /health whenever its sandbox runs."""
+        name = planner_container_name(plan_id)
+        url = f"http://{name}:{self.settings.agent_port}/health"
+
+        def health(method: str, body: Any) -> HttpResponse:
+            c = self.runtime.containers.get(name)
+            if c is not None and c.running:
                 return HttpResponse(200, "OK")
             return HttpResponse(0, error="connection refused")
 

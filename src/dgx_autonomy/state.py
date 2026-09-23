@@ -16,6 +16,8 @@ Tables:
 - `evaluations`: each run of the frozen checks against a pinned project snapshot,
   with its per-criterion results and where its evidence is.
 - `reviews`: manually requested stronger-model reviews, kept apart from the checks.
+- `plans`: interactive planning sessions (planning.py). A plan has no deadline; its
+  launch freezes the agreed draft and creates the run, which gets one then.
 
 `pragma user_version` records the schema version. Older databases are migrated in
 place on open.
@@ -46,8 +48,9 @@ EvaluationResult = Literal["passed", "failed", "inconclusive", "infra_error"]
 EvaluationStatus = Literal["intended", "passed", "failed", "inconclusive", "infra_error"]
 EvaluationTrigger = Literal["claim", "final", "requested"]
 ReviewStatus = Literal["requested", "recorded"]
+PlanState = Literal["starting", "open", "launched", "closed", "failed"]
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 TERMINAL_PHASES: frozenset[str] = frozenset({"stopped", "finished", "failed"})
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "launched": frozenset({"running", "failed", "stopping"}),
@@ -207,6 +210,26 @@ create table if not exists reviews (
 """
 
 
+_PLANS_TABLE = """
+create table if not exists plans (
+    id              text primary key,
+    state           text not null check (state in
+                        ('starting', 'open', 'launched', 'closed', 'failed')),
+    model_key       text not null,
+    request         text not null,      -- the operator's opening request
+    created_at      text not null,
+    updated_at      text not null,
+    conversation_id text,
+    error           text,
+    -- The last dry run of the draft checks (JSON), bound to the draft digest.
+    dry_run         text,
+    -- Set once, at launch: the run the plan became and the digest it froze.
+    run_id          text unique references runs(id),
+    launched_digest text
+);
+"""
+
+
 class StateError(RuntimeError):
     """A lifecycle rule would be broken."""
 
@@ -342,6 +365,26 @@ class Evaluation:
 
 
 @dataclass(frozen=True)
+class Plan:
+    id: str
+    state: PlanState
+    model_key: str
+    request: str
+    created_at: datetime
+    updated_at: datetime
+    conversation_id: str | None
+    error: str | None
+    dry_run: dict[str, Any] | None
+    run_id: str | None
+    launched_digest: str | None
+
+    @property
+    def active(self) -> bool:
+        """Its planner sandbox should be up."""
+        return self.state in ("starting", "open")
+
+
+@dataclass(frozen=True)
 class Review:
     id: str
     run_id: str
@@ -386,6 +429,9 @@ def _migrate(db: sqlite3.Connection) -> None:
             db.execute(_CRITERIA_TABLE)
             db.execute(_EVALUATIONS_TABLE)
             db.execute(_REVIEWS_TABLE)
+        if version < 5:
+            # v4 -> v5: interactive planning sessions.
+            db.execute(_PLANS_TABLE)
         problems = db.execute("pragma foreign_key_check").fetchall()
         if problems:
             raise StateError(f"schema migration broke foreign keys: {problems}")
@@ -543,37 +589,53 @@ class StateStore:
         criteria: Sequence[Mapping[str, Any]] = (),
     ) -> Run:
         """The run and its frozen criteria, in one transaction."""
+        with self._tx() as db:
+            self._insert_run(
+                db,
+                run_id=run_id,
+                model_key=model_key,
+                launched_at=launched_at,
+                deadline_at=deadline_at,
+                brief_path=brief_path,
+                frozen_digest=frozen_digest,
+                criteria=criteria,
+            )
+        return self._require_run(run_id)
+
+    @staticmethod
+    def _insert_run(
+        db: sqlite3.Connection,
+        *,
+        run_id: str,
+        model_key: str,
+        launched_at: datetime,
+        deadline_at: datetime,
+        brief_path: str,
+        frozen_digest: str | None,
+        criteria: Sequence[Mapping[str, Any]],
+    ) -> None:
         if deadline_at <= launched_at:
             raise StateError("deadline must be after launch")
-        with self._tx() as db:
+        db.execute(
+            "insert into runs (id, phase, model_key, launched_at, deadline_at, brief_path,"
+            " frozen_digest) values (?, 'launched', ?, ?, ?, ?, ?)",
+            (run_id, model_key, _iso(launched_at), _iso(deadline_at), brief_path, frozen_digest),
+        )
+        for i, c in enumerate(criteria):
             db.execute(
-                "insert into runs (id, phase, model_key, launched_at, deadline_at, brief_path,"
-                " frozen_digest) values (?, 'launched', ?, ?, ?, ?, ?)",
+                "insert into criteria (run_id, key, position, kind, required, description,"
+                " test, runner) values (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
-                    model_key,
-                    _iso(launched_at),
-                    _iso(deadline_at),
-                    brief_path,
-                    frozen_digest,
+                    c["key"],
+                    i,
+                    c["kind"],
+                    int(bool(c.get("required", True))),
+                    c["description"],
+                    c.get("test"),
+                    c.get("runner"),
                 ),
             )
-            for i, c in enumerate(criteria):
-                db.execute(
-                    "insert into criteria (run_id, key, position, kind, required, description,"
-                    " test, runner) values (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        run_id,
-                        c["key"],
-                        i,
-                        c["kind"],
-                        int(bool(c.get("required", True))),
-                        c["description"],
-                        c.get("test"),
-                        c.get("runner"),
-                    ),
-                )
-        return self._require_run(run_id)
 
     def get_run(self, run_id: str) -> Run | None:
         with self._lock:
@@ -1149,6 +1211,115 @@ class StateStore:
             raise StateError(f"no review {review_id}")
         return _review(row)
 
+    # --- planning ------------------------------------------------------------------
+
+    def create_plan(self, *, plan_id: str, model_key: str, request: str, now: datetime) -> Plan:
+        with self._tx() as db:
+            db.execute(
+                "insert into plans (id, state, model_key, request, created_at, updated_at)"
+                " values (?, 'starting', ?, ?, ?, ?)",
+                (plan_id, model_key, request, _iso(now), _iso(now)),
+            )
+        return self._require_plan(plan_id)
+
+    def get_plan(self, plan_id: str) -> Plan | None:
+        with self._lock:
+            row = self._db.execute("select * from plans where id = ?", (plan_id,)).fetchone()
+        return _plan(row) if row else None
+
+    def plan_for_run(self, run_id: str) -> Plan | None:
+        with self._lock:
+            row = self._db.execute("select * from plans where run_id = ?", (run_id,)).fetchone()
+        return _plan(row) if row else None
+
+    def list_plans(self) -> list[Plan]:
+        with self._lock:
+            rows = self._db.execute("select * from plans order by created_at, rowid").fetchall()
+        return [_plan(r) for r in rows]
+
+    def active_plans(self) -> list[Plan]:
+        return [p for p in self.list_plans() if p.active]
+
+    def set_plan_state(
+        self, plan_id: str, state: PlanState, now: datetime, *, error: str | None = None
+    ) -> Plan:
+        """Move an active plan on. A plan that was launched, closed or failed stays so."""
+        with self._tx() as db:
+            db.execute(
+                "update plans set state = ?, error = ?, updated_at = ?"
+                " where id = ? and state in ('starting', 'open')",
+                (state, error, _iso(now), plan_id),
+            )
+        return self._require_plan(plan_id)
+
+    def set_plan_conversation(self, plan_id: str, conversation_id: str, now: datetime) -> Plan:
+        with self._tx() as db:
+            row = db.execute(
+                "select conversation_id from plans where id = ?", (plan_id,)
+            ).fetchone()
+            if row is None:
+                raise StateError(f"no plan {plan_id}")
+            if row["conversation_id"] not in (None, conversation_id):
+                raise StateError(f"plan {plan_id} already has conversation {row[0]}")
+            db.execute(
+                "update plans set conversation_id = ?, updated_at = ? where id = ?",
+                (conversation_id, _iso(now), plan_id),
+            )
+        return self._require_plan(plan_id)
+
+    def record_dry_run(self, plan_id: str, result: Mapping[str, Any], now: datetime) -> Plan:
+        with self._tx() as db:
+            db.execute(
+                "update plans set dry_run = ?, updated_at = ? where id = ?",
+                (json.dumps(result, sort_keys=True), _iso(now), plan_id),
+            )
+        return self._require_plan(plan_id)
+
+    def launch_plan(
+        self,
+        plan_id: str,
+        *,
+        run_id: str,
+        model_key: str,
+        launched_at: datetime,
+        deadline_at: datetime,
+        brief_path: str,
+        frozen_digest: str,
+        criteria: Sequence[Mapping[str, Any]],
+    ) -> Run:
+        """The run a plan becomes, in one transaction with the plan's `launched` state.
+
+        Only an open plan launches, and only once.
+        """
+        with self._tx() as db:
+            row = db.execute("select state from plans where id = ?", (plan_id,)).fetchone()
+            if row is None:
+                raise StateError(f"no plan {plan_id}")
+            if row["state"] != "open":
+                raise StateError(f"plan {plan_id} is {row['state']}; only an open plan launches")
+            self._insert_run(
+                db,
+                run_id=run_id,
+                model_key=model_key,
+                launched_at=launched_at,
+                deadline_at=deadline_at,
+                brief_path=brief_path,
+                frozen_digest=frozen_digest,
+                criteria=criteria,
+            )
+            db.execute(
+                "update plans set state = 'launched', run_id = ?, launched_digest = ?,"
+                " updated_at = ? where id = ?",
+                (run_id, frozen_digest, _iso(launched_at), plan_id),
+            )
+        return self._require_run(run_id)
+
+    def _require_plan(self, plan_id: str) -> Plan:
+        plan = self.get_plan(plan_id)
+        if plan is None:
+            raise StateError(f"no plan {plan_id}")
+        return plan
+
     def _require_demo(self, run_id: str) -> Demo:
         demo = self.get_demo(run_id)
         if demo is None:
@@ -1278,4 +1449,20 @@ def _review(row: sqlite3.Row) -> Review:
         reviewer=row["reviewer"],
         result_path=row["result_path"],
         recorded_at=_parse(row["recorded_at"]) if row["recorded_at"] else None,
+    )
+
+
+def _plan(row: sqlite3.Row) -> Plan:
+    return Plan(
+        id=row["id"],
+        state=cast(PlanState, row["state"]),
+        model_key=row["model_key"],
+        request=row["request"],
+        created_at=_parse(row["created_at"]),
+        updated_at=_parse(row["updated_at"]),
+        conversation_id=row["conversation_id"],
+        error=row["error"],
+        dry_run=json.loads(row["dry_run"]) if row["dry_run"] else None,
+        run_id=row["run_id"],
+        launched_digest=row["launched_digest"],
     )

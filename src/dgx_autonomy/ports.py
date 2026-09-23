@@ -252,6 +252,8 @@ class ConversationRequest:
     working_dir: str
     llm: LlmEndpoint
     message: str
+    # The builder gets start_demo; the planner does not (it serves nothing).
+    demo_tool: bool = True
 
 
 @dataclass(frozen=True)
@@ -275,6 +277,8 @@ class ConversationSnapshot:
 @dataclass(frozen=True)
 class EvidenceMessage:
     text: str
+    # True: the message also runs the conversation. False: it is context only.
+    run: bool = True
 
 
 class ConversationPort(Protocol):
@@ -290,8 +294,17 @@ class ConversationPort(Protocol):
         self, server: ServerRef, conversation_id: str, evidence: EvidenceMessage
     ) -> None: ...
     def events(
-        self, server: ServerRef, conversation_id: str, since: int, limit: int
-    ) -> Sequence[EventSummary]: ...
+        self,
+        server: ServerRef,
+        conversation_id: str,
+        since: int,
+        limit: int,
+        *,
+        text_limit: int = 300,
+    ) -> Sequence[EventSummary]:
+        """Events [since, since+limit) in order; each text clipped to `text_limit`."""
+        ...
+
     def recent(self, server: ServerRef, conversation_id: str, limit: int) -> Sequence[EventSummary]:
         """The newest `limit` events, newest first."""
         ...

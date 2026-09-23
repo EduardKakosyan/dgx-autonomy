@@ -132,6 +132,14 @@ class Settings:
     agent_memory: str = "32g"
     agent_cpus: str = "8"
     agent_pids_limit: int = 4096
+    # The planning sandbox (planning.py) does research, not builds.
+    planner_memory: str = "8g"
+    planner_cpus: str = "4"
+    # A planning session that has not come up (model, sandbox, conversation) by then
+    # is failed; the operator starts another.
+    planner_start_timeout_s: float = 45 * 60.0
+    # The dry run of draft checks: each check against an empty target, at most this long.
+    dry_run_timeout_s: float = 180.0
     max_budget_hours: float = 40.0
     poll_seconds: float = 5.0
     inference_load_timeout_s: float = 30 * 60.0
@@ -172,6 +180,10 @@ class Settings:
     @property
     def runs_dir(self) -> Path:
         return self.data_dir / "runs"
+
+    @property
+    def plans_dir(self) -> Path:
+        return self.data_dir / "plans"
 
     @property
     def state_db(self) -> Path:

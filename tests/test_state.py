@@ -394,6 +394,51 @@ def test_a_phase_4_database_gains_the_frozen_agreement_and_evaluations(tmp_path:
         == 2
     )
     raw = sqlite3.connect(path)
-    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 5
     raw.close()
+    store.close()
+
+
+def test_v4_database_gains_plans_and_a_plan_launches_once(tmp_path: Path) -> None:
+    path = tmp_path / "v4.sqlite3"
+    StateStore(path).close()
+    db = sqlite3.connect(path)
+    db.execute("drop table plans")
+    db.execute("pragma user_version = 4")
+    db.commit()
+    db.close()
+
+    store = StateStore(path)
+    plan = store.create_plan(plan_id="p1", model_key="m", request="a weather app", now=LAUNCH)
+    assert (plan.state, plan.active, plan.run_id) == ("starting", True, None)
+    store.set_plan_conversation("p1", "c1", LAUNCH)
+    with pytest.raises(StateError, match="already has conversation"):
+        store.set_plan_conversation("p1", "c2", LAUNCH)
+    with pytest.raises(StateError, match="only an open plan"):
+        store.launch_plan(
+            "p1", run_id="r1", model_key="m", launched_at=LAUNCH, deadline_at=DEADLINE,
+            brief_path="b", frozen_digest="sha256:d", criteria=[],
+        )  # fmt: skip
+    store.set_plan_state("p1", "open", LAUNCH)
+    store.record_dry_run("p1", {"digest": "sha256:d", "ok": True}, LAUNCH)
+    run = store.launch_plan(
+        "p1", run_id="r1", model_key="m", launched_at=LAUNCH, deadline_at=DEADLINE,
+        brief_path="b", frozen_digest="sha256:d",
+        criteria=[{"key": "home", "kind": "automated", "description": "d", "test": "h.spec.ts",
+                   "runner": "playwright"}],
+    )  # fmt: skip
+    assert (run.phase, run.frozen_digest, run.deadline_at) == ("launched", "sha256:d", DEADLINE)
+    assert [c.key for c in store.criteria("r1")] == ["home"]
+    plan = store.plan_for_run("r1")
+    assert plan is not None
+    assert (plan.state, plan.launched_digest, plan.active) == ("launched", "sha256:d", False)
+    assert plan.dry_run == {"digest": "sha256:d", "ok": True}
+    # Launched is final: neither a second launch nor a state change applies.
+    with pytest.raises(StateError, match="only an open plan"):
+        store.launch_plan(
+            "p1", run_id="r2", model_key="m", launched_at=LAUNCH, deadline_at=DEADLINE,
+            brief_path="b", frozen_digest="sha256:d", criteria=[],
+        )  # fmt: skip
+    assert store.get_run("r2") is None
+    assert store.set_plan_state("p1", "closed", LAUNCH).state == "launched"
     store.close()

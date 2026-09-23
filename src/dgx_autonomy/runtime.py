@@ -39,6 +39,7 @@ LABEL_PREFIX = "dgx-autonomy"
 LABEL_RUN = f"{LABEL_PREFIX}.run"
 LABEL_OP = f"{LABEL_PREFIX}.op"
 LABEL_ROLE = f"{LABEL_PREFIX}.role"
+LABEL_PLAN = f"{LABEL_PREFIX}.plan"
 
 FORBIDDEN_MOUNT_SOURCES = frozenset({"/var/run/docker.sock", "/run/docker.sock"})
 BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
@@ -182,6 +183,48 @@ def agent_container_spec(settings: Settings, spec: WorkspaceSpec) -> ContainerSp
         user=f"{settings.agent_uid}:{settings.agent_gid}",
         memory=settings.agent_memory,
         cpus=settings.agent_cpus,
+        pids_limit=settings.agent_pids_limit,
+    )
+
+
+def planner_container_name(plan_id: str) -> str:
+    return f"{LABEL_PREFIX}-plan-{plan_id}"
+
+
+@dataclass(frozen=True)
+class PlannerSpec:
+    plan_id: str
+    # Mounted at /workspace: the planner's scratch space, its draft and its conversation.
+    agent_dir: str
+    # Controller-owned, read-only at /dgx-control: the supervisor mode.
+    control_dir: str
+    session_api_key: str
+    secret_key: str
+
+
+def planner_container_spec(settings: Settings, spec: PlannerSpec) -> ContainerSpec:
+    """The planning sandbox: the agent image and hardening, without a project.
+
+    It sees only its own workspace (where the draft is) and the control directory.
+    No frozen agreement (there is none yet), no published port (no demo), no Docker
+    socket, no controller state. Research needs the internet, so it gets the same
+    two networks and the same host egress policy as a run's sandbox.
+    """
+    return ContainerSpec(
+        name=planner_container_name(spec.plan_id),
+        image=settings.agent_image,
+        labels={LABEL_PLAN: spec.plan_id, LABEL_ROLE: "planner"},
+        networks=(settings.internal_network, settings.egress_network),
+        mounts=(
+            Mount(spec.agent_dir, AGENT_WORKDIR),
+            Mount(spec.control_dir, AGENT_CONTROL_DIR, read_only=True),
+        ),
+        dns=settings.agent_dns,
+        env={"OH_SESSION_API_KEYS_0": spec.session_api_key, "OH_SECRET_KEY": spec.secret_key},
+        command=("--host", "0.0.0.0", "--port", str(settings.agent_port)),
+        user=f"{settings.agent_uid}:{settings.agent_gid}",
+        memory=settings.planner_memory,
+        cpus=settings.planner_cpus,
         pids_limit=settings.agent_pids_limit,
     )
 

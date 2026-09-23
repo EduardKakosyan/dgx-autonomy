@@ -135,6 +135,11 @@ need an operator with sudo. Everything after this runs as `jim` without Docker a
 Put the CLI on the PATH once: `ln -sf ~/dgx-autonomy/.venv/bin/dgx-autonomy ~/.local/bin/`.
 
 ```bash
+dgx-autonomy plan [--request TEXT] [--model M]      # plan a run with the model (interactive)
+dgx-autonomy plan --attach [PLAN_ID]      # continue a plan (after a dropped SSH session, say)
+dgx-autonomy plan --close PLAN_ID         # abandon a plan
+dgx-autonomy plans                        # planning sessions and the runs they became
+dgx-autonomy launch --plan PLAN_ID [--budget-hours 40] [--yes [--skip-dry-run]]
 dgx-autonomy launch --brief DIR|brief.md [--budget-hours 40] [--model qwen3.6-35b-a3b]
 dgx-autonomy status [RUN_ID]          # phase, outcome, deadline, demo, evaluation, stop evidence, recoveries
 dgx-autonomy report [RUN_ID]          # claims, check results, human judgment, evaluations, reviews
@@ -152,6 +157,54 @@ dgx-autonomy release                  # remove the owned llama-server, restore c
 dgx-autonomy reservation              # held or not, since when, memory available
 dgx-autonomy egress [HOST:PORT ...]   # is the egress policy in place / probe through it
 ```
+
+### Planning
+
+`dgx-autonomy plan` is the front door. It asks what to build, then opens a planning
+session in the controller with the selected model, the same model the run will use.
+The operator and the model research the request and agree on requirements. The
+model writes the agreement as a draft in its own workspace: `draft/brief.md` and
+`draft/checks/` (criteria and executable checks, in the format under
+[Acceptance checks](#acceptance-checks)).
+
+```text
+you> TEXT            a message to the planner; its reply is streamed
+/draft               the draft, its digest, and why it cannot be launched (if so)
+/checks              dry-run every automated check against an empty target
+/launch [HOURS]      freeze exactly the draft shown and start the run (budget <= 40 h)
+/status  /interrupt  /close  /detach (or Ctrl-D)
+```
+
+- **The planner is sandboxed like a builder, without a project.** It runs in
+  `dgx-autonomy-plan-<id>` with the agent image and hardening, on the same two
+  networks under the egress policy (for web research with `curl`), with no published
+  port and no start_demo tool. Its workspace is `plans/<id>/agent`. Nothing it writes
+  reaches a run except the draft, and only at launch.
+- **Planning outlives the SSH session.** The session belongs to the controller:
+  closing the laptop, losing SSH, or a controller restart leaves the plan open, and
+  the planner finishes its turn meanwhile. `plan --attach` prints the conversation so
+  far and continues it. A planner sandbox that went down (a DGX restart) is started
+  again; the next message resumes the conversation.
+- **The dry run proves the checks execute.** `/checks` copies the draft into a
+  controller-owned directory and runs each automated check in an evaluator container
+  (the same image, user and limits as an evaluation) with `APP_URL` pointing at
+  nothing. A working check *fails* there. A check that errors does not run (a syntax
+  error, a wrong file name); one that *passes* checks nothing. The result goes to the
+  operator, and to the planner as context (it does not start a turn). Evidence is in
+  `plans/<id>/dryruns/dry-<n>/`.
+- **Launch freezes what the operator reviewed.** `/launch` shows the draft and its
+  digest and asks for confirmation (and for `force` when this exact draft has not
+  passed a dry run). The controller refuses when the draft on disk no longer has that
+  digest, while the planner is still working, or when the draft has no automated
+  criterion. Then it freezes the draft through the same path as `launch --brief`,
+  creates the run with its deadline (planning time does not count against the
+  budget), removes the planner sandbox and records which run the plan became. The
+  planning conversation stays on disk; `status` shows the run's `plan_id`.
+
+`launch --brief` still takes a handwritten brief (the smoke tests use it) and still
+accepts a brief without checks; a planned run needs at least one automated check.
+
+### Launching from a brief
 
 `--brief` takes a brief file, or a directory with `brief.md` and `checks/` (see
 [Acceptance checks](#acceptance-checks)). The CLI sends the contents, because the
@@ -433,7 +486,8 @@ The sudoers entry (`host/sudoers-autonomy`) lets jim run exactly `reserve`,
 ```text
 /var/lib/dgx-autonomy/            controller-owned (root), mounted at the same path in the controller
   control/control.sock            0600, owned by jim
-  state/controller.sqlite3        runs, operations, demos, recoveries, criteria, evaluations, reviews
+  state/controller.sqlite3        runs, operations, demos, recoveries, criteria, evaluations,
+                                  reviews, plans
                                   (never mounted into agent, inference or evaluator)
   state/controller.lock           the controller's writer lock (flock)
   policy/egress.json              written by dgx-autonomy-egress: boot id, rules sha256
@@ -445,6 +499,8 @@ The sudoers entry (`host/sudoers-autonomy`) lets jim run exactly `reserve`,
   runs/<id>/snapshots.git/        project snapshots (controller-owned git directory, 0700)
   runs/<id>/reviews/review-<n>/   manual review bundles
   runs/<id>/control/              mounted read-only at /dgx-control: mode, demo.json
+  plans/<id>/agent/               uid 10001; the planner's /workspace: draft/, conversations/
+  plans/<id>/dryruns/dry-<n>/     dry runs of the draft checks (controller-owned)
   runs/<id>/secrets/              Agent Server session key and secret key, 0700 root
   runs/<id>/agent/                uid 10001; the agent's /workspace
     project/                      what the agent builds
@@ -473,6 +529,7 @@ ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_egress.py'
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_controller_kill.py -s'
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_protected_eval.py -s'
+ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_plan_to_launch.py -s'
 # stops claude-qwen for a few minutes; opt in explicitly:
 ssh hugo-dgx1 'cd ~/dgx-autonomy && DGX_AUTONOMY_RESERVATION_TEST=1 ~/.local/bin/uv run pytest -m dgx tests/dgx/test_reserve_release.py -s'
 ```
@@ -486,3 +543,5 @@ and expects each run to finish its brief in the same conversation.
 `test_protected_eval.py` gives the builder a brief that omits something a frozen
 check requires. The builder's tampering with the checks must fail, its first claim
 must fail, and its repair must pass. With `-s` it prints the report.
+`test_plan_to_launch.py` scripts two planning turns, crashes the controller between
+them, dry-runs the checks, launches the reviewed digest and expects the run VERIFIED.
