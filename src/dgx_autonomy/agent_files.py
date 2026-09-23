@@ -82,3 +82,20 @@ def read_json(root: Path, *parts: str, max_bytes: int) -> Any:
     *dirs, name = parts
     with open_dir(root, *dirs) as fd:
         return read_json_at(fd, name, max_bytes)
+
+
+def make_world_readable(root: Path) -> None:
+    """Add o+r (and o+x on directories) through `root`; symlinks are left alone.
+
+    For the operator: the agent's file tools write 0600 as the agent uid, so the
+    project the CLI points at would otherwise be unreadable to jim.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in (*dirnames, *filenames):
+            path = os.path.join(dirpath, name)
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            extra = stat.S_IROTH | (stat.S_IXOTH if stat.S_ISDIR(st.st_mode) else 0)
+            if st.st_mode & extra != extra:
+                os.chmod(path, stat.S_IMODE(st.st_mode) | extra)

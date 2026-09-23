@@ -313,3 +313,87 @@ def test_a_refused_demo_request_keeps_the_command_to_relaunch(tmp_path: Path) ->
         "r1", request_id="b", command=None, state="refused", message="port", now=LAUNCH
     )
     assert (demo.command, demo.session_id, demo.request_id) == ("pnpm start", 77, "b")
+
+
+def test_a_phase_4_database_gains_the_frozen_agreement_and_evaluations(tmp_path: Path) -> None:
+    """v3 -> v4 in place: existing runs keep working, with no frozen digest."""
+    from dgx_autonomy import state as st
+
+    path = tmp_path / "state" / "controller.sqlite3"
+    path.parent.mkdir()
+    db = sqlite3.connect(path)
+    db.execute(st._RUNS_TABLE.format(name="runs"))
+    for ddl in (st._DEADLINE_TRIGGER, st._OPERATIONS_TABLE, st._DEMOS_TABLE):
+        db.execute(ddl)
+    db.execute("alter table operations add column attempted_at text")
+    db.execute(st._RECOVERIES_TABLE)
+    db.execute(st._CONTROLLER_LOCK_TABLE)
+    db.execute(
+        "insert into runs (id, phase, model_key, launched_at, deadline_at, brief_path, outcome)"
+        " values ('old', 'finished', 'm', ?, ?, 'b', 'finished')",
+        (LAUNCH.isoformat(), DEADLINE.isoformat()),
+    )
+    db.execute(
+        "insert into demos (run_id, port, host_port, state, updated_at)"
+        " values ('old', 3000, 43000, 'running', ?)",
+        (LAUNCH.isoformat(),),
+    )
+    db.execute("pragma user_version = 3")
+    db.commit()
+    db.close()
+
+    store = StateStore(path)
+    old = store.get_run("old")
+    assert old is not None and old.frozen_digest is None and old.phase == "finished"
+    demo = store.get_demo("old")
+    assert demo is not None and demo.snapshot_id is None
+    assert store.criteria("old") == [] and store.evaluations("old") == []
+
+    store.create_run(
+        run_id="r1",
+        model_key="m",
+        launched_at=LAUNCH,
+        deadline_at=DEADLINE,
+        brief_path="b",
+        frozen_digest="sha256:abc",
+        criteria=[
+            {"key": "home", "kind": "automated", "description": "d", "test": "h.spec.ts",
+             "runner": "playwright"},
+            {"key": "tidy", "kind": "human_judgment", "description": "t", "required": False},
+        ],
+    )  # fmt: skip
+    assert [(c.key, c.required) for c in store.criteria("r1")] == [("home", True), ("tidy", False)]
+    ev = store.begin_evaluation(
+        "r1", trigger="claim", check_digest="sha256:abc", evidence_root="/e", now=LAUNCH,
+        claim_event_id="ev-1", claim_text="done",
+    )  # fmt: skip
+    assert (ev.id, ev.evidence_dir, ev.open) == ("r1.eval.1", "/e/eval-1", True)
+    assert (
+        store.begin_evaluation(
+            "r1", trigger="claim", check_digest="x", evidence_root="/e", now=LAUNCH
+        )
+        == ev
+    )  # one open evaluation per run
+    store.pin_evaluation(ev.id, snapshot_id="tree1", snapshot_commit="c1")
+    ev = store.pin_evaluation(ev.id, snapshot_id="tree2", snapshot_commit="c2")
+    assert ev.snapshot_id == "tree1"  # pinned once per attempt
+    ev = store.finish_evaluation(
+        ev.id, status="failed", detail="failed: home",
+        results={"home": {"status": "failed"}}, now=LAUNCH,
+    )  # fmt: skip
+    assert ev.status == "failed" and not ev.open
+    [home, _] = store.criteria("r1")
+    assert (home.latest_evaluation_id, home.latest_status) == ("r1.eval.1", "failed")
+    # A finished evaluation is final.
+    again = store.finish_evaluation(ev.id, status="passed", detail=None, results={}, now=LAUNCH)
+    assert again.status == "failed"
+    assert (
+        store.begin_evaluation(
+            "r1", trigger="final", check_digest="x", evidence_root="/e", now=LAUNCH
+        ).n
+        == 2
+    )
+    raw = sqlite3.connect(path)
+    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    raw.close()
+    store.close()

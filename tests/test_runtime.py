@@ -32,7 +32,7 @@ def _workspace(tmp_path: Path) -> WorkspaceSpec:
         run_id="20260922-120000-abcdef",
         op_id="20260922-120000-abcdef.workspace.create",
         agent_dir=tmp_path / "runs" / "r" / "agent",
-        brief_file=tmp_path / "runs" / "r" / "brief.md",
+        frozen_dir=tmp_path / "runs" / "r" / "frozen",
         session_api_key="session-key",
         secret_key="secret-key",
         control_dir=tmp_path / "runs" / "r" / "control",
@@ -72,7 +72,7 @@ def test_agent_argv_is_unprivileged_and_has_no_socket(settings: Settings, tmp_pa
     assert sorted(mounts) == sorted(
         [
             f"type=bind,source={tmp_path}/runs/r/agent,target=/workspace",
-            f"type=bind,source={tmp_path}/runs/r/brief.md,target=/brief/brief.md,readonly",
+            f"type=bind,source={tmp_path}/runs/r/frozen,target=/brief,readonly",
             f"type=bind,source={tmp_path}/runs/r/control,target=/dgx-control,readonly",
         ]
     )

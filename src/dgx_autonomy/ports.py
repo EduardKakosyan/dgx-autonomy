@@ -12,7 +12,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from .snapshot import Snapshot
 
 # --- clock -------------------------------------------------------------------------
 
@@ -92,6 +95,7 @@ class ContainerSpec:
     ports: tuple[PortBinding, ...] = ()
     dns: tuple[str, ...] = ()
     entrypoint: str | None = None
+    workdir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -122,7 +126,8 @@ class WorkspaceSpec:
     run_id: str
     op_id: str
     agent_dir: Path
-    brief_file: Path
+    # The frozen brief and checks (frozen.py); read-only at /brief in the sandbox.
+    frozen_dir: Path
     session_api_key: str
     secret_key: str
     # Controller-owned, read-only in the sandbox: the supervisor mode and demo status.
@@ -287,3 +292,17 @@ class ConversationPort(Protocol):
     def events(
         self, server: ServerRef, conversation_id: str, since: int, limit: int
     ) -> Sequence[EventSummary]: ...
+    def recent(self, server: ServerRef, conversation_id: str, limit: int) -> Sequence[EventSummary]:
+        """The newest `limit` events, newest first."""
+        ...
+
+
+# --- project snapshots -------------------------------------------------------------
+
+
+class SnapshotPort(Protocol):
+    """Content-addressed snapshots of a project directory (snapshot.py)."""
+
+    def take(self, store: Path, project: Path, label: str) -> Snapshot: ...
+    def changed(self, store: Path, before: str, after: str, limit: int = 200) -> list[str]: ...
+    def archive(self, store: Path, commit: str, dest: Path) -> None: ...

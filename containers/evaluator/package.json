@@ -1,0 +1,8 @@
+{
+  "name": "dgx-autonomy-evaluator",
+  "private": true,
+  "description": "Playwright Test for the frozen acceptance checks (containers/evaluator.Dockerfile)",
+  "dependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

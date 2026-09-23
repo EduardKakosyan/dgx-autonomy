@@ -14,7 +14,9 @@ ARG DOCKER_CLI_VERSION=29.2.1
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl tini; \
+    # git: project snapshots for evaluations (snapshot.py), in a git directory the
+    # controller owns; the agent's own repository is never used.
+    apt-get install -y --no-install-recommends ca-certificates curl git tini; \
     rm -rf /var/lib/apt/lists/*; \
     case "${TARGETARCH:-arm64}" in \
       arm64) arch=aarch64 ;; \
@@ -23,7 +25,8 @@ RUN set -eux; \
     esac; \
     curl -fsSL "https://download.docker.com/linux/static/stable/${arch}/docker-${DOCKER_CLI_VERSION}.tgz" \
       | tar -xz -C /usr/local/bin --strip-components=1 docker/docker; \
-    docker --version
+    docker --version; \
+    git --version
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.16 /uv /usr/local/bin/uv
 

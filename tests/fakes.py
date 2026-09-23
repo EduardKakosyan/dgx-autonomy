@@ -11,10 +11,12 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from dgx_autonomy.config import Settings
 from dgx_autonomy.controller import Controller
+from dgx_autonomy.evaluation import EVALUATOR_OUT_DIR, LABEL_CRITERION
 from dgx_autonomy.openhands_adapter import conversation_id_for
 from dgx_autonomy.ports import (
     ContainerSpec,
@@ -35,6 +37,7 @@ from dgx_autonomy.ports import (
     WorkspaceSpec,
 )
 from dgx_autonomy.runtime import (
+    LABEL_ROLE,
     LABEL_RUN,
     CommandResult,
     DockerError,
@@ -111,6 +114,13 @@ class FakeRuntime:
         self.removed: list[str] = []
         self.completed: list[ContainerSpec] = []  # specs passed to run_to_completion
         self.completion_output: tuple[int, str] = (0, "{}")
+        # Evaluator containers "run" when they are created: criterion key -> what the
+        # runner does (exit code, files it writes to /out, its log). None: it keeps
+        # running (a hung test). Unknown keys pass, in their runner's format.
+        self.evaluator_outcomes: dict[str, EvaluatorOutcome | None] = {}
+        self.evaluators: list[ContainerSpec] = []
+        # Called when an evaluator starts, e.g. to have the "agent" change the project.
+        self.on_evaluator: list[Callable[[ContainerSpec], None]] = []
         self._next_pid = 100
 
     def _pid(self) -> int:
@@ -175,13 +185,31 @@ class FakeRuntime:
                 labels=dict(spec.labels),
             )
         self.containers[spec.name] = state
+        role = spec.labels.get(LABEL_ROLE)
         run_id = spec.labels.get(LABEL_RUN)
-        if run_id is not None:
+        if role == "evaluator":
+            self._run_evaluator(spec)
+            return self.containers[spec.name]
+        if run_id is not None and role == "agent":
             for m in spec.mounts:
                 if m.target == "/dgx-control":
                     self.control_dirs[run_id] = m.source
             self._boot(run_id)
         return state
+
+    def _run_evaluator(self, spec: ContainerSpec) -> None:
+        self.evaluators.append(spec)
+        for hook in self.on_evaluator:
+            hook(spec)
+        key = spec.labels[LABEL_CRITERION]
+        default = playwright_passes() if "playwright" in " ".join(spec.command) else pytest_passes()
+        outcome = self.evaluator_outcomes.get(key, default)
+        if outcome is None:
+            return  # still running
+        out = next(Path(m.source) for m in spec.mounts if m.target == EVALUATOR_OUT_DIR)
+        for name, text in outcome.files.items():
+            (out / name).write_text(text)
+        self.exit(spec.name, code=outcome.exit_code, logs=outcome.logs)
 
     def container_logs(self, name: str, tail: int = 40) -> str:
         return self.logs.get(name, "")
@@ -221,8 +249,9 @@ class FakeRuntime:
             self.containers[name], running=False, status="exited", exit_code=code
         )
         self.logs[name] = logs
-        run_id = self.containers[name].labels.get(LABEL_RUN)
-        if run_id is not None:
+        labels = self.containers[name].labels
+        run_id = labels.get(LABEL_RUN)
+        if run_id is not None and labels.get(LABEL_ROLE) == "agent":
             self.procs[run_id] = []
 
     def inspect(self, run_id: str) -> RuntimeSnapshot:
@@ -302,6 +331,61 @@ class FakeRuntime:
         return DemoStatus(
             alive=alive, listening=alive and self.listening.get(run_id, False), log_tail="boom"
         )
+
+
+@dataclass(frozen=True)
+class EvaluatorOutcome:
+    exit_code: int
+    files: dict[str, str] = field(default_factory=dict)
+    logs: str = ""
+
+
+def pytest_passes() -> EvaluatorOutcome:
+    junit = '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0">'
+    junit += '<testcase classname="test_app" name="test_ok"/></testsuite></testsuites>'
+    return EvaluatorOutcome(0, {"junit.xml": junit}, "1 passed in 0.10s")
+
+
+def pytest_fails(message: str = "assert 404 == 200") -> EvaluatorOutcome:
+    junit = (
+        '<testsuites><testsuite tests="1" failures="1" errors="0" skipped="0">'
+        '<testcase classname="test_app" name="test_version">'
+        f'<failure message="{message}">def test_version():\n&gt;   {message}</failure>'
+        "</testcase></testsuite></testsuites>"
+    )
+    return EvaluatorOutcome(
+        1, {"junit.xml": junit}, f"FAILED test_app.py::test_version - {message}"
+    )
+
+
+def playwright_report(expected: int, unexpected: int, message: str = "") -> str:
+    spec = {
+        "title": "shows the greeting",
+        "ok": unexpected == 0,
+        "tests": [{"results": [{"status": "failed" if unexpected else "passed",
+                                "errors": [{"message": message}] if unexpected else []}]}],
+    }  # fmt: skip
+    return json.dumps(
+        {
+            "suites": [{"title": "home.spec.ts", "specs": [spec], "suites": []}],
+            "errors": [],
+            "stats": {"expected": expected, "unexpected": unexpected, "flaky": 0, "skipped": 0},
+        }
+    )
+
+
+def playwright_passes() -> EvaluatorOutcome:
+    return EvaluatorOutcome(0, {"report.json": playwright_report(1, 0)}, "1 passed (2.1s)")
+
+
+def playwright_fails(message: str) -> EvaluatorOutcome:
+    return EvaluatorOutcome(1, {"report.json": playwright_report(0, 1, message)}, "1 failed")
+
+
+def runner_crashes(
+    logs: str = "Traceback: ModuleNotFoundError: No module named 'httpx'",
+) -> EvaluatorOutcome:
+    return EvaluatorOutcome(3, {}, logs)
 
 
 class FakeHttp:
@@ -396,14 +480,31 @@ class FakeConversation:
         if self.fail_deliver is not None:
             raise self.fail_deliver
         self.delivered.append(evidence)
-        # A user message with run=True runs a conversation that is not running.
-        if self.status in ("error", "paused", "idle"):
+        # A user message with run=True runs a conversation that is not running; a
+        # FINISHED one is set IDLE first (SDK 1.49.4, LocalConversation.send_message).
+        if self.status in ("error", "paused", "idle", "finished"):
             self.status = "running"
 
     def events(
         self, server: ServerRef, conversation_id: str, since: int, limit: int
     ) -> Sequence[EventSummary]:
         return self.event_log[since : since + limit]
+
+    def recent(self, server: ServerRef, conversation_id: str, limit: int) -> Sequence[EventSummary]:
+        return list(reversed(self.event_log))[:limit]
+
+    def claim(self, text: str = "The page is served on port 3000.") -> EventSummary:
+        """The agent finishes: its finish action is the newest event."""
+        event = EventSummary(
+            id=f"ev-{len(self.event_log)}",
+            timestamp="2026-09-22T12:00:00",
+            kind="ActionEvent",
+            source="agent",
+            text=f'finish {{"message": "{text}"}}',
+        )
+        self.event_log.append(event)
+        self.status = "finished"
+        return event
 
 
 @dataclass

@@ -14,6 +14,7 @@ DEFAULT_DATA_DIR = "/var/lib/dgx-autonomy"
 DEFAULT_MODELS_DIR = "/home/jim/models"
 DEFAULT_INFERENCE_IMAGE = "dgx-autonomy/inference:f95b0d9"
 DEFAULT_AGENT_IMAGE = "dgx-autonomy/agent:1.49.4"
+DEFAULT_EVALUATOR_IMAGE = "dgx-autonomy/evaluator:1.63.0"
 PACKAGED_MODELS_FILE = Path(__file__).resolve().parents[2] / "config" / "models.yaml"
 BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 
@@ -107,6 +108,7 @@ class Settings:
     operator_gid: int | None = None
     inference_image: str = DEFAULT_INFERENCE_IMAGE
     agent_image: str = DEFAULT_AGENT_IMAGE
+    evaluator_image: str = DEFAULT_EVALUATOR_IMAGE
     internal_network: str = "dgx-autonomy-internal"
     egress_network: str = "dgx-autonomy-egress"
     # Host interface names of those networks (compose sets them). The host's egress
@@ -153,6 +155,19 @@ class Settings:
     recovery_backoff_s: float = 30.0
     recovery_backoff_max_s: float = 15 * 60.0
     recovery_window_s: float = 60 * 60.0
+    # The acceptance-check evaluator (evaluation.py): one disposable container per
+    # criterion, as this uid, with these limits, for at most this long. It sits on
+    # the egress network, where it reaches the demo by the sandbox's name.
+    evaluator_uid: int = 10002
+    evaluator_gid: int = 10002
+    evaluator_memory: str = "4g"
+    evaluator_cpus: str = "4"
+    evaluator_pids_limit: int = 1024
+    evaluator_timeout_s: float = 10 * 60.0
+    # An evaluation that could not decide (inconclusive, infra_error) is repeated for
+    # the same completion claim after this backoff, doubling up to the maximum.
+    evaluation_retry_s: float = 30.0
+    evaluation_retry_max_s: float = 15 * 60.0
 
     @property
     def runs_dir(self) -> Path:
@@ -189,6 +204,7 @@ class Settings:
             operator_gid=_int_or_none(e.get("DGX_AUTONOMY_OPERATOR_GID")),
             inference_image=e.get("DGX_AUTONOMY_INFERENCE_IMAGE", DEFAULT_INFERENCE_IMAGE),
             agent_image=e.get("DGX_AUTONOMY_AGENT_IMAGE", DEFAULT_AGENT_IMAGE),
+            evaluator_image=e.get("DGX_AUTONOMY_EVALUATOR_IMAGE", DEFAULT_EVALUATOR_IMAGE),
             require_egress_policy=e.get("DGX_AUTONOMY_REQUIRE_EGRESS_POLICY", "1") != "0",
         )
 

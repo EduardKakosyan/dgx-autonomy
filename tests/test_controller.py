@@ -170,8 +170,13 @@ def test_agent_container_is_unprivileged_and_isolated(harness: Harness) -> None:
     assert spec.cap_drop_all and spec.no_new_privileges
     assert all("docker.sock" not in m.source for m in spec.mounts)
     assert all(not m.source.startswith(str(h.settings.state_db.parent)) for m in spec.mounts)
-    brief_mount = next(m for m in spec.mounts if m.target == "/brief/brief.md")
-    assert brief_mount.read_only
+    # The frozen agreement (brief + checks) is the only other host path, read-only.
+    frozen_mount = next(m for m in spec.mounts if m.target == "/brief")
+    assert frozen_mount.read_only
+    assert frozen_mount.source == str(h.controller.paths(run_id).frozen_dir)
+    run_root = str(h.controller.paths(run_id).root)
+    for private in ("evidence", "snapshots.git", "secrets", "reviews"):
+        assert all(not m.source.startswith(f"{run_root}/{private}") for m in spec.mounts)
     assert spec.networks == (h.settings.internal_network, h.settings.egress_network)
     assert not spec.gpus
 
@@ -296,4 +301,5 @@ def test_run_directories_hand_the_workspace_to_the_agent_user(harness: Harness) 
     assert (str(paths.project_dir), 10001, 10001) in harness.chowned
     assert (paths.secrets_dir.stat().st_mode & 0o777) == 0o700
     assert ((paths.secrets_dir / "session_api_key").stat().st_mode & 0o777) == 0o600
-    assert (paths.brief.stat().st_mode & 0o777) == 0o644
+    assert (paths.frozen_dir.stat().st_mode & 0o777) == 0o755
+    assert ((paths.frozen_dir / "brief.md").stat().st_mode & 0o777) == 0o644

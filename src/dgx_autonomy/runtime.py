@@ -45,7 +45,10 @@ BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 
 AGENT_WORKDIR = "/workspace"
 AGENT_PROJECT_DIR = f"{AGENT_WORKDIR}/project"
-AGENT_BRIEF_PATH = "/brief/brief.md"
+# The frozen agreement (frozen.py), read-only: brief.md, checks/, manifest.json.
+AGENT_FROZEN_DIR = "/brief"
+AGENT_BRIEF_PATH = f"{AGENT_FROZEN_DIR}/brief.md"
+AGENT_CHECKS_DIR = f"{AGENT_FROZEN_DIR}/checks"
 # Controller-owned, mounted read-only: `mode` (agent | demo-only) and `demo.json`.
 AGENT_CONTROL_DIR = "/dgx-control"
 # The agent writes its start_demo request here (see demo_tool.py).
@@ -135,6 +138,8 @@ def docker_run_argv(spec: ContainerSpec, *, detach: bool = True) -> list[str]:
         argv += ["--env", f"{key}={value}"]
     if spec.entrypoint is not None:
         argv += ["--entrypoint", spec.entrypoint]
+    if spec.workdir is not None:
+        argv += ["--workdir", spec.workdir]
     argv.append(spec.image)
     argv += list(spec.command)
     return argv
@@ -147,9 +152,10 @@ def agent_container_name(run_id: str) -> str:
 def agent_container_spec(settings: Settings, spec: WorkspaceSpec) -> ContainerSpec:
     """The unprivileged sandbox that runs the Agent Server and its tools.
 
-    It sees its own workspace (project + SDK conversation storage), a read-only
-    brief and a read-only control directory. It gets the private inference network
-    and an egress network, but no Docker socket and no controller state. The only
+    It sees its own workspace (project + SDK conversation storage), the frozen
+    agreement (brief and checks) read-only, and a read-only control directory. It
+    gets the private inference network and an egress network, but no Docker socket,
+    no controller state, no snapshots and no evaluation evidence. The only
     published port is the demo's, on host loopback. The host's egress rules
     (host/nftables-autonomy.nft) keep it off the DGX, the LAN and the tailnet, so it
     resolves names through public resolvers rather than the host's (the LAN router).
@@ -161,7 +167,7 @@ def agent_container_spec(settings: Settings, spec: WorkspaceSpec) -> ContainerSp
         networks=(settings.internal_network, settings.egress_network),
         mounts=(
             Mount(str(spec.agent_dir), AGENT_WORKDIR),
-            Mount(str(spec.brief_file), AGENT_BRIEF_PATH, read_only=True),
+            Mount(str(spec.frozen_dir), AGENT_FROZEN_DIR, read_only=True),
             Mount(str(spec.control_dir), AGENT_CONTROL_DIR, read_only=True),
         ),
         ports=(PortBinding(LOOPBACK, spec.demo_host_port, settings.demo_port),),

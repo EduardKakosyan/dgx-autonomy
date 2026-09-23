@@ -18,6 +18,10 @@ agent container (uid 10001, no caps, no socket)
    │ private network
    ▼
 llama-server container (GPU, model mounted read-only, not published)
+
+evaluator containers (uid 10002, no caps, no socket), one per acceptance check:
+   frozen checks read-only, an output directory of their own, the egress network
+   (they reach the demo by the sandbox's name; not the model, not the DGX)
 ```
 
 - The **controller** is the only container that mounts the Docker socket. It keeps
@@ -33,6 +37,9 @@ llama-server container (GPU, model mounted read-only, not published)
   separate sessions, so ending the agent does not end the demo.
 - The **inference container** is llama.cpp `f95b0d9`, built for GB10 (`sm_121a`). It
   serves the model in `config/models.yaml` on the internal network only.
+- The **evaluator** is Playwright Test 1.63.0 (Chromium) plus pytest 9.1.1 and httpx.
+  The controller starts one disposable evaluator per automated acceptance check when
+  the builder claims completion (see [Acceptance checks](#acceptance-checks)).
 
 The default model is `qwen3.6-35b-a3b` (Q3, about 17 GB). It fits next to
 `claude-qwen`, so runs work without displacing it. `dgx-autonomy reserve` displaces
@@ -71,7 +78,7 @@ need an operator with sudo. Everything after this runs as `jim` without Docker a
    ```bash
    sudo install -d -m 0755 /var/lib/dgx-autonomy
    cd ~jim/dgx-autonomy/containers
-   sudo docker compose --profile images build     # controller, inference (sm_121a check), agent
+   sudo docker compose --profile images build     # controller, inference (sm_121a check), agent, evaluator
    sudo docker compose up -d controller
    sudo docker compose logs -f controller          # expect "control socket at ..."
    ```
@@ -89,8 +96,9 @@ need an operator with sudo. Everything after this runs as `jim` without Docker a
    ```
 
    Expected result: `user=10001:10001`, `caps=[ALL]`, `sec=[no-new-privileges]`,
-   exactly three mounts (the workspace, rw; `brief.md`, ro; the run's `control/`
-   directory at `/dgx-control`, ro), no `docker.sock`, and one port binding:
+   exactly three mounts (the workspace, rw; the run's `frozen/` agreement at
+   `/brief`, ro; the run's `control/` directory at `/dgx-control`, ro), no
+   `docker.sock`, and one port binding:
    `3000/tcp` on `127.0.0.1:<host port>` (43000 and up, one per run).
 
 5. **Install the host pieces** (egress policy, reservation helper, busy notice,
@@ -127,8 +135,12 @@ need an operator with sudo. Everything after this runs as `jim` without Docker a
 Put the CLI on the PATH once: `ln -sf ~/dgx-autonomy/.venv/bin/dgx-autonomy ~/.local/bin/`.
 
 ```bash
-dgx-autonomy launch --brief brief.md [--budget-hours 40] [--model qwen3.6-35b-a3b]
-dgx-autonomy status [RUN_ID]          # phase, outcome, deadline, demo, stop evidence, recoveries
+dgx-autonomy launch --brief DIR|brief.md [--budget-hours 40] [--model qwen3.6-35b-a3b]
+dgx-autonomy status [RUN_ID]          # phase, outcome, deadline, demo, evaluation, stop evidence, recoveries
+dgx-autonomy report [RUN_ID]          # claims, check results, human judgment, evaluations, reviews
+dgx-autonomy evaluate RUN_ID          # run the frozen checks again on an ended run
+dgx-autonomy review-request RUN_ID [--note TEXT]    # bundle for a manual stronger-model review
+dgx-autonomy review-record RUN_ID N --reviewer M --file review.md
 dgx-autonomy logs RUN_ID [--follow]   # summarized OpenHands events
 dgx-autonomy stop RUN_ID              # end agent execution now; the demo stays up
 dgx-autonomy tunnel [RUN_ID]          # prints: ssh -N -L <p>:127.0.0.1:<p> hugo-dgx1
@@ -141,11 +153,13 @@ dgx-autonomy reservation              # held or not, since when, memory availabl
 dgx-autonomy egress [HOST:PORT ...]   # is the egress policy in place / probe through it
 ```
 
-The CLI sends the contents of the brief file, because the controller cannot read
-jim's files. The controller stores its own copy at
-`/var/lib/dgx-autonomy/runs/<id>/brief.md`, and the agent sees it read-only at
-`/brief/brief.md`. The project the agent builds is at
-`/var/lib/dgx-autonomy/runs/<id>/agent/project`.
+`--brief` takes a brief file, or a directory with `brief.md` and `checks/` (see
+[Acceptance checks](#acceptance-checks)). The CLI sends the contents, because the
+controller cannot read jim's files, together with the sha256 digest of what it read.
+The controller freezes its own copy in `/var/lib/dgx-autonomy/runs/<id>/frozen/` and
+refuses the launch unless the digest of that copy matches. The agent sees it
+read-only at `/brief` (`/brief/brief.md`, `/brief/checks/`). The project the agent
+builds is at `/var/lib/dgx-autonomy/runs/<id>/agent/project`.
 
 `--budget-hours` must be at most 40. The deadline is written once at launch and
 never moves.
@@ -189,6 +203,115 @@ itself (`&`, `nohup`) end when agent execution ends.
 To open a demo from the laptop, run the command `dgx-autonomy tunnel RUN_ID` prints
 on the DGX, keep it running, and browse to `http://127.0.0.1:<p>/`. The demo is bound
 to DGX loopback only.
+
+### Acceptance checks
+
+A brief directory holds the agreement: what to build, and how completion is checked.
+
+```text
+plan/
+  brief.md
+  checks/
+    criteria.yaml
+    home.spec.ts          Playwright Test (TypeScript or JavaScript)
+    test_version.py       pytest (httpx is installed)
+```
+
+```yaml
+criteria:
+  - key: home                       # [a-z0-9-]
+    description: The home page shows the heading "hello"
+    test: home.spec.ts              # *.spec.ts / *.test.js ... -> Playwright; test_*.py -> pytest
+  - key: version
+    description: GET /version.txt returns the text 2
+    test: test_version.py
+    required: false                 # reported, but does not block completion
+  - key: tidy
+    description: The page looks tidy on a phone
+    kind: human_judgment            # never automated, never counted as a pass
+```
+
+The checks exercise the running app from outside, through the demo. `APP_URL` (and
+Playwright's `baseURL`) is the demo as the evaluator reaches it,
+`http://dgx-autonomy-agent-<run>:3000`. The Playwright config is fixed by the
+evaluator image (one worker, no retries, 60 s per test, a screenshot and a trace on
+failure); the checks are only spec files.
+
+**Frozen.** At launch the controller writes the brief and checks once, into a
+controller-owned directory, and records their digest on the run. The agent reads them
+at `/brief` (read-only), and it is told that its finish is checked. The digest is
+checked again before the sandbox is created and before every evaluation. A changed
+agreement fails the launch step, and no evaluation runs against it.
+
+**A finish is a claim.** When the conversation finishes and the run has automated
+checks, the run stays `running` and the claim is evaluated, one step per controller
+tick:
+
+1. *Pin.* Check the frozen digest, then snapshot the project: a git commit in a git
+   directory the controller owns (`runs/<id>/snapshots.git`). The agent's own
+   repository, config and hooks are never used. The snapshot id is the tree sha.
+   The project's `.gitignore` and default caches (`node_modules/`, `.next/`, ...)
+   are left out.
+2. *Demo.* The demo must serve that snapshot. A demo started (by `start_demo`) from
+   another snapshot is relaunched with its recorded command. No demo, or a demo that
+   does not listen, fails the claim with that reason.
+3. *Run.* Each automated check runs in its own evaluator container. The checks are
+   mounted read-only at `/checks` and a fresh directory for that check at `/out`. The
+   container runs as uid 10002 with no capabilities, `no-new-privileges`, 4 GiB, 4 CPUs
+   and 1024 pids. It is on the egress network only, and only while the egress policy
+   is in place. It has no Docker socket, no model, and no controller state. The runner
+   gets 10 minutes; the container is removed afterwards.
+4. *Conclude.* Snapshot again. If the project changed while the checks ran, the
+   result cannot be attributed to the pinned snapshot: `inconclusive`. Otherwise the
+   evaluation is `passed` when every required check passed, `failed` when one
+   failed, and `infra_error` when one could not produce a result.
+
+A result comes only from the runner's own report: Playwright's JSON report or
+pytest's JUnit XML, read without following symlinks. A runner that crashes, times
+out, finds no tests, is killed (out of memory) or writes no report is an
+infrastructure error. It is never a pass, and never the application's failure.
+
+Then:
+
+- `passed`: the run is `finished`.
+- `failed`: the builder gets one message with each check's result and the failure
+  excerpt (assertion, expected and received values). The conversation resumes, and its
+  next finish is a new claim.
+- `inconclusive` or `infra_error`: nothing is sent to the builder. The same claim is
+  evaluated again after 30 s, then 60 s, and so on, up to 15 minutes apart, until the
+  deadline.
+
+A deadline or `stop` during an evaluation abandons it (`inconclusive`) and removes its
+containers. When a run ends without a passing evaluation (stopped, expired, or its
+conversation failed), a `final` evaluation checks what it left, against the retained
+demo. It is for the report only. `dgx-autonomy evaluate RUN_ID` runs the checks again
+on an ended run. A controller restart starts an open evaluation over. The interrupted
+attempt's evidence is set aside as `eval-<n>.interrupted-<time>`.
+
+**Evidence** is in `runs/<id>/evidence/eval-<n>/`: `evaluation.json` (status, check
+digest, snapshot, per-check results), `<i>-<key>/` (what that evaluator wrote: the
+JSON report or JUnit XML, and Playwright's screenshots and traces), and `<i>-<key>.log`
+(the runner's output). The agent never sees any of it.
+
+**The report** (`dgx-autonomy report RUN_ID`) keeps each kind of evidence apart:
+
+- the builder's *claims*, with the evaluations that answered them;
+- each *automated check*, with its latest result, bound to an evaluation, a
+  snapshot and the check digest, and its history (for example `#1 failed -> #2
+  passed`);
+- the criteria *awaiting human judgment*;
+- every *evaluation*, with what changed in the project since the previous one;
+- any *stronger-model reviews*.
+
+A run is `VERIFIED` only if it finished on a passing evaluation of the intact frozen
+checks. A run without automated checks is reported as *claimed only*.
+
+**Stronger-model review** happens only when the operator asks for it.
+`review-request` writes a bundle to `runs/<id>/reviews/review-<n>/`: the agreement, the
+report, and the project at its latest evaluated snapshot as `project.tar`. Nothing is
+sent anywhere. The operator runs the review, then `review-record` attaches the result.
+The report shows the result in its own section. It never changes a check result or
+the verdict.
 
 ### Crashes and DGX restarts
 
@@ -310,12 +433,17 @@ The sudoers entry (`host/sudoers-autonomy`) lets jim run exactly `reserve`,
 ```text
 /var/lib/dgx-autonomy/            controller-owned (root), mounted at the same path in the controller
   control/control.sock            0600, owned by jim
-  state/controller.sqlite3        runs, operations, demos, recoveries (never mounted into agent/inference)
+  state/controller.sqlite3        runs, operations, demos, recoveries, criteria, evaluations, reviews
+                                  (never mounted into agent, inference or evaluator)
   state/controller.lock           the controller's writer lock (flock)
   policy/egress.json              written by dgx-autonomy-egress: boot id, rules sha256
   reservation/record.json         present while claude-qwen is displaced (host helper)
   reservation/prior/              the unit text and `systemctl cat` before reserve
-  runs/<id>/brief.md              frozen copy, mounted read-only into the agent
+  runs/<id>/frozen/               the agreement, frozen at launch; read-only at /brief in the agent
+    brief.md, checks/, manifest.json   (checks/ is also read-only at /checks in evaluators)
+  runs/<id>/evidence/eval-<n>/    evaluation evidence (controller-owned; never mounted into the agent)
+  runs/<id>/snapshots.git/        project snapshots (controller-owned git directory, 0700)
+  runs/<id>/reviews/review-<n>/   manual review bundles
   runs/<id>/control/              mounted read-only at /dgx-control: mode, demo.json
   runs/<id>/secrets/              Agent Server session key and secret key, 0700 root
   runs/<id>/agent/                uid 10001; the agent's /workspace
@@ -344,6 +472,7 @@ ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_stop_retains_demo.py -s'
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_egress.py'
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_controller_kill.py -s'
+ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_protected_eval.py -s'
 # stops claude-qwen for a few minutes; opt in explicitly:
 ssh hugo-dgx1 'cd ~/dgx-autonomy && DGX_AUTONOMY_RESERVATION_TEST=1 ~/.local/bin/uv run pytest -m dgx tests/dgx/test_reserve_release.py -s'
 ```
@@ -354,3 +483,6 @@ prints the stop evidence, including which processes were alive after the pause.
 and expects each to be rejected at once, not to time out. `test_controller_kill.py`
 crashes the controller, and then the whole stack, in the middle of two short runs,
 and expects each run to finish its brief in the same conversation.
+`test_protected_eval.py` gives the builder a brief that omits something a frozen
+check requires. The builder's tampering with the checks must fail, its first claim
+must fail, and its repair must pass. With `-s` it prints the report.

@@ -11,6 +11,11 @@ Tables:
 - `recoveries`: each time the controller brought a run's inference or sandbox back
   after it went down (a crash, a DGX restart), with what it found and did.
 - `controller_lock`: the one controller allowed to write. See `acquire_writer`.
+- `criteria`: the acceptance criteria frozen at launch (frozen.py), automated or
+  awaiting human judgment.
+- `evaluations`: each run of the frozen checks against a pinned project snapshot,
+  with its per-criterion results and where its evidence is.
+- `reviews`: manually requested stronger-model reviews, kept apart from the checks.
 
 `pragma user_version` records the schema version. Older databases are migrated in
 place on open.
@@ -24,7 +29,7 @@ import os
 import sqlite3
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -37,8 +42,12 @@ OperationKind = Literal["inference.start", "workspace.create", "conversation.sta
 OperationStatus = Literal["intended", "done", "failed"]
 DemoState = Literal["reserved", "starting", "running", "failed", "refused"]
 RecoveryStatus = Literal["intended", "done", "failed"]
+EvaluationResult = Literal["passed", "failed", "inconclusive", "infra_error"]
+EvaluationStatus = Literal["intended", "passed", "failed", "inconclusive", "infra_error"]
+EvaluationTrigger = Literal["claim", "final", "requested"]
+ReviewStatus = Literal["requested", "recorded"]
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TERMINAL_PHASES: frozenset[str] = frozenset({"stopped", "finished", "failed"})
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "launched": frozenset({"running", "failed", "stopping"}),
@@ -137,6 +146,67 @@ create table if not exists controller_lock (
 """
 
 
+_CRITERIA_TABLE = """
+create table if not exists criteria (
+    run_id               text not null references runs(id),
+    key                  text not null,
+    position             integer not null,
+    kind                 text not null check (kind in ('automated', 'human_judgment')),
+    required             integer not null check (required in (0, 1)),
+    description          text not null,
+    test                 text,              -- automated: the check file under checks/
+    runner               text,              -- automated: pytest | playwright
+    latest_evaluation_id text,              -- the last evaluation that reported on it
+    latest_status        text,
+    primary key (run_id, key)
+);
+"""
+
+_EVALUATIONS_TABLE = """
+create table if not exists evaluations (
+    id                    text primary key,   -- <run_id>.eval.<n>
+    run_id                text not null references runs(id),
+    n                     integer not null,
+    trigger               text not null check (trigger in ('claim', 'final', 'requested')),
+    -- The builder's completion claim this evaluation answers (claim trigger).
+    claim_event_id        text,
+    claim_text            text,
+    check_digest          text not null,      -- the frozen agreement it ran
+    workspace_snapshot_id text,               -- git tree sha of the checked project
+    snapshot_commit       text,
+    status                text not null check (status in
+                              ('intended', 'passed', 'failed', 'inconclusive', 'infra_error')),
+    detail                text,
+    steps                 text not null default '{}',   -- JSON: progress of this attempt
+    results               text not null default '{}',   -- JSON: criterion key -> result
+    evidence_dir          text not null,      -- controller-owned
+    started_at            text not null,
+    attempted_at          text not null,
+    finished_at           text,
+    delivered_at          text,               -- failures handed to the builder
+    unique (run_id, n)
+);
+"""
+
+_REVIEWS_TABLE = """
+create table if not exists reviews (
+    id              text primary key,   -- <run_id>.review.<n>
+    run_id          text not null references runs(id),
+    n               integer not null,
+    status          text not null check (status in ('requested', 'recorded')),
+    note            text,
+    evaluation_id   text,               -- the latest evaluation when it was requested
+    snapshot_commit text,
+    bundle_dir      text not null,
+    requested_at    text not null,
+    reviewer        text,
+    result_path     text,
+    recorded_at     text,
+    unique (run_id, n)
+);
+"""
+
+
 class StateError(RuntimeError):
     """A lifecycle rule would be broken."""
 
@@ -167,6 +237,9 @@ class Run:
     stop_requested: bool = False
     outcome: RunOutcome | None = None
     stop_evidence: str | None = None  # JSON, see controller.StopEvidence
+    # frozen.bundle_digest of the brief and checks, recorded at launch. None for
+    # runs launched before the agreement was frozen (schema < 4).
+    frozen_digest: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -198,6 +271,8 @@ class Demo:
     state: DemoState
     message: str | None
     updated_at: datetime
+    # The project snapshot (tree sha) the demo was last started from.
+    snapshot_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +301,62 @@ class WriterHolder:
     acquired_at: datetime
 
 
+@dataclass(frozen=True)
+class CriterionRow:
+    run_id: str
+    key: str
+    position: int
+    kind: str
+    required: bool
+    description: str
+    test: str | None
+    runner: str | None
+    latest_evaluation_id: str | None
+    latest_status: str | None
+
+
+@dataclass(frozen=True)
+class Evaluation:
+    id: str
+    run_id: str
+    n: int
+    trigger: EvaluationTrigger
+    claim_event_id: str | None
+    claim_text: str | None
+    check_digest: str
+    snapshot_id: str | None
+    snapshot_commit: str | None
+    status: EvaluationStatus
+    detail: str | None
+    steps: dict[str, Any]
+    results: dict[str, Any]
+    evidence_dir: str
+    started_at: datetime
+    attempted_at: datetime
+    finished_at: datetime | None
+    delivered_at: datetime | None
+
+    @property
+    def open(self) -> bool:
+        return self.status == "intended"
+
+
+@dataclass(frozen=True)
+class Review:
+    id: str
+    run_id: str
+    n: int
+    status: ReviewStatus
+    note: str | None
+    evaluation_id: str | None
+    snapshot_commit: str | None
+    bundle_dir: str
+    requested_at: datetime
+    reviewer: str | None
+    result_path: str | None
+    recorded_at: datetime | None
+
+
 def operation_id(run_id: str, kind: OperationKind) -> str:
     return f"{run_id}.{kind}"
 
@@ -247,6 +378,14 @@ def _migrate(db: sqlite3.Connection) -> None:
             db.execute("alter table operations add column attempted_at text")
             db.execute(_RECOVERIES_TABLE)
             db.execute(_CONTROLLER_LOCK_TABLE)
+        if version < 4:
+            # v3 -> v4: the frozen agreement, its criteria, evaluations and reviews;
+            # the snapshot a demo was started from.
+            db.execute("alter table runs add column frozen_digest text")
+            db.execute("alter table demos add column snapshot_id text")
+            db.execute(_CRITERIA_TABLE)
+            db.execute(_EVALUATIONS_TABLE)
+            db.execute(_REVIEWS_TABLE)
         problems = db.execute("pragma foreign_key_check").fetchall()
         if problems:
             raise StateError(f"schema migration broke foreign keys: {problems}")
@@ -400,15 +539,40 @@ class StateStore:
         launched_at: datetime,
         deadline_at: datetime,
         brief_path: str,
+        frozen_digest: str | None = None,
+        criteria: Sequence[Mapping[str, Any]] = (),
     ) -> Run:
+        """The run and its frozen criteria, in one transaction."""
         if deadline_at <= launched_at:
             raise StateError("deadline must be after launch")
         with self._tx() as db:
             db.execute(
-                "insert into runs (id, phase, model_key, launched_at, deadline_at, brief_path)"
-                " values (?, 'launched', ?, ?, ?, ?)",
-                (run_id, model_key, _iso(launched_at), _iso(deadline_at), brief_path),
+                "insert into runs (id, phase, model_key, launched_at, deadline_at, brief_path,"
+                " frozen_digest) values (?, 'launched', ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    model_key,
+                    _iso(launched_at),
+                    _iso(deadline_at),
+                    brief_path,
+                    frozen_digest,
+                ),
             )
+            for i, c in enumerate(criteria):
+                db.execute(
+                    "insert into criteria (run_id, key, position, kind, required, description,"
+                    " test, runner) values (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        c["key"],
+                        i,
+                        c["kind"],
+                        int(bool(c.get("required", True))),
+                        c["description"],
+                        c.get("test"),
+                        c.get("runner"),
+                    ),
+                )
         return self._require_run(run_id)
 
     def get_run(self, run_id: str) -> Run | None:
@@ -758,6 +922,233 @@ class StateStore:
             )
         return self._require_demo(run_id)
 
+    def set_demo_snapshot(self, run_id: str, snapshot_id: str | None) -> Demo:
+        """The project snapshot the demo was (re)started from."""
+        with self._tx() as db:
+            db.execute("update demos set snapshot_id = ? where run_id = ?", (snapshot_id, run_id))
+        return self._require_demo(run_id)
+
+    # --- criteria and evaluations --------------------------------------------------
+
+    def criteria(self, run_id: str) -> list[CriterionRow]:
+        with self._lock:
+            rows = self._db.execute(
+                "select * from criteria where run_id = ? order by position", (run_id,)
+            ).fetchall()
+        return [_criterion(r) for r in rows]
+
+    def begin_evaluation(
+        self,
+        run_id: str,
+        *,
+        trigger: EvaluationTrigger,
+        check_digest: str,
+        evidence_root: str,
+        now: datetime,
+        claim_event_id: str | None = None,
+        claim_text: str | None = None,
+    ) -> Evaluation:
+        """Persist the intent to evaluate before anything runs. Returns the open
+        evaluation instead if the run already has one."""
+        with self._tx() as db:
+            row = db.execute(
+                "select id from evaluations where run_id = ? and status = 'intended'", (run_id,)
+            ).fetchone()
+            if row is not None:
+                ev_id = str(row["id"])
+            else:
+                n = int(
+                    db.execute(
+                        "select coalesce(max(n), 0) + 1 from evaluations where run_id = ?",
+                        (run_id,),
+                    ).fetchone()[0]
+                )
+                ev_id = f"{run_id}.eval.{n}"
+                db.execute(
+                    "insert into evaluations (id, run_id, n, trigger, claim_event_id, claim_text,"
+                    " check_digest, status, evidence_dir, started_at, attempted_at)"
+                    " values (?, ?, ?, ?, ?, ?, ?, 'intended', ?, ?, ?)",
+                    (
+                        ev_id,
+                        run_id,
+                        n,
+                        trigger,
+                        claim_event_id,
+                        claim_text,
+                        check_digest,
+                        f"{evidence_root.rstrip('/')}/eval-{n}",
+                        _iso(now),
+                        _iso(now),
+                    ),
+                )
+        return self._require_evaluation(ev_id)
+
+    def evaluations(self, run_id: str) -> list[Evaluation]:
+        with self._lock:
+            rows = self._db.execute(
+                "select * from evaluations where run_id = ? order by n", (run_id,)
+            ).fetchall()
+        return [_evaluation(r) for r in rows]
+
+    def open_evaluation(self, run_id: str) -> Evaluation | None:
+        with self._lock:
+            row = self._db.execute(
+                "select * from evaluations where run_id = ? and status = 'intended'", (run_id,)
+            ).fetchone()
+        return _evaluation(row) if row else None
+
+    def open_evaluations(self) -> list[Evaluation]:
+        with self._lock:
+            rows = self._db.execute(
+                "select * from evaluations where status = 'intended' order by run_id, n"
+            ).fetchall()
+        return [_evaluation(r) for r in rows]
+
+    def record_evaluation_steps(self, ev_id: str, steps: dict[str, Any]) -> Evaluation:
+        with self._tx() as db:
+            db.execute(
+                "update evaluations set steps = ? where id = ? and status = 'intended'",
+                (json.dumps(steps, sort_keys=True), ev_id),
+            )
+        return self._require_evaluation(ev_id)
+
+    def pin_evaluation(self, ev_id: str, *, snapshot_id: str, snapshot_commit: str) -> Evaluation:
+        """The project snapshot this evaluation checks. Written once per attempt."""
+        with self._tx() as db:
+            db.execute(
+                "update evaluations set workspace_snapshot_id = ?, snapshot_commit = ?"
+                " where id = ? and status = 'intended' and workspace_snapshot_id is null",
+                (snapshot_id, snapshot_commit, ev_id),
+            )
+        return self._require_evaluation(ev_id)
+
+    def retry_evaluation(self, ev_id: str, now: datetime) -> Evaluation:
+        """Start an open evaluation over (the controller restarted in the middle).
+
+        Nothing it did is trusted: steps, snapshot and results are cleared, the
+        evaluator containers are removed by the caller, and it runs again.
+        """
+        with self._tx() as db:
+            db.execute(
+                "update evaluations set steps = '{}', results = '{}', workspace_snapshot_id = null,"
+                " snapshot_commit = null, attempted_at = ? where id = ? and status = 'intended'",
+                (_iso(now), ev_id),
+            )
+        return self._require_evaluation(ev_id)
+
+    def finish_evaluation(
+        self,
+        ev_id: str,
+        *,
+        status: EvaluationResult,
+        detail: str | None,
+        results: Mapping[str, Mapping[str, Any]],
+        now: datetime,
+    ) -> Evaluation:
+        """Record the outcome and point each reported criterion at it."""
+        with self._tx() as db:
+            row = db.execute(
+                "select run_id, status from evaluations where id = ?", (ev_id,)
+            ).fetchone()
+            if row is None:
+                raise StateError(f"no evaluation {ev_id}")
+            if row["status"] == "intended":
+                db.execute(
+                    "update evaluations set status = ?, detail = ?, results = ?, finished_at = ?"
+                    " where id = ?",
+                    (status, detail, json.dumps(results, sort_keys=True), _iso(now), ev_id),
+                )
+                for key, result in results.items():
+                    db.execute(
+                        "update criteria set latest_evaluation_id = ?, latest_status = ?"
+                        " where run_id = ? and key = ?",
+                        (ev_id, str(result.get("status")), row["run_id"], key),
+                    )
+        return self._require_evaluation(ev_id)
+
+    def mark_delivered(self, ev_id: str, now: datetime) -> Evaluation:
+        with self._tx() as db:
+            db.execute(
+                "update evaluations set delivered_at = coalesce(delivered_at, ?) where id = ?",
+                (_iso(now), ev_id),
+            )
+        return self._require_evaluation(ev_id)
+
+    def _require_evaluation(self, ev_id: str) -> Evaluation:
+        with self._lock:
+            row = self._db.execute("select * from evaluations where id = ?", (ev_id,)).fetchone()
+        if row is None:
+            raise StateError(f"no evaluation {ev_id}")
+        return _evaluation(row)
+
+    # --- manual reviews ------------------------------------------------------------
+
+    def request_review(
+        self,
+        run_id: str,
+        *,
+        note: str | None,
+        evaluation_id: str | None,
+        snapshot_commit: str | None,
+        bundle_root: str,
+        now: datetime,
+    ) -> Review:
+        with self._tx() as db:
+            n = int(
+                db.execute(
+                    "select coalesce(max(n), 0) + 1 from reviews where run_id = ?", (run_id,)
+                ).fetchone()[0]
+            )
+            review_id = f"{run_id}.review.{n}"
+            db.execute(
+                "insert into reviews (id, run_id, n, status, note, evaluation_id, snapshot_commit,"
+                " bundle_dir, requested_at) values (?, ?, ?, 'requested', ?, ?, ?, ?, ?)",
+                (
+                    review_id,
+                    run_id,
+                    n,
+                    note,
+                    evaluation_id,
+                    snapshot_commit,
+                    f"{bundle_root.rstrip('/')}/review-{n}",
+                    _iso(now),
+                ),
+            )
+        return self._require_review(review_id)
+
+    def record_review(
+        self, run_id: str, n: int, *, reviewer: str, result_path: str, now: datetime
+    ) -> Review:
+        review_id = f"{run_id}.review.{n}"
+        with self._tx() as db:
+            db.execute(
+                "update reviews set status = 'recorded', reviewer = ?, result_path = ?,"
+                " recorded_at = ? where id = ?",
+                (reviewer, result_path, _iso(now), review_id),
+            )
+        return self._require_review(review_id)
+
+    def reviews(self, run_id: str) -> list[Review]:
+        with self._lock:
+            rows = self._db.execute(
+                "select * from reviews where run_id = ? order by n", (run_id,)
+            ).fetchall()
+        return [_review(r) for r in rows]
+
+    def get_review(self, run_id: str, n: int) -> Review | None:
+        with self._lock:
+            row = self._db.execute(
+                "select * from reviews where id = ?", (f"{run_id}.review.{n}",)
+            ).fetchone()
+        return _review(row) if row else None
+
+    def _require_review(self, review_id: str) -> Review:
+        with self._lock:
+            row = self._db.execute("select * from reviews where id = ?", (review_id,)).fetchone()
+        if row is None:
+            raise StateError(f"no review {review_id}")
+        return _review(row)
+
     def _require_demo(self, run_id: str) -> Demo:
         demo = self.get_demo(run_id)
         if demo is None:
@@ -777,6 +1168,7 @@ def _run(row: sqlite3.Row) -> Run:
         stop_requested=bool(row["stop_requested"]),
         outcome=cast(RunOutcome | None, row["outcome"]),
         stop_evidence=row["stop_evidence"],
+        frozen_digest=row["frozen_digest"],
     )
 
 
@@ -830,4 +1222,60 @@ def _demo(row: sqlite3.Row) -> Demo:
         state=cast(DemoState, row["state"]),
         message=row["message"],
         updated_at=_parse(row["updated_at"]),
+        snapshot_id=row["snapshot_id"],
+    )
+
+
+def _criterion(row: sqlite3.Row) -> CriterionRow:
+    return CriterionRow(
+        run_id=row["run_id"],
+        key=row["key"],
+        position=int(row["position"]),
+        kind=row["kind"],
+        required=bool(row["required"]),
+        description=row["description"],
+        test=row["test"],
+        runner=row["runner"],
+        latest_evaluation_id=row["latest_evaluation_id"],
+        latest_status=row["latest_status"],
+    )
+
+
+def _evaluation(row: sqlite3.Row) -> Evaluation:
+    return Evaluation(
+        id=row["id"],
+        run_id=row["run_id"],
+        n=int(row["n"]),
+        trigger=cast(EvaluationTrigger, row["trigger"]),
+        claim_event_id=row["claim_event_id"],
+        claim_text=row["claim_text"],
+        check_digest=row["check_digest"],
+        snapshot_id=row["workspace_snapshot_id"],
+        snapshot_commit=row["snapshot_commit"],
+        status=cast(EvaluationStatus, row["status"]),
+        detail=row["detail"],
+        steps=json.loads(row["steps"] or "{}"),
+        results=json.loads(row["results"] or "{}"),
+        evidence_dir=row["evidence_dir"],
+        started_at=_parse(row["started_at"]),
+        attempted_at=_parse(row["attempted_at"]),
+        finished_at=_parse(row["finished_at"]) if row["finished_at"] else None,
+        delivered_at=_parse(row["delivered_at"]) if row["delivered_at"] else None,
+    )
+
+
+def _review(row: sqlite3.Row) -> Review:
+    return Review(
+        id=row["id"],
+        run_id=row["run_id"],
+        n=int(row["n"]),
+        status=cast(ReviewStatus, row["status"]),
+        note=row["note"],
+        evaluation_id=row["evaluation_id"],
+        snapshot_commit=row["snapshot_commit"],
+        bundle_dir=row["bundle_dir"],
+        requested_at=_parse(row["requested_at"]),
+        reviewer=row["reviewer"],
+        result_path=row["result_path"],
+        recorded_at=_parse(row["recorded_at"]) if row["recorded_at"] else None,
     )

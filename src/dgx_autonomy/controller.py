@@ -4,8 +4,11 @@ A command (for example `launch`) only persists the requested transition and wake
 reconcile loop. The loop does the work, one idempotent step per tick:
 
     launched: ensure inference -> ensure workspace -> start conversation -> running
-    running:  observe the conversation; FINISHED -> finished, ERROR/STUCK -> failed;
-              serve start_demo requests
+    running:  observe the conversation; FINISHED is a completion claim: without
+              frozen acceptance checks the run is finished, with them the claim is
+              evaluated (evaluation.py) and the run is finished only when every
+              required check passed, otherwise the failures go back to the builder;
+              ERROR/STUCK -> failed; serve start_demo requests
     stopping: end agent execution (retried until it is verified)
 
 Every external side effect is preceded by a durable operation intent. A step that is
@@ -32,14 +35,15 @@ agent tool action, and no recovery moves the deadline.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
 import secrets
+import shutil
 import signal
 import socket
-import stat
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -48,10 +52,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .agent_files import AgentFileError, read_json
+from . import frozen
+from .agent_files import AgentFileError, make_world_readable, read_json
 from .config import ConfigError, ModelCatalog, Settings, load_models
 from .deadline import DeadlineWatchdog
 from .egress import EgressPolicyError, check_policy, probe, probe_targets
+from .evaluation import EvaluationError, Evaluator, app_url, failure_message
 from .inference import InferenceError, InferenceManager
 from .openhands_adapter import (
     ConversationError,
@@ -74,21 +80,27 @@ from .ports import (
     RuntimePort,
     SandboxProcess,
     ServerRef,
+    SnapshotPort,
     WorkspaceHandle,
     WorkspaceSpec,
 )
 from .runtime import (
     AGENT_BRIEF_PATH,
+    AGENT_CHECKS_DIR,
     AGENT_PROJECT_DIR,
     LABEL_OP,
     DockerError,
     agent_container_name,
 )
+from .snapshot import GitSnapshots, SnapshotError
 from .state import (
+    CriterionRow,
     Demo,
+    Evaluation,
     Operation,
     OperationKind,
     Recovery,
+    Review,
     Run,
     StateStore,
     WriterLockError,
@@ -109,6 +121,10 @@ MAX_BRIEF_BYTES = 256 * 1024
 MAX_DEMO_REQUEST_BYTES = 16 * 1024
 MAX_DEMO_COMMAND = 4096
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# How many recent events to search for the builder's completion claim, and its finish
+# action as summarize_event writes it ("finish {...}", or "<thought> -> finish {...}").
+_CLAIM_LOOKBACK = 20
+_FINISH_ACTION = re.compile(r"(^|-> )finish \{")
 # Processes that are the Agent Server itself rather than something a tool started.
 _SERVER_MARKERS = ("openhands-agent-server", ".openvscode-server")
 
@@ -132,7 +148,27 @@ class RunPaths:
 
     @property
     def brief(self) -> Path:
+        """Where runs launched before Phase 5 kept their brief."""
         return self.root / "brief.md"
+
+    @property
+    def frozen_dir(self) -> Path:
+        """The frozen brief and checks (frozen.py); read-only at /brief in the sandbox."""
+        return self.root / "frozen"
+
+    @property
+    def evidence_dir(self) -> Path:
+        """Controller-owned evaluation evidence, one directory per evaluation."""
+        return self.root / "evidence"
+
+    @property
+    def snapshots_dir(self) -> Path:
+        """Controller-owned git directory with the project snapshots (snapshot.py)."""
+        return self.root / "snapshots.git"
+
+    @property
+    def reviews_dir(self) -> Path:
+        return self.root / "reviews"
 
     @property
     def agent_dir(self) -> Path:
@@ -191,13 +227,23 @@ def _atomic_write(path: Path, data: str, mode: int) -> None:
     os.replace(tmp, path)
 
 
-def agent_message(brief: str) -> str:
-    return (
+def agent_message(brief: str, *, checks: bool = False) -> str:
+    text = (
         "You are working unattended; nobody will answer questions until the work is done.\n"
         f"Your project directory is {AGENT_PROJECT_DIR}. The agreed brief is below and is also"
         f" available read-only at {AGENT_BRIEF_PATH}.\n"
         "To serve the app for the operator, use the start_demo tool: it is the only way to"
         " keep the app running after your work ends.\n"
+    )
+    if checks:
+        text += (
+            f"The agreed acceptance checks are read-only in {AGENT_CHECKS_DIR}"
+            f" ({frozen.CRITERIA_FILE} lists the criteria). When you finish, the environment"
+            " runs the automated checks against the app that start_demo serves. Your work is"
+            " complete only when they pass; otherwise you get the failures and continue."
+            " Criteria marked human_judgment are judged by the operator later.\n"
+        )
+    return text + (
         "Complete the brief, verify the result yourself, then finish.\n\n"
         "--- BRIEF ---\n"
         f"{brief.strip()}\n"
@@ -223,6 +269,25 @@ def recovery_notice(cause: str, *, sandbox_restarted: bool, demo_relaunched: boo
         lines.append("The demo was relaunched with the command you gave start_demo.")
     lines.append("Check the state of the project and continue with the brief.")
     return "\n".join(lines)
+
+
+def review_readme(run_id: str, n: int, commit: str | None, note: str | None) -> str:
+    return f"""# Review request #{n} for run {run_id}
+
+A manually requested review by a stronger model. It is not one of the automated
+acceptance checks, and the report keeps its result apart from them.
+
+- `agreement/brief.md`: the brief agreed at launch
+- `agreement/checks/`: the frozen acceptance criteria and their checks
+- `report.json`: the builder's claims, the check results, criteria awaiting human
+  judgment, and every evaluation
+- `project.tar`: the project at snapshot {commit or "?"}
+
+Review the project against the brief for gaps the automated checks may miss. The
+demo can be opened with `dgx-autonomy tunnel {run_id}`. Record the result with
+
+    dgx-autonomy review-record {run_id} {n} --reviewer MODEL --file review.md
+{f"{chr(10)}Note from the operator: {note}{chr(10)}" if note else ""}"""
 
 
 def _describe(container: ContainerState | None) -> str:
@@ -279,6 +344,7 @@ class Controller:
         chown: Callable[[Path, int, int], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         crash: Callable[[], None] | None = None,
+        snapshots: SnapshotPort | None = None,
     ) -> None:
         self._settings = settings
         self._state = state
@@ -297,6 +363,15 @@ class Controller:
         self._stop_locks: dict[str, threading.Lock] = {}
         self._stop_locks_guard = threading.Lock()
         self._bad_requests: dict[str, str] = {}
+        self._projects: SnapshotPort = snapshots if snapshots is not None else GitSnapshots()
+        self._evaluator = Evaluator(
+            settings=settings,
+            state=state,
+            runtime=runtime,
+            snapshots=self._projects,
+            clock=clock,
+            chown=self._chown,
+        )
 
     # --- paths & secrets -----------------------------------------------------------
 
@@ -351,6 +426,10 @@ class Controller:
             "network.policy": lambda a: check_policy(self._settings, self._runtime).as_dict(),
             "network.probe": self.network_probe,
             "fault.inject": self.fault_inject,
+            "report": self.report,
+            "evaluate": self.evaluate,
+            "review.request": self.review_request,
+            "review.record": self.review_record,
         }
         handler = handlers.get(op)
         if handler is None:
@@ -358,11 +437,26 @@ class Controller:
         return handler(args)
 
     def launch(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Freeze the brief and its checks, then record the run with a fixed deadline.
+
+        `checks` maps paths under checks/ to their text; `bundle_digest` is what the
+        CLI computed from the files it read. The frozen copy must have that digest.
+        """
         brief = args.get("brief_text")
         if not isinstance(brief, str) or not brief.strip():
             raise RequestError("launch needs a non-empty brief_text")
         if len(brief.encode()) > MAX_BRIEF_BYTES:
             raise RequestError(f"brief is larger than {MAX_BRIEF_BYTES} bytes")
+        raw_checks = args.get("checks") or {}
+        if not isinstance(raw_checks, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in raw_checks.items()
+        ):
+            raise RequestError("checks must map paths under checks/ to their text")
+        checks = frozen.encode(raw_checks)
+        try:
+            frozen.validate(brief.encode(), checks)
+        except frozen.FrozenError as exc:
+            raise RequestError(str(exc)) from None
         try:
             budget = float(args.get("budget_hours", self._settings.max_budget_hours))
         except (TypeError, ValueError):
@@ -379,23 +473,41 @@ class Controller:
         now = self._clock.now()
         run_id = _new_run_id(now)
         paths = self._prepare_run_dirs(run_id)
-        _atomic_write(paths.brief, brief, 0o644)
+        try:
+            agreement = frozen.freeze(paths.frozen_dir, brief.encode(), checks)
+            # Read back what is on disk: that is what the agent and evaluator will see.
+            agreement = frozen.load(paths.frozen_dir, args.get("bundle_digest") or None)
+        except frozen.FrozenError as exc:
+            shutil.rmtree(paths.frozen_dir, ignore_errors=True)
+            raise RequestError(f"refusing to launch: {exc}") from None
         run = self._state.create_run(
             run_id=run_id,
             model_key=model.key,
             launched_at=now,
             deadline_at=now + timedelta(hours=budget),
-            brief_path=str(paths.brief),
+            brief_path=str(agreement.brief),
+            frozen_digest=agreement.digest,
+            criteria=[c.as_dict() for c in agreement.criteria],
         )
         log.info(
-            "launched %s (model %s, deadline %s, brief from %s)",
+            "launched %s (model %s, deadline %s, brief from %s, %d criteria, %s)",
             run.id,
             model.key,
             run.deadline_at,
             args.get("brief_source", "?"),
+            len(agreement.criteria),
+            agreement.digest,
         )
         self._wake.set()
-        return {"run_id": run.id, "deadline_at": run.deadline_at.isoformat()}
+        return {
+            "run_id": run.id,
+            "deadline_at": run.deadline_at.isoformat(),
+            "frozen_digest": agreement.digest,
+            "criteria": [
+                {"key": c.key, "kind": c.kind, "required": c.required, "test": c.test}
+                for c in agreement.criteria
+            ],
+        }
 
     def _resolve(self, args: Mapping[str, Any]) -> Run:
         run_id = args.get("run_id")
@@ -449,7 +561,293 @@ class Controller:
             for r in self._state.recoveries(run.id)
         ]
         view["containers"] = self._containers_view(run)
+        view["frozen_digest"] = run.frozen_digest
+        criteria = self._state.criteria(run.id)
+        view["criteria"] = {
+            "automated": sum(1 for c in criteria if c.kind == "automated"),
+            "human_judgment": sum(1 for c in criteria if c.kind == "human_judgment"),
+        }
+        evaluations = self._state.evaluations(run.id)
+        view["evaluation"] = self._evaluation_view(evaluations[-1]) if evaluations else None
         return view
+
+    def _evaluation_view(self, ev: Evaluation) -> dict[str, Any]:
+        return {
+            "n": ev.n,
+            "trigger": ev.trigger,
+            "status": ev.status,
+            "detail": ev.detail,
+            "claim": ev.claim_text,
+            "snapshot": ev.snapshot_id,
+            "snapshot_commit": ev.snapshot_commit,
+            "check_digest": ev.check_digest,
+            "demo_relaunched": bool(ev.steps.get("demo_relaunched")),
+            "started_at": ev.started_at.isoformat(),
+            "finished_at": ev.finished_at.isoformat() if ev.finished_at else None,
+            "delivered_at": ev.delivered_at.isoformat() if ev.delivered_at else None,
+            "evidence_dir": ev.evidence_dir,
+            "results": {
+                key: {k: r.get(k) for k in ("status", "summary", "excerpt", "evidence")}
+                for key, r in (ev.results or ev.steps.get("results") or {}).items()
+            },
+        }
+
+    def report(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """What the run established, kept apart by kind of evidence.
+
+        claims            what the builder said when it finished (never a result)
+        automated         each frozen automated check: its latest result, bound to the
+                          evaluation, the project snapshot and the check digest
+        human_judgment    criteria no automation can decide; never counted as passes
+        evaluations       every run of the checks, and what changed in the project
+                          between them
+        reviews           manually requested stronger-model reviews, if any
+        """
+        run = self._resolve(args)
+        status = self.status({"run_id": run.id})
+        criteria = self._state.criteria(run.id)
+        evaluations = self._state.evaluations(run.id)
+        automated = [c for c in criteria if c.kind == "automated"]
+        integrity = self._frozen_integrity(run)
+
+        decided = [e for e in evaluations if not e.open]
+        views = []
+        previous: Evaluation | None = None
+        for ev in evaluations:
+            view = self._evaluation_view(ev)
+            if previous is not None and previous.snapshot_commit and ev.snapshot_commit:
+                try:
+                    view["changes_since_previous"] = self._projects.changed(
+                        self.paths(run.id).snapshots_dir,
+                        previous.snapshot_commit,
+                        ev.snapshot_commit,
+                        limit=50,
+                    )
+                except SnapshotError as exc:
+                    view["changes_since_previous"] = [f"unavailable: {exc}"]
+            if ev.snapshot_commit:
+                previous = ev
+            views.append(view)
+
+        checks = []
+        for c in automated:
+            history = [
+                {"evaluation": e.n, "status": str(e.results[c.key].get("status"))}
+                for e in decided
+                if c.key in e.results
+            ]
+            latest = next((e for e in reversed(decided) if c.key in e.results), None)
+            result = latest.results[c.key] if latest else {}
+            checks.append(
+                {
+                    "key": c.key,
+                    "description": c.description,
+                    "required": c.required,
+                    "test": c.test,
+                    "runner": c.runner,
+                    "status": result.get("status", "not evaluated"),
+                    "summary": result.get("summary"),
+                    "excerpt": result.get("excerpt"),
+                    "evidence": result.get("evidence"),
+                    "evaluation": latest.n if latest else None,
+                    "snapshot": latest.snapshot_id if latest else None,
+                    "check_digest": latest.check_digest if latest else None,
+                    "history": history,
+                }
+            )
+
+        claims: list[dict[str, Any]] = []
+        for ev in evaluations:
+            if ev.trigger != "claim":
+                continue
+            if claims and claims[-1]["event_id"] == ev.claim_event_id:
+                claims[-1]["evaluations"].append({"n": ev.n, "status": ev.status})
+                continue
+            claims.append(
+                {
+                    "event_id": ev.claim_event_id,
+                    "text": ev.claim_text,
+                    "at": ev.started_at.isoformat(),
+                    "evaluations": [{"n": ev.n, "status": ev.status}],
+                }
+            )
+        if not automated and status.get("conversation_status") == "finished":
+            last = status.get("last_event") or {}
+            claims.append({"event_id": last.get("id"), "text": last.get("text"), "evaluations": []})
+
+        verified, verdict = self._verdict(run, automated, decided, integrity)
+        return {
+            "run_id": run.id,
+            "phase": run.phase,
+            "outcome": run.outcome,
+            "launched_at": run.launched_at.isoformat(),
+            "deadline_at": run.deadline_at.isoformat(),
+            "verified": verified,
+            "verdict": verdict,
+            "frozen": integrity,
+            "claims": claims,
+            "automated": checks,
+            "human_judgment": [
+                {
+                    "key": c.key,
+                    "description": c.description,
+                    "required": c.required,
+                    "status": "awaiting human judgment",
+                }
+                for c in criteria
+                if c.kind == "human_judgment"
+            ],
+            "evaluations": views,
+            "reviews": [self._review_view(r) for r in self._state.reviews(run.id)],
+            "demo": status.get("demo"),
+            "workspace_dir": status.get("workspace_dir"),
+        }
+
+    def _frozen_integrity(self, run: Run) -> dict[str, Any]:
+        if run.frozen_digest is None:
+            return {"digest": None, "intact": None, "problem": "launched before checks were frozen"}
+        try:
+            frozen.load(self.paths(run.id).frozen_dir, run.frozen_digest)
+        except frozen.FrozenError as exc:
+            return {"digest": run.frozen_digest, "intact": False, "problem": str(exc)}
+        return {"digest": run.frozen_digest, "intact": True, "problem": None}
+
+    def _verdict(
+        self,
+        run: Run,
+        automated: list[CriterionRow],
+        decided: list[Evaluation],
+        integrity: Mapping[str, Any],
+    ) -> tuple[bool, str]:
+        if not automated:
+            return False, (
+                "claimed only: no automated acceptance checks were agreed, so nothing"
+                " independent verified the builder's claim"
+            )
+        if integrity.get("intact") is False:
+            return False, f"not verified: {integrity['problem']}"
+        last = decided[-1] if decided else None
+        if (
+            run.phase == "finished"
+            and last is not None
+            and last.status == "passed"
+            and last.check_digest == run.frozen_digest
+        ):
+            return True, (
+                f"verified: every required automated check passed in evaluation #{last.n}"
+                f" at snapshot {str(last.snapshot_id)[:12]}"
+            )
+        ending = f"run {run.outcome or run.phase}"
+        if last is None:
+            return False, f"not verified ({ending}): the checks never ran"
+        return False, f"not verified ({ending}): evaluation #{last.n} {last.status}: {last.detail}"
+
+    def evaluate(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Run the frozen checks again on a run that has ended (its demo is kept)."""
+        run = self._resolve(args)
+        if not run.terminal:
+            raise RequestError(
+                f"run {run.id} is {run.phase}; its next completion claim is evaluated automatically"
+            )
+        if run.frozen_digest is None or not self._automated(run.id):
+            raise RequestError(f"run {run.id} has no automated acceptance checks")
+        ev = self._state.begin_evaluation(
+            run.id,
+            trigger="requested",
+            check_digest=run.frozen_digest,
+            evidence_root=str(self.paths(run.id).evidence_dir),
+            now=self._clock.now(),
+        )
+        log.info("%s: evaluation #%d requested by the operator", run.id, ev.n)
+        self._wake.set()
+        return self._evaluation_view(ev)
+
+    def _review_view(self, r: Review) -> dict[str, Any]:
+        view: dict[str, Any] = {
+            "n": r.n,
+            "status": r.status,
+            "note": r.note,
+            "requested_at": r.requested_at.isoformat(),
+            "bundle_dir": r.bundle_dir,
+            "snapshot_commit": r.snapshot_commit,
+            "reviewer": r.reviewer,
+            "recorded_at": r.recorded_at.isoformat() if r.recorded_at else None,
+            "result_path": r.result_path,
+            "result_excerpt": None,
+        }
+        if r.result_path:
+            with contextlib.suppress(OSError):
+                view["result_excerpt"] = _clip(Path(r.result_path).read_text()[:4000], 1500)
+        return view
+
+    def review_request(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Prepare a bundle for a stronger-model review the operator runs by hand.
+
+        Nothing is sent anywhere. The bundle holds the frozen agreement, the report
+        and the project at its latest evaluated snapshot (or now, if none).
+        """
+        run = self._resolve(args)
+        note = args.get("note")
+        if note is not None and (not isinstance(note, str) or len(note) > 4000):
+            raise RequestError("note must be a string of at most 4000 characters")
+        paths = self.paths(run.id)
+        pinned = [e for e in self._state.evaluations(run.id) if e.snapshot_commit]
+        evaluation_id = pinned[-1].id if pinned else None
+        commit = pinned[-1].snapshot_commit if pinned else None
+        try:
+            if commit is None:
+                commit = self._projects.take(
+                    paths.snapshots_dir, paths.project_dir, "review request"
+                ).commit
+        except SnapshotError as exc:
+            raise RequestError(f"cannot snapshot the project: {exc}") from None
+        review = self._state.request_review(
+            run.id,
+            note=note,
+            evaluation_id=evaluation_id,
+            snapshot_commit=commit,
+            bundle_root=str(paths.reviews_dir),
+            now=self._clock.now(),
+        )
+        bundle = Path(review.bundle_dir)
+        bundle.mkdir(mode=0o755, parents=True, exist_ok=True)
+        agreement = self._frozen_dir(run.id)
+        if agreement.exists():
+            shutil.copytree(agreement, bundle / "agreement", dirs_exist_ok=True)
+        try:
+            self._projects.archive(paths.snapshots_dir, commit, bundle / "project.tar")
+        except SnapshotError as exc:
+            raise RequestError(f"cannot archive the project: {exc}") from None
+        report = self.report({"run_id": run.id})
+        _atomic_write(bundle / "report.json", json.dumps(report, indent=2, default=str), 0o644)
+        _atomic_write(bundle / "README.md", review_readme(run.id, review.n, commit, note), 0o644)
+        make_world_readable(bundle)
+        log.info("%s: review #%d requested; bundle in %s", run.id, review.n, bundle)
+        return self._review_view(review)
+
+    def review_record(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Attach the result of a manual review. It is reported as a review only."""
+        run = self._resolve(args)
+        try:
+            n = int(args.get("n", 0))
+        except (TypeError, ValueError):
+            raise RequestError("n must be a review number") from None
+        review = self._state.get_review(run.id, n)
+        if review is None:
+            raise RequestError(f"run {run.id} has no review #{n}")
+        if review.status == "recorded":
+            raise RequestError(f"review #{n} is already recorded")
+        reviewer, text = args.get("reviewer"), args.get("text")
+        if not isinstance(reviewer, str) or not reviewer.strip() or len(reviewer) > 200:
+            raise RequestError("reviewer names the model or person that reviewed")
+        if not isinstance(text, str) or not text.strip() or len(text.encode()) > MAX_BRIEF_BYTES:
+            raise RequestError(f"text must be non-empty and at most {MAX_BRIEF_BYTES} bytes")
+        result = Path(review.bundle_dir) / "review.md"
+        _atomic_write(result, text, 0o644)
+        review = self._state.record_review(
+            run.id, n, reviewer=reviewer.strip(), result_path=str(result), now=self._clock.now()
+        )
+        return self._review_view(review)
 
     def _containers_view(self, run: Run) -> list[dict[str, Any]] | None:
         """The run's labeled containers as Docker reports them (None if it cannot)."""
@@ -722,6 +1120,9 @@ class Controller:
                 self._state.retry_recovery(rec.id, now)
                 log.warning("%s: recovery #%d was interrupted; starting it over", run.id, rec.n)
                 retried.append(rec.id)
+        for ev in self._state.open_evaluations():
+            self._restart_evaluation(ev, now)
+            retried.append(ev.id)
         summary = {
             "expired": expired,
             "retried": retried,
@@ -731,6 +1132,19 @@ class Controller:
         log.info("startup reconciliation: %s", summary)
         self._wake.set()
         return summary
+
+    def _restart_evaluation(self, ev: Evaluation, now: datetime) -> None:
+        """An evaluation the previous controller left open runs again from the start.
+
+        Its evaluator containers are removed and its evidence is set aside, not
+        reused: nothing it did is trusted.
+        """
+        self._evaluator.remove_containers(ev)
+        evidence = Path(ev.evidence_dir)
+        if evidence.exists():
+            evidence.rename(evidence.with_name(f"{evidence.name}.interrupted-{now:%Y%m%dT%H%M%S}"))
+        self._state.retry_evaluation(ev.id, now)
+        log.warning("%s: evaluation #%d was interrupted; starting it over", ev.run_id, ev.n)
 
     def _restore_retained_demos(self) -> list[str]:
         """Bring back the demos of runs that had ended before the restart.
@@ -838,6 +1252,16 @@ class Controller:
                     self._check_demo_start(ended, demo)
                 except Exception:
                     log.exception("demo check %s failed", ended.id)
+            # Final and requested evaluations of runs that have ended; a running run's
+            # claims are evaluated by _observe.
+            for ev in self._state.open_evaluations():
+                ended = self._state.get_run(ev.run_id)
+                if ended is None or not ended.terminal:
+                    continue
+                try:
+                    self._advance_evaluation(ended, ev)
+                except Exception:
+                    log.exception("evaluation %s failed", ev.id)
 
     def _phase_is(self, run_id: str, *phases: str) -> bool:
         """Re-read the phase: a stop may have moved the run on during a slow step."""
@@ -915,6 +1339,14 @@ class Controller:
             self._fail(run, op, f"llama-server not ready in time ({status.health})")
         return False
 
+    def _frozen_dir(self, run_id: str) -> Path:
+        """The run's frozen agreement. A run launched before it existed gets one made
+        from its brief (no checks), so its sandbox can be recreated the same way."""
+        paths = self.paths(run_id)
+        if not paths.frozen_dir.exists() and paths.brief.is_file():
+            frozen.freeze(paths.frozen_dir, paths.brief.read_bytes(), {})
+        return paths.frozen_dir
+
     def _workspace_spec(self, run_id: str, op_id: str) -> WorkspaceSpec:
         paths = self._prepare_run_dirs(run_id)
         demo = self._state.reserve_demo(
@@ -928,7 +1360,7 @@ class Controller:
             run_id=run_id,
             op_id=op_id,
             agent_dir=paths.agent_dir,
-            brief_file=paths.brief,
+            frozen_dir=self._frozen_dir(run_id),
             session_api_key=(paths.secrets_dir / "session_api_key").read_text().strip(),
             secret_key=(paths.secrets_dir / "secret_key").read_text().strip(),
             control_dir=paths.control_dir,
@@ -956,8 +1388,11 @@ class Controller:
         resource = op.resource_id
         if resource is None:
             try:
+                # The agreement the agent will see is the one recorded at launch.
+                if run.frozen_digest is not None:
+                    frozen.load(self.paths(run.id).frozen_dir, run.frozen_digest)
                 handle = self._ensure_workspace(run.id, op.id)
-            except (DockerError, EgressPolicyError) as exc:
+            except (DockerError, EgressPolicyError, frozen.FrozenError) as exc:
                 self._fail(run, op, str(exc))
                 return None
             resource = handle.container_id
@@ -989,7 +1424,9 @@ class Controller:
                 base_url=f"{self._settings.inference_url}/v1",
                 max_input_tokens=model.ctx,
             ),
-            message=agent_message(Path(run.brief_path).read_text()),
+            message=agent_message(
+                Path(run.brief_path).read_text(), checks=bool(self._automated(run.id))
+            ),
         )
         try:
             cid = self._conversations.start(request)
@@ -1022,6 +1459,10 @@ class Controller:
             return
         self._snapshots[run.id] = snap
         if snap.status == "finished":
+            if self._automated(run.id):
+                # A completion claim; the frozen checks decide.
+                self._on_claim(run)
+                return
             if not self._state.try_set_phase(run.id, "finished"):
                 return
             log.info("%s finished", run.id)
@@ -1029,6 +1470,8 @@ class Controller:
             if not self._state.try_set_phase(run.id, "failed"):
                 return
             log.warning("%s conversation ended %s", run.id, snap.status)
+            self._abandon_evaluation(run.id, f"the conversation ended {snap.status}")
+            self._begin_final_evaluation(run.id)
         else:
             return
         self._publish_project(run.id)
@@ -1258,6 +1701,241 @@ class Controller:
                 rec.id, status="failed", error=f"abandoned: {reason}", now=self._clock.now()
             )
 
+    # --- acceptance checks ---------------------------------------------------------
+
+    def _automated(self, run_id: str) -> list[CriterionRow]:
+        return [c for c in self._state.criteria(run_id) if c.kind == "automated"]
+
+    def _claim(self, run: Run) -> tuple[str, str] | None:
+        """The builder's completion claim: (event id, text) of its last finish action or
+        message. None when the Agent Server cannot be asked right now."""
+        if run.conversation_id is None:
+            return None
+        try:
+            recent = self._conversations.recent(
+                self._server_ref(run.id), run.conversation_id, _CLAIM_LOOKBACK
+            )
+        except (ConversationError, OSError) as exc:
+            log.warning("%s: cannot read the completion claim: %s", run.id, exc)
+            return None
+        for e in recent:
+            if (e.kind == "ActionEvent" and _FINISH_ACTION.search(e.text)) or (
+                e.kind == "MessageEvent" and e.source == "agent"
+            ):
+                return e.id, e.text
+        if recent:
+            return recent[0].id, recent[0].text
+        return "unknown", ""
+
+    def _on_claim(self, run: Run) -> None:
+        """The conversation finished: evaluate the claim, once per claim."""
+        ev = self._state.open_evaluation(run.id)
+        if ev is None:
+            claim = self._claim(run)
+            if claim is None or run.frozen_digest is None:
+                return
+            claim_id, claim_text = claim
+            same = [e for e in self._state.evaluations(run.id) if e.claim_event_id == claim_id]
+            if same:
+                last = same[-1]
+                if last.status == "passed":
+                    self._complete(run, last)
+                    return
+                if last.status == "failed":
+                    if last.delivered_at is None:
+                        self._deliver_failure(run, last)
+                    return
+                if not self._evaluation_retry_due(same):
+                    return
+            ev = self._state.begin_evaluation(
+                run.id,
+                trigger="claim",
+                check_digest=run.frozen_digest,
+                evidence_root=str(self.paths(run.id).evidence_dir),
+                now=self._clock.now(),
+                claim_event_id=claim_id,
+                claim_text=claim_text,
+            )
+            log.info("%s: completion claimed; evaluation #%d: %s", run.id, ev.n, claim_text)
+        self._advance_evaluation(run, ev)
+
+    def _evaluation_retry_due(self, same_claim: list[Evaluation]) -> bool:
+        """An undecided evaluation is repeated after a backoff that doubles."""
+        undecided = [e for e in same_claim if e.status in ("inconclusive", "infra_error")]
+        delay = min(
+            self._settings.evaluation_retry_s * 2 ** max(0, len(undecided) - 1),
+            self._settings.evaluation_retry_max_s,
+        )
+        last = same_claim[-1]
+        return self._clock.now() >= (last.finished_at or last.started_at) + timedelta(seconds=delay)
+
+    def _begin_final_evaluation(self, run_id: str) -> None:
+        """A run ended without a passing evaluation: check what it left behind, for
+        the report. Nothing is delivered to anyone."""
+        run = self._state.get_run(run_id)
+        if run is None or run.frozen_digest is None or not self._automated(run_id):
+            return
+        if not self._done(run_id, "workspace.create"):
+            return  # there never was a sandbox, so there is no app to check
+        ev = self._state.begin_evaluation(
+            run_id,
+            trigger="final",
+            check_digest=run.frozen_digest,
+            evidence_root=str(self.paths(run_id).evidence_dir),
+            now=self._clock.now(),
+        )
+        log.info("%s: final evaluation #%d of what the run left", run_id, ev.n)
+        self._wake.set()
+
+    def _abandon_evaluation(self, run_id: str, reason: str) -> None:
+        ev = self._state.open_evaluation(run_id)
+        if ev is not None:
+            self._evaluator.finish(ev, status="inconclusive", detail=f"abandoned: {reason}")
+            log.info("%s: evaluation #%d abandoned: %s", run_id, ev.n, reason)
+
+    def _advance_evaluation(self, run: Run, ev: Evaluation) -> None:
+        """One step of an open evaluation; acts on the result once there is one."""
+        paths = self.paths(run.id)
+        store, project = paths.snapshots_dir, paths.project_dir
+        try:
+            ev = self._evaluator.pin(
+                ev,
+                frozen_dir=paths.frozen_dir,
+                expected_digest=ev.check_digest,
+                store=store,
+                project=project,
+            )
+            ev = self._demo_for_evaluation(run, ev)
+            if ev.open and ev.steps.get("demo_ready"):
+                ev, done = self._evaluator.run_next(
+                    run.id,
+                    ev,
+                    checks_dir=paths.frozen_dir / frozen.CHECKS_DIR,
+                    url=app_url(self._settings, agent_container_name(run.id)),
+                )
+                if done:
+                    ev = self._evaluator.conclude(
+                        run.id,
+                        ev,
+                        store=store,
+                        project=project,
+                        quiescence_problem=self._quiescence_problem(run.id),
+                    )
+        except (EvaluationError, DockerError, SnapshotError) as exc:
+            ev = self._evaluator.finish(ev, status="infra_error", detail=str(exc))
+        if ev.open:
+            return
+        log.info("%s: evaluation #%d %s: %s", run.id, ev.n, ev.status, ev.detail)
+        run = self._state.get_run(run.id) or run
+        if ev.trigger != "claim" or run.phase != "running":
+            return
+        if ev.status == "passed":
+            self._complete(run, ev)
+        elif ev.status == "failed":
+            self._deliver_failure(run, ev)
+
+    def _demo_for_evaluation(self, run: Run, ev: Evaluation) -> Evaluation:
+        """Make the demo serve the pinned snapshot; finish the evaluation if it cannot.
+
+        A demo started from another snapshot is relaunched with its recorded command,
+        once, so the checks exercise the files they are attributed to.
+        """
+        if not ev.open or ev.steps.get("demo_ready"):
+            return ev
+        steps = dict(ev.steps)
+        demo = self._state.get_demo(run.id)
+        if demo is None or demo.command is None:
+            steps["demo_note"] = (
+                "No demo is serving the app: the checks need it served with start_demo."
+            )
+            ev = self._state.record_evaluation_steps(ev.id, steps)
+            return self._evaluator.finish(
+                ev,
+                status="failed",
+                detail="no demo: start_demo was never used",
+                results=self._not_run(run.id, "not run: the app was not being served"),
+            )
+        if demo.snapshot_id != ev.snapshot_id and "demo_relaunched" not in steps:
+            handle = self._runtime.ensure_demo(
+                DemoSpec(run.id, demo.command, demo.port, replace_session=demo.session_id)
+            )
+            demo = self._state.set_demo_state(
+                run.id,
+                state="starting",
+                message="relaunched to serve the snapshot under evaluation",
+                now=self._clock.now(),
+                session_id=handle.session_id,
+            )
+            self._state.set_demo_snapshot(run.id, ev.snapshot_id)
+            self._publish_demo_status(demo)
+            steps["demo_relaunched"] = self._clock.now().isoformat()
+            steps["demo_note"] = (
+                "The environment relaunched your start_demo command so that it serves the"
+                " current files."
+            )
+            return self._state.record_evaluation_steps(ev.id, steps)
+        if demo.state == "starting":
+            self._check_demo_start(run, demo)
+            demo = self._state.get_demo(run.id) or demo
+        if demo.state == "starting":
+            return ev
+        live = self._demo_live(demo)
+        if demo.state == "running" and live is not None and live.listening:
+            steps["demo_ready"] = self._clock.now().isoformat()
+            return self._state.record_evaluation_steps(ev.id, steps)
+        why = demo.message or (
+            "the demo is not listening" if live is None or live.alive else "the demo exited"
+        )
+        steps["demo_note"] = f"The demo is not serving the app: {why}"
+        ev = self._state.record_evaluation_steps(ev.id, steps)
+        return self._evaluator.finish(
+            ev,
+            status="failed",
+            detail=f"the demo is not serving: {_clip(why, 300)}",
+            results=self._not_run(run.id, "not run: the demo is not serving the app"),
+        )
+
+    def _not_run(self, run_id: str, why: str) -> dict[str, Any]:
+        return {c.key: {"status": "not_run", "summary": why} for c in self._automated(run_id)}
+
+    def _quiescence_problem(self, run_id: str) -> str | None:
+        """Why the builder may have been changing things during the evaluation."""
+        run = self._state.get_run(run_id)
+        if run is None or run.phase != "running":
+            return None  # agent execution ended (or the conversation did)
+        snap = self._try_inspect(run)
+        if snap is None:
+            return "cannot confirm that the builder was idle: its Agent Server did not answer"
+        if snap.status == "running":
+            return "the builder was working while the checks ran"
+        return None
+
+    def _complete(self, run: Run, ev: Evaluation) -> None:
+        if self._state.try_set_phase(run.id, "finished"):
+            log.info("%s finished: evaluation #%d passed", run.id, ev.n)
+            self._publish_project(run.id)
+
+    def _deliver_failure(self, run: Run, ev: Evaluation) -> None:
+        """Hand the failures back to the builder, which resumes to repair them."""
+        if run.conversation_id is None:
+            return
+        text = failure_message(
+            ev,
+            self._state.criteria(run.id),
+            ev.results,
+            demo_note=ev.steps.get("demo_note"),
+            checks_dir=AGENT_CHECKS_DIR,
+        )
+        try:
+            self._conversations.deliver(
+                self._server_ref(run.id), run.conversation_id, EvidenceMessage(text)
+            )
+        except ConversationError as exc:
+            log.warning("%s: cannot deliver evaluation #%d yet: %s", run.id, ev.n, exc)
+            return
+        self._state.mark_delivered(ev.id, self._clock.now())
+        log.info("%s: evaluation #%d failures delivered to the builder", run.id, ev.n)
+
     # --- the demo ------------------------------------------------------------------
 
     def _read_demo_request(self, run_id: str) -> dict[str, Any] | None:
@@ -1312,6 +1990,9 @@ class Controller:
         self._state.record_demo_request(
             run.id, request_id=rid, command=command, state="starting", message=None, now=now
         )
+        # Which project state the demo serves: an evaluation relaunches a demo that
+        # was started from another snapshot than the one it checks.
+        self._state.set_demo_snapshot(run.id, self._snapshot_id(run.id))
         try:
             handle = self._runtime.ensure_demo(
                 DemoSpec(run.id, command, port, replace_session=previous_session)
@@ -1326,6 +2007,14 @@ class Controller:
             )
             log.info("%s: demo %s started (session %s)", run.id, rid, handle.session_id)
         self._publish_demo_status(demo)
+
+    def _snapshot_id(self, run_id: str) -> str | None:
+        paths = self.paths(run_id)
+        try:
+            return self._projects.take(paths.snapshots_dir, paths.project_dir, "demo start").tree
+        except SnapshotError as exc:
+            log.warning("%s: cannot snapshot the project: %s", run_id, exc)
+            return None
 
     def _check_demo_start(self, run: Run, demo: Demo) -> None:
         live = self._demo_live(demo)
@@ -1409,6 +2098,7 @@ class Controller:
         started = self._clock.now()
         notes: list[str] = []
         self._abandon_recovery(run.id, f"agent execution is ending ({run.outcome or 'stopped'})")
+        self._abandon_evaluation(run.id, f"agent execution is ending ({run.outcome or 'stopped'})")
         # 1. A sandbox that (re)starts from now on never starts the Agent Server.
         self._write_control(run.id, "mode", "demo-only\n")
 
@@ -1497,6 +2187,7 @@ class Controller:
                 evidence.tool_processes_after_pause,
             )
             self._publish_project(run.id)
+            self._begin_final_evaluation(run.id)
         return evidence
 
     def _wait_quiescent(self, server: ServerRef, conversation_id: str) -> str | None:
@@ -1559,22 +2250,9 @@ class Controller:
         workspace the CLI points at is unreadable to jim.
         """
         try:
-            _make_world_readable(self.paths(run_id).project_dir)
+            make_world_readable(self.paths(run_id).project_dir)
         except OSError as exc:
             log.warning("%s: cannot make the project readable: %s", run_id, exc)
-
-
-def _make_world_readable(root: Path) -> None:
-    """Add o+r (and o+x on directories) through `root`; symlinks are left alone."""
-    for dirpath, dirnames, filenames in os.walk(root):
-        for name in (*dirnames, *filenames):
-            path = os.path.join(dirpath, name)
-            st = os.lstat(path)
-            if stat.S_ISLNK(st.st_mode):
-                continue
-            extra = stat.S_IROTH | (stat.S_IXOTH if stat.S_ISDIR(st.st_mode) else 0)
-            if st.st_mode & extra != extra:
-                os.chmod(path, stat.S_IMODE(st.st_mode) | extra)
 
 
 def _crash_now() -> None:

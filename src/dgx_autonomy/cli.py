@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from . import frozen
 from .config import default_socket_path
 from .control_api import ControlError, call
 
@@ -87,21 +88,41 @@ def _budget(value: str) -> float:
 
 
 def cmd_launch(args: argparse.Namespace) -> int:
+    """Launch from a brief file, or a directory with brief.md and checks/."""
     brief = Path(args.brief)
     # The controller runs in a container and cannot read the operator's files, so
-    # the CLI sends the brief's contents; the controller stores its own copy.
-    text = brief.read_text()
+    # the CLI sends their contents, and the digest of what it read. The controller
+    # freezes its own copy and refuses the launch unless the digests agree.
+    try:
+        text, checks = frozen.read_bundle(brief)
+        criteria = frozen.validate(text.encode(), frozen.encode(checks))
+    except frozen.FrozenError as exc:
+        print(f"dgx-autonomy: {exc}", file=sys.stderr)
+        return 1
     result = call(
         _socket(args),
         "launch",
         {
             "brief_text": text,
+            "checks": checks,
+            "bundle_digest": frozen.bundle_digest(text.encode(), frozen.encode(checks)),
             "brief_source": str(brief.resolve()),
             "model_key": args.model,
             "budget_hours": args.budget_hours,
         },
     )
-    _print(result, args.json)
+    if args.json:
+        _print(result, True)
+        return 0
+    print(f"run_id         {result['run_id']}")
+    print(f"deadline_at    {result['deadline_at']}")
+    print(f"frozen_digest  {result['frozen_digest']}")
+    if not criteria:
+        print("criteria       none: completion will be the builder's claim only")
+    for c in criteria:
+        what = f"{c.runner} checks/{c.test}" if c.kind == "automated" else "human judgment"
+        optional = "" if c.required else " (optional)"
+        print(f"  {c.key:<24} {what}{optional}")
     return 0
 
 
@@ -112,6 +133,8 @@ def _print_status(result: dict[str, Any]) -> None:
     evidence = result.pop("stop_evidence", None)
     recoveries = result.pop("recoveries", [])
     containers = result.pop("containers", None)
+    evaluation = result.pop("evaluation", None)
+    criteria = result.pop("criteria", None)
     _print(result, False)
     for op in ops:
         line = f"  {op['kind']:<20} {op['status']}"
@@ -136,6 +159,18 @@ def _print_status(result: dict[str, Any]) -> None:
             print(f"            command: {demo['command']}")
         if demo.get("message") and demo["state"] != "running":
             print(f"            {demo['message']}")
+    if criteria and (criteria["automated"] or criteria["human_judgment"]):
+        print(
+            f"criteria    {criteria['automated']} automated,"
+            f" {criteria['human_judgment']} awaiting human judgment"
+        )
+    if evaluation:
+        print(
+            f"evaluation  #{evaluation['n']} ({evaluation['trigger']}) {evaluation['status']}"
+            + (f": {evaluation['detail']}" if evaluation.get("detail") else "")
+        )
+        for key, r in evaluation["results"].items():
+            print(f"            {r['status']:<8} {key}  {r.get('summary') or ''}")
     if evidence:
         verdict = "NOT VERIFIED" if evidence["failed"] else "verified"
         print(
@@ -187,6 +222,116 @@ def cmd_tunnel(args: argparse.Namespace) -> int:
         f"# run on the laptop, then open http://127.0.0.1:{local}/  (demo: {live})",
         file=sys.stderr,
     )
+    return 0
+
+
+def _indent(text: str, prefix: str = "      ") -> str:
+    return prefix + str(text).replace("\n", "\n" + prefix)
+
+
+def print_report(r: dict[str, Any]) -> None:
+    """The report, one section per kind of evidence. Nothing is merged across them."""
+    print(f"run       {r['run_id']}  {r['phase']} ({r['outcome'] or '-'})")
+    print(f"deadline  {r['deadline_at']}")
+    print(f"result    {'VERIFIED' if r['verified'] else 'NOT VERIFIED'}: {r['verdict']}")
+    fz = r["frozen"]
+    if fz["digest"]:
+        print(f"frozen    {fz['digest']} ({'intact' if fz['intact'] else fz['problem']})")
+
+    print("\nBuilder claims (what the builder said; not evidence of anything)")
+    if not r["claims"]:
+        print("  none")
+    for c in r["claims"]:
+        results = ", ".join(f"#{e['n']} {e['status']}" for e in c["evaluations"]) or "-"
+        print(f"  claimed: {c['text']}")
+        print(f"      evaluations: {results}")
+
+    print("\nAutomated acceptance checks (frozen at launch, run by the evaluator)")
+    if not r["automated"]:
+        print("  none agreed")
+    for c in r["automated"]:
+        optional = "" if c["required"] else " (optional)"
+        print(f"  {str(c['status']).upper():<14} {c['key']}{optional}: {c['description']}")
+        if c["evaluation"] is not None:
+            history = " -> ".join(f"#{h['evaluation']} {h['status']}" for h in c["history"])
+            print(f"      evaluation #{c['evaluation']}, snapshot {str(c['snapshot'])[:12]};"
+                  f" history {history}")  # fmt: skip
+        if c["status"] != "passed" and c.get("summary"):
+            print(f"      {c['summary']}")
+            if c.get("excerpt"):
+                print(_indent(c["excerpt"][:800], "        "))
+
+    print("\nAwaiting human judgment (never counted as passes)")
+    if not r["human_judgment"]:
+        print("  none")
+    for c in r["human_judgment"]:
+        print(f"  {c['key']}: {c['description']}")
+
+    print("\nEvaluations")
+    if not r["evaluations"]:
+        print("  none")
+    for e in r["evaluations"]:
+        relaunched = ", demo relaunched" if e["demo_relaunched"] else ""
+        delivered = ", failures sent to the builder" if e["delivered_at"] else ""
+        print(
+            f"  #{e['n']} {e['trigger']:<9} {e['status']:<12} snapshot"
+            f" {str(e['snapshot'])[:12]}{relaunched}{delivered}"
+        )
+        if e.get("detail"):
+            print(f"      {e['detail']}")
+        changes = e.get("changes_since_previous")
+        if changes:
+            print(f"      changed since the previous evaluation: {', '.join(changes[:10])}")
+        print(f"      evidence: {e['evidence_dir']}")
+
+    print("\nStronger-model reviews (requested manually; separate from the checks)")
+    if not r["reviews"]:
+        print("  none requested")
+    for rv in r["reviews"]:
+        who = f" by {rv['reviewer']}" if rv["reviewer"] else ""
+        print(f"  #{rv['n']} {rv['status']}{who} ({rv['requested_at']}): {rv['bundle_dir']}")
+        if rv.get("result_excerpt"):
+            print(_indent(rv["result_excerpt"][:800]))
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    result = call(_socket(args), "report", {"run_id": args.run_id} if args.run_id else {})
+    if args.json:
+        _print(result, True)
+    else:
+        print_report(result)
+    return 0
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    """Run the frozen checks again on a run that has ended."""
+    result = call(_socket(args), "evaluate", {"run_id": args.run_id})
+    if args.json:
+        _print(result, True)
+    else:
+        print(f"evaluation #{result['n']} started; `dgx-autonomy report {args.run_id}` shows it")
+    return 0
+
+
+def cmd_review_request(args: argparse.Namespace) -> int:
+    """Bundle a run for a stronger-model review that the operator runs by hand."""
+    request = {"run_id": args.run_id} | ({"note": args.note} if args.note else {})
+    result = call(_socket(args), "review.request", request, timeout=600)
+    if args.json:
+        _print(result, True)
+    else:
+        print(f"review #{result['n']}: bundle in {result['bundle_dir']} (see its README.md)")
+    return 0
+
+
+def cmd_review_record(args: argparse.Namespace) -> int:
+    text = Path(args.file).read_text()
+    result = call(
+        _socket(args),
+        "review.record",
+        {"run_id": args.run_id, "n": args.n, "reviewer": args.reviewer, "text": text},
+    )
+    _print(result, args.json)
     return 0
 
 
@@ -337,8 +482,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="machine-readable output")
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("launch", help="start an unattended run from a brief file")
-    s.add_argument("--brief", required=True, help="markdown file with the agreed brief")
+    s = sub.add_parser("launch", help="start an unattended run from a brief (and its checks)")
+    s.add_argument(
+        "--brief",
+        required=True,
+        help="a brief.md file, or a directory with brief.md and checks/ (criteria.yaml + checks)",
+    )
     s.add_argument("--model", default=None, help="model key from models.yaml (default: default)")
     s.add_argument(
         "--budget-hours", type=_budget, default=MAX_BUDGET_HOURS, help="wall-clock budget (≤40)"
@@ -352,6 +501,26 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("stop", help="end agent execution now; the demo stays up")
     s.add_argument("run_id", help="run id")
     s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("report", help="claims, check results, human judgment, reviews")
+    s.add_argument("run_id", nargs="?", help="run id (default: the latest run)")
+    s.set_defaults(func=cmd_report)
+
+    s = sub.add_parser("evaluate", help="run the frozen checks again on an ended run")
+    s.add_argument("run_id")
+    s.set_defaults(func=cmd_evaluate)
+
+    s = sub.add_parser("review-request", help="bundle a run for a manual stronger-model review")
+    s.add_argument("run_id")
+    s.add_argument("--note", help="what the reviewer should look at")
+    s.set_defaults(func=cmd_review_request)
+
+    s = sub.add_parser("review-record", help="attach the result of a manual review")
+    s.add_argument("run_id")
+    s.add_argument("n", type=int, help="review number")
+    s.add_argument("--reviewer", required=True, help="the model or person that reviewed")
+    s.add_argument("--file", required=True, help="the review, as text")
+    s.set_defaults(func=cmd_review_record)
 
     s = sub.add_parser("tunnel", help="print the ssh command that forwards the demo port")
     s.add_argument("run_id", nargs="?", help="run id (default: the latest run)")

@@ -245,6 +245,17 @@ class OpenHandsConversations:
     def deliver(self, server: ServerRef, conversation_id: str, evidence: EvidenceMessage) -> None:
         self._send(server, conversation_id, evidence.text, run=True)
 
+    def recent(self, server: ServerRef, conversation_id: str, limit: int) -> Sequence[EventSummary]:
+        res = self._call(
+            server,
+            "GET",
+            f"{CONVERSATIONS}/{conversation_id}/events/search"
+            f"?sort_order=TIMESTAMP_DESC&limit={max(1, min(limit, 100))}",
+            timeout=10.0,
+        )
+        items = res.body.get("items") if isinstance(res.body, dict) else None
+        return [summarize_event(i) for i in items or [] if isinstance(i, dict)]
+
     def events(
         self, server: ServerRef, conversation_id: str, since: int, limit: int
     ) -> Sequence[EventSummary]:

@@ -3,9 +3,9 @@
 #   sudo docker compose --profile images build
 #   sudo docker compose up -d controller
 #
-# Only the controller is a long-running compose service. The inference and agent
-# containers are created by the controller per run; their services here exist only
-# so `--profile images build` builds all three images.
+# Only the controller is a long-running compose service. The inference, agent and
+# evaluator containers are created by the controller per run; their services here
+# exist only so `--profile images build` builds all four images.
 #
 # Values come from .env next to this file. scripts/deploy.sh writes it on the DGX.
 
@@ -25,6 +25,7 @@ services:
       DGX_AUTONOMY_OPERATOR_GID: ${DGX_AUTONOMY_OPERATOR_GID:?set the operator gid in .env}
       DGX_AUTONOMY_INFERENCE_IMAGE: dgx-autonomy/inference:f95b0d9
       DGX_AUTONOMY_AGENT_IMAGE: dgx-autonomy/agent:1.49.4
+      DGX_AUTONOMY_EVALUATOR_IMAGE: dgx-autonomy/evaluator:1.63.0
     volumes:
       # The only Docker socket mount in the system.
       - /var/run/docker.sock:/var/run/docker.sock
@@ -49,6 +50,14 @@ services:
       # autonomy/: the image copies containers/sandbox/ and src/dgx_autonomy/demo_tool.py.
       context: ..
       dockerfile: containers/agent.Dockerfile
+    profiles: [images]
+
+  evaluator-image:
+    image: dgx-autonomy/evaluator:1.63.0
+    build:
+      # autonomy/: the image copies containers/evaluator/ (lockfiles, Playwright config).
+      context: ..
+      dockerfile: containers/evaluator.Dockerfile
     profiles: [images]
 
 # The bridges have fixed host interface names: the host egress rules
