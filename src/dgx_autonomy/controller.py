@@ -52,7 +52,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import frozen, planning
+from . import checkpoints, frozen, planning, qualify
 from .agent_files import AgentFileError, make_world_readable, read_json
 from .config import ConfigError, ModelCatalog, Settings, load_models
 from .deadline import DeadlineWatchdog
@@ -71,6 +71,7 @@ from .inference import InferenceError, InferenceManager
 from .openhands_adapter import (
     ConversationError,
     conversation_id_for,
+    persisted_event_count,
     persisted_events,
     persisted_status,
 )
@@ -108,6 +109,9 @@ from .runtime import (
 )
 from .snapshot import GitSnapshots, SnapshotError
 from .state import (
+    Checkpoint,
+    CheckpointSource,
+    ConversationRow,
     CriterionRow,
     Demo,
     Evaluation,
@@ -125,7 +129,6 @@ from .state import (
 
 log = logging.getLogger("dgx_autonomy.controller")
 
-FAILED_CONVERSATION_STATUSES = frozenset({"error", "stuck"})
 # A conversation in one of these states before the restart had ended; recovery
 # leaves it for _observe instead of resuming it.
 _ENDED_CONVERSATION_STATUSES = frozenset({"finished", "error", "stuck"})
@@ -135,6 +138,7 @@ _RESUMABLE_CONVERSATION_STATUSES = frozenset({"error", "paused", "idle"})
 FAULT_TARGETS = ("controller", "sandbox", "inference")
 MAX_BRIEF_BYTES = 256 * 1024
 MAX_DEMO_REQUEST_BYTES = 16 * 1024
+MAX_HANDOFF_BYTES = 256 * 1024
 MAX_DEMO_COMMAND = 4096
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # How many recent events to search for the builder's completion claim, and its finish
@@ -266,6 +270,12 @@ def agent_message(brief: str, *, checks: bool = False) -> str:
             " complete only when they pass; otherwise you get the failures and continue."
             " Criteria marked human_judgment are judged by the operator later.\n"
         )
+    text += (
+        "A long task may continue in a fresh conversation: when a message titled HANDOFF"
+        " REQUEST arrives, answer it with the write_handoff tool. If no viable path is left"
+        " (a missing capability or permission, not a bug you have not fixed yet), say so"
+        " with declare_blocked; operating restrictions are not blockers to work around.\n"
+    )
     return text + (
         "Complete the brief, verify the result yourself, then finish.\n\n"
         "--- BRIEF ---\n"
@@ -311,6 +321,25 @@ demo can be opened with `dgx-autonomy tunnel {run_id}`. Record the result with
 
     dgx-autonomy review-record {run_id} {n} --reviewer MODEL --file review.md
 {f"{chr(10)}Note from the operator: {note}{chr(10)}" if note else ""}"""
+
+
+def _brief_detail(row: ConversationRow) -> str | None:
+    """The rollover's detail as the agent should read it (a blocker is shown apart)."""
+    return None if row.reason == "blocked-review" else row.detail
+
+
+def _blocker_of(row: ConversationRow) -> dict[str, Any] | None:
+    if row.reason != "blocked-review" or not row.detail:
+        return None
+    try:
+        blocker = json.loads(row.detail)
+    except ValueError:
+        return None
+    return blocker if isinstance(blocker, dict) else None
+
+
+def _last_text(snap: ConversationSnapshot) -> str:
+    return _clip(snap.last_event.text, 600) if snap.last_event else "(no event)"
 
 
 def _describe(container: ContainerState | None) -> str:
@@ -386,7 +415,34 @@ class Controller:
         self._stop_locks: dict[str, threading.Lock] = {}
         self._stop_locks_guard = threading.Lock()
         self._bad_requests: dict[str, str] = {}
+        # The last handoff/blocker request answered per run: (which request, handoff,
+        # problems).
+        self._answered: dict[str, tuple[Any, Any, Any]] = {}
+        # When each conversation was nudged after an error (in memory: a restarted
+        # controller starts counting again).
+        self._error_nudges: dict[str, list[datetime]] = {}
         self._projects: SnapshotPort = snapshots if snapshots is not None else GitSnapshots()
+        self._qualifier = qualify.Qualifier(
+            settings=settings,
+            clock=clock,
+            sleep=sleep,
+            hooks=qualify.Hooks(
+                active_work=lambda: [
+                    *(f"run {r.id}" for r in self._state.active_runs()),
+                    *(f"plan {p.id}" for p in self._state.active_plans()),
+                ],
+                serving=lambda: self._inference.status().model_key,
+                remove_inference=lambda: (
+                    self._runtime.remove_container(self._settings.inference_name) and None
+                ),
+                ensure_inference=lambda model: self._inference.ensure(model) and None,
+                inference_ready=self._inference_ready,
+                chat=self._qualify_chat,
+                launch=self.launch,
+                run_status=lambda run_id: self.status({"run_id": run_id}),
+                report=lambda run_id: self.report({"run_id": run_id}),
+            ),
+        )
         self._evaluator = Evaluator(
             settings=settings,
             state=state,
@@ -469,6 +525,11 @@ class Controller:
             "plan.checks": self.plan_checks,
             "plan.launch": self.plan_launch,
             "plan.close": self.plan_close,
+            "rollover": self.rollover,
+            "checkpoints": self.checkpoint_chain,
+            "retire": self.retire,
+            "qualify.start": self.qualify_start,
+            "qualify.status": self.qualify_status,
         }
         handler = handlers.get(op)
         if handler is None:
@@ -616,6 +677,12 @@ class Controller:
         view["frozen_digest"] = run.frozen_digest
         plan = self._state.plan_for_run(run.id)
         view["plan_id"] = plan.id if plan else None
+        view["conversations"] = [
+            {k: c[k] for k in ("n", "status", "reason", "started_at", "active_at")}
+            for c in map(self._conversation_view, self._state.conversations(run.id))
+        ]
+        view["current_checkpoint"] = run.current_checkpoint_id
+        view["blocked"] = json.loads(run.blocked) if run.blocked else None
         criteria = self._state.criteria(run.id)
         view["criteria"] = {
             "automated": sum(1 for c in criteria if c.kind == "automated"),
@@ -753,6 +820,12 @@ class Controller:
             ],
             "evaluations": views,
             "reviews": [self._review_view(r) for r in self._state.reviews(run.id)],
+            "blocked": status.get("blocked"),
+            "conversations": status.get("conversations"),
+            "checkpoints": [
+                {"n": c.n, "source": c.source, "reason": c.reason, "problems": c.problems}
+                for c in self._state.checkpoints(run.id)
+            ],
             "demo": status.get("demo"),
             "workspace_dir": status.get("workspace_dir"),
         }
@@ -959,6 +1032,30 @@ class Controller:
         log.warning("%s: stop requested by the operator", run.id)
         self.stop_agent(run.id)
         return self.status({"run_id": run.id})
+
+    def retire(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Take an ended run's retained demo down: its sandbox is removed for good.
+
+        The project, the conversations, the evidence and the record stay. A removed
+        sandbox is not brought back after a restart.
+        """
+        run = self._resolve(args)
+        if not run.terminal:
+            raise RequestError(f"run {run.id} is {run.phase}; stop it first")
+        try:
+            removed = self._runtime.remove_container(agent_container_name(run.id))
+        except DockerError as exc:
+            raise RequestError(str(exc)) from None
+        demo = self._state.get_demo(run.id)
+        if demo is not None and demo.state in ("starting", "running"):
+            self._state.set_demo_state(
+                run.id,
+                state="failed",
+                message="retired by the operator: the sandbox was removed",
+                now=self._clock.now(),
+            )
+        log.info("%s: retired (sandbox %s)", run.id, "removed" if removed else "already gone")
+        return {"run_id": run.id, "sandbox_removed": removed}
 
     def processes(self, args: Mapping[str, Any]) -> dict[str, Any]:
         """The sandbox's processes, classified by the in-sandbox helper (diagnostic)."""
@@ -1180,6 +1277,16 @@ class Controller:
                 self._state.retry_recovery(rec.id, now)
                 log.warning("%s: recovery #%d was interrupted; starting it over", run.id, rec.n)
                 retried.append(rec.id)
+            rollover = self._state.open_rollover(run.id)
+            if rollover is not None:
+                self._state.retry_rollover(rollover.id, now)
+                log.warning(
+                    "%s: the rollover to conversation #%d was interrupted (%s); continuing",
+                    run.id,
+                    rollover.n,
+                    rollover.status,
+                )
+                retried.append(rollover.id)
         for ev in self._state.open_evaluations():
             self._restart_evaluation(ev, now)
             retried.append(ev.id)
@@ -1353,7 +1460,13 @@ class Controller:
             log.info("%s is running", run.id)
             run = self._state.get_run(run.id) or run
         if run.phase == "running" and run.conversation_id is not None:
-            self._observe(run)
+            rollover = self._state.open_rollover(run.id)
+            if rollover is not None:
+                self._advance_rollover(run, rollover)
+            else:
+                self._step_blocked(run)
+                if self._phase_is(run.id, "running"):
+                    self._observe(run)
             if self._phase_is(run.id, "running"):
                 self._step_demo(run)
 
@@ -1488,6 +1601,7 @@ class Controller:
                 model=model.key,
                 base_url=f"{self._settings.inference_url}/v1",
                 max_input_tokens=model.ctx,
+                max_output_tokens=model.max_output_tokens,
             ),
             message=agent_message(
                 Path(run.brief_path).read_text(), checks=bool(self._automated(run.id))
@@ -1506,6 +1620,7 @@ class Controller:
             return False
         # Recorded even if a stop arrived meanwhile: logs need the id.
         self._state.set_conversation_id(run.id, cid)
+        self._state.record_first_conversation(run.id, cid, self._clock.now())
         self._state.complete_operation(op.id, cid)
         return True
 
@@ -1531,15 +1646,16 @@ class Controller:
             if not self._state.try_set_phase(run.id, "finished"):
                 return
             log.info("%s finished", run.id)
-        elif snap.status in FAILED_CONVERSATION_STATUSES:
-            if not self._state.try_set_phase(run.id, "failed"):
-                return
-            log.warning("%s conversation ended %s", run.id, snap.status)
-            self._abandon_evaluation(run.id, f"the conversation ended {snap.status}")
-            self._begin_final_evaluation(run.id)
+            self._publish_project(run.id)
+        elif snap.status == "stuck":
+            # The SDK's stuck detector fired: a fresh conversation, with a diagnosis.
+            self._begin_rollover(run, "stuck", _last_text(snap))
+        elif snap.status == "error":
+            self._on_error(run, snap)
         else:
-            return
-        self._publish_project(run.id)
+            pressure = self._context_pressure(run, snap)
+            if pressure is not None:
+                self._begin_rollover(run, "context", pressure)
 
     # --- recovery ------------------------------------------------------------------
 
@@ -1725,6 +1841,11 @@ class Controller:
         cid = self._conversation_ref(run)
         if cid is None or not self._done(run.id, "workspace.create"):
             return True
+        if self._state.open_rollover(run.id) is not None:
+            # The conversation is being replaced; the rollover goes on from its record.
+            steps["conversation_status"] = "rolling over"
+            self._save_steps(rec, steps)
+            return True
         server = self._server_ref(run.id)
         try:
             snap = self._conversations.inspect(server, cid)
@@ -1765,6 +1886,497 @@ class Controller:
             self._state.finish_recovery(
                 rec.id, status="failed", error=f"abandoned: {reason}", now=self._clock.now()
             )
+
+    # --- model qualification ---------------------------------------------------------
+
+    def qualify_start(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Qualify a model with the whole workload (qualify.py); runs in the background."""
+        try:
+            model = self._catalog.get(args.get("model_key"))
+        except ConfigError as exc:
+            raise RequestError(str(exc)) from None
+        try:
+            job = self._qualifier.start(model)
+        except qualify.QualificationError as exc:
+            raise RequestError(str(exc)) from None
+        log.info("qualification of %s started", model.key)
+        return job.view()
+
+    def qualify_status(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        key = args.get("model_key")
+        if key is not None and not qualify.valid_model_key(key):
+            raise RequestError("model_key is not a model key")
+        latest = self._qualifier.latest(key)
+        if latest is None:
+            raise RequestError(f"no qualification of {key or 'any model'} yet")
+        return latest
+
+    def _inference_ready(self) -> tuple[bool, str]:
+        status = self._inference.status()
+        return status.ready, f"{status.container}: {status.health} {status.detail or ''}".strip()
+
+    def _qualify_chat(self, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
+        res = self._http.request(
+            "POST", f"{self._settings.inference_url}/v1/chat/completions", json_body=body,
+            timeout=timeout,
+        )  # fmt: skip
+        return res.status, res.body if res.ok else (res.error or res.body)
+
+    # --- continuity: rollover to a fresh conversation ------------------------------------
+
+    def rollover(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Replace the run's conversation with a fresh one now (the operator asks)."""
+        run = self._resolve(args)
+        if run.phase != "running" or run.conversation_id is None:
+            raise RequestError(f"run {run.id} is {run.phase}; only a running run rolls over")
+        detail = args.get("detail")
+        if detail is not None and (not isinstance(detail, str) or len(detail) > 1000):
+            raise RequestError("detail must be text of at most 1000 characters")
+        row = self._begin_rollover(run, "forced", detail or "requested by the operator")
+        assert row is not None
+        self._wake.set()
+        return self._conversation_view(row)
+
+    def _conversation_view(self, row: ConversationRow) -> dict[str, Any]:
+        return {
+            "n": row.n,
+            "conversation_id": row.conversation_id,
+            "status": row.status,
+            "reason": row.reason,
+            "detail": row.detail,
+            "from_checkpoint": row.from_checkpoint_id,
+            "handoff_attempts": row.handoff_attempts,
+            "started_at": row.started_at.isoformat(),
+            "active_at": row.active_at.isoformat() if row.active_at else None,
+            "ended_at": row.ended_at.isoformat() if row.ended_at else None,
+        }
+
+    def checkpoint_chain(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """The run's checkpoint chain and conversations, oldest first."""
+        run = self._resolve(args)
+        conversations = self._state.conversations(run.id)
+        return {
+            "run_id": run.id,
+            "current_checkpoint": run.current_checkpoint_id,
+            "conversations": [self._conversation_view(c) for c in conversations],
+            "checkpoints": [
+                {
+                    "id": c.id,
+                    "n": c.n,
+                    "source": c.source,
+                    "reason": c.reason,
+                    "from_conversation": c.conversation_id,
+                    "event_position": c.event_position,
+                    "workspace_sha": c.workspace_sha,
+                    "supersedes": c.supersedes_id,
+                    "created_at": c.created_at.isoformat(),
+                    "handoff": c.handoff,
+                    "verified": c.verified,
+                    "problems": c.problems,
+                }
+                for c in self._state.checkpoints(run.id)
+            ],
+        }
+
+    def _begin_rollover(self, run: Run, reason: str, detail: str | None) -> ConversationRow | None:
+        """Persist the intent to replace the conversation. None while it is too soon
+        after the last rollover (so a context that stays full cannot storm)."""
+        rows = self._state.conversations(run.id)
+        if reason not in ("forced", "blocked-review") and len(rows) > 1:
+            gap = (
+                self._settings.rollover_min_interval_s
+                if reason in ("context", "failures")
+                else self._settings.rollover_retry_s
+            )
+            last = rows[-1]
+            if (self._clock.now() - last.started_at).total_seconds() < gap:
+                return None
+        row = self._state.begin_rollover(
+            run.id,
+            conversation_id_for_n=lambda n: conversation_id_for(f"{run.id}#{n}"),
+            reason=reason,
+            detail=detail,
+            now=self._clock.now(),
+        )
+        log.warning(
+            "%s: rolling over to conversation #%d (%s%s)",
+            run.id,
+            row.n,
+            reason,
+            f": {_clip(detail, 200)}" if detail else "",
+        )
+        return row
+
+    def _advance_rollover(self, run: Run, row: ConversationRow) -> None:
+        """One step: ask for the handoff, take it (or fall back), start the new one."""
+        if row.status == "handoff":
+            ckpt = self._collect_handoff(run, row)
+            if ckpt is None:
+                return
+            row = self._state.open_rollover(run.id) or row
+        if row.status == "starting":
+            self._start_rolled_over(run, row)
+
+    def _collect_handoff(self, run: Run, row: ConversationRow) -> Checkpoint | None:
+        server = self._server_ref(run.id)
+        old = run.conversation_id
+        assert old is not None
+        if row.handoff_request_id is None:
+            request_id = secrets.token_hex(4)
+            row = self._state.note_handoff_request(row.id, request_id, self._clock.now())
+            text = checkpoints.handoff_request(request_id, row.reason, _brief_detail(row))
+            try:
+                self._conversations.deliver(server, old, EvidenceMessage(text))
+            except ConversationError as exc:
+                log.warning("%s: cannot ask for a handoff: %s", run.id, exc)
+        handoff, problems = self._read_handoff(run, row)
+        if handoff is not None and not problems:
+            return self._record_checkpoint(run, row, "agent_handoff", handoff, [])
+        waited = (self._clock.now() - row.attempted_at).total_seconds()
+        if waited <= self._settings.handoff_timeout_s:
+            return None
+        previous = self._state.get_checkpoint(run.current_checkpoint_id or "")
+        why = f"no valid handoff within {self._settings.handoff_timeout_s / 60:.0f} min"
+        fallback = checkpoints.fallback_handoff(
+            previous.handoff if previous else None,
+            why=why,
+            recent_activity=self._recent_activity(run.id, old),
+        )
+        return self._record_checkpoint(
+            run, row, "controller_fallback", fallback, [why, *(problems or [])]
+        )
+
+    def _read_handoff(
+        self, run: Run, row: ConversationRow
+    ) -> tuple[dict[str, Any] | None, list[str] | None]:
+        """The newest handoff the agent wrote, validated and answered. (None, None)
+        when there is nothing new; (handoff, problems) otherwise."""
+        try:
+            raw = read_json(
+                self.paths(run.id).agent_dir, ".dgx", "handoff.json", max_bytes=MAX_HANDOFF_BYTES
+            )
+        except FileNotFoundError:
+            return None, None
+        except AgentFileError as exc:
+            return None, [str(exc)]
+        file_id = raw.get("id") if isinstance(raw, dict) else None
+        if not isinstance(file_id, str) or not _REQUEST_ID.match(file_id):
+            return None, ["handoff without a valid id"]
+        earlier = {
+            c.handoff_request_id
+            for c in self._state.conversations(run.id)
+            if c.id != row.id and c.handoff_request_id
+        }
+        if raw.get("request_id") in earlier:
+            return None, None  # the handoff of an earlier rollover
+        key = f"handoff:{run.id}"
+        answered = self._answered.get(key)
+        if answered is not None and answered[0] == (file_id, row.handoff_request_id):
+            return answered[1], answered[2]
+        body = {k: v for k, v in raw.items() if k != "id"}
+        handoff, problems = checkpoints.validate_handoff(
+            body, self._evidence_index(run.id), request_id=row.handoff_request_id or ""
+        )
+        answer = {
+            "request_id": file_id,
+            "accepted": not problems,
+            "problems": problems,
+            "message": (
+                "Handoff accepted. Stop now: finish with the message 'handoff written'."
+                if not problems
+                else "The handoff was not accepted."
+            ),
+        }
+        self._write_control(run.id, "handoff.json", json.dumps(answer))
+        self._answered[key] = ((file_id, row.handoff_request_id), handoff, problems)
+        log.info("%s: handoff %s %s", run.id, file_id, "accepted" if not problems else problems[:3])
+        return handoff, problems
+
+    def _evidence_index(self, run_id: str) -> checkpoints.EvidenceIndex:
+        project = self.paths(run_id).project_dir
+        return checkpoints.EvidenceIndex(
+            path_exists=lambda rel: checkpoints.project_path_exists(project, rel),
+            evaluations=frozenset(e.n for e in self._state.evaluations(run_id)),
+        )
+
+    def _recent_activity(self, run_id: str, conversation_id: str, limit: int = 12) -> list[str]:
+        events = persisted_events(
+            self.paths(run_id).conversations_dir, conversation_id, 0, 60, last=True
+        )
+        wanted = ("ActionEvent", "MessageEvent", "AgentErrorEvent")
+        picked = [e for e in events if e.kind in wanted and e.source != "user"]
+        return [f"{e.kind}: {_clip(e.text, 240)}" for e in picked[-limit:]]
+
+    def _verified(self, run_id: str) -> dict[str, Any]:
+        """What the environment itself established: the latest decided evaluation."""
+        decided = [e for e in self._state.evaluations(run_id) if not e.open]
+        if not decided:
+            return {"latest_evaluation": None}
+        ev = decided[-1]
+        return {
+            "latest_evaluation": {
+                "n": ev.n,
+                "status": ev.status,
+                "snapshot": ev.snapshot_id,
+                "check_digest": ev.check_digest,
+                "results": {
+                    k: {"status": r.get("status"), "summary": r.get("summary")}
+                    for k, r in (ev.results or {}).items()
+                },
+            }
+        }
+
+    def _record_checkpoint(
+        self,
+        run: Run,
+        row: ConversationRow,
+        source: CheckpointSource,
+        handoff: Mapping[str, Any],
+        problems: list[str],
+    ) -> Checkpoint:
+        """Pause the old conversation, then record the checkpoint (durably)."""
+        old = run.conversation_id
+        assert old is not None
+        self._quiet_old_conversation(run.id, old)
+        paths = self.paths(run.id)
+        try:
+            sha: str | None = self._projects.take(
+                paths.snapshots_dir, paths.project_dir, f"checkpoint for conversation #{row.n}"
+            ).tree
+        except SnapshotError as exc:
+            log.warning("%s: cannot snapshot the project: %s", run.id, exc)
+            sha = None
+        ckpt = self._state.record_checkpoint(
+            row.id,
+            from_conversation_id=old,
+            event_position=persisted_event_count(paths.conversations_dir, old),
+            workspace_sha=sha,
+            source=source,
+            reason=row.reason,
+            handoff=handoff,
+            verified=self._verified(run.id),
+            problems=problems,
+            now=self._clock.now(),
+        )
+        log.info("%s: checkpoint #%d (%s) recorded", run.id, ckpt.n, source)
+        return ckpt
+
+    def _quiet_old_conversation(self, run_id: str, conversation_id: str) -> None:
+        """The old conversation must not keep working next to the new one."""
+        server = self._server_ref(run_id)
+        for call in (self._conversations.interrupt, self._conversations.pause):
+            try:
+                call(server, conversation_id)
+            except ConversationError as exc:
+                log.info("%s: quieting conversation %s: %s", run_id, conversation_id, exc)
+
+    def _start_rolled_over(self, run: Run, row: ConversationRow) -> None:
+        ckpt = self._state.get_checkpoint(row.from_checkpoint_id or "")
+        if ckpt is None:
+            raise StateError(f"{row.id} has no checkpoint")
+        if run.conversation_id is not None and run.conversation_id != row.conversation_id:
+            self._quiet_old_conversation(run.id, run.conversation_id)
+        model = self._catalog.get(run.model_key)
+        message = checkpoints.assemble_recovery_context(
+            checkpoints.RecoveryInputs(
+                run_id=run.id,
+                n=row.n,
+                reason=row.reason,
+                detail=_brief_detail(row),
+                now=self._clock.now(),
+                deadline=run.deadline_at,
+                brief=Path(run.brief_path).read_text(),
+                checkpoint_source=ckpt.source,
+                handoff=ckpt.handoff,
+                verified=ckpt.verified,
+                demo=self._demo_line(run.id),
+                recent_failures=self._recent_failures(run),
+                recent_activity=(
+                    []
+                    if ckpt.source == "controller_fallback"
+                    else self._recent_activity(run.id, ckpt.conversation_id, limit=6)
+                ),
+                blocker=_blocker_of(row),
+            ),
+            budget_chars=int(model.ctx * self._settings.recovery_context_fraction * 3),
+        )
+        request = ConversationRequest(
+            server=self._server_ref(run.id),
+            conversation_id=row.conversation_id,
+            working_dir=AGENT_PROJECT_DIR,
+            llm=LlmEndpoint(
+                model=model.key,
+                base_url=f"{self._settings.inference_url}/v1",
+                max_input_tokens=model.ctx,
+                max_output_tokens=model.max_output_tokens,
+            ),
+            message=message,
+        )
+        try:
+            self._conversations.start(request)
+        except ConversationError as exc:
+            log.warning("%s: conversation #%d start will be retried: %s", run.id, row.n, exc)
+            return
+        self._state.activate_conversation(row.id, self._clock.now())
+        self._snapshots.pop(run.id, None)
+        # Failures the old conversation never got are in the recovery context.
+        for ev in self._state.evaluations(run.id):
+            if ev.status == "failed" and ev.trigger == "claim" and ev.delivered_at is None:
+                self._state.mark_delivered(ev.id, self._clock.now())
+        log.info("%s: conversation #%d (%s) is the run's now", run.id, row.n, row.conversation_id)
+
+    def _demo_line(self, run_id: str) -> str:
+        demo = self._state.get_demo(run_id)
+        if demo is None or demo.command is None:
+            return "not started yet; serve the app with the start_demo tool on port 3000."
+        return (
+            f"{demo.state}: `{demo.command}` on port {demo.port} (start_demo; call it again"
+            " to serve a new version)."
+        )
+
+    def _recent_failures(self, run: Run) -> str:
+        failed = [e for e in self._state.evaluations(run.id) if e.status == "failed"]
+        if not failed:
+            return ""
+        ev = failed[-1]
+        return _clip(
+            failure_message(
+                ev,
+                self._state.criteria(run.id),
+                ev.results,
+                demo_note=ev.steps.get("demo_note"),
+                checks_dir=AGENT_CHECKS_DIR,
+            ),
+            6000,
+        )
+
+    def _active_conversation(self, run_id: str) -> ConversationRow | None:
+        active = [c for c in self._state.conversations(run_id) if c.status == "active"]
+        return active[-1] if active else None
+
+    def _on_error(self, run: Run, snap: ConversationSnapshot) -> None:
+        """An errored conversation is nudged a few times, then replaced; never failed."""
+        cid = snap.conversation_id
+        now = self._clock.now()
+        window = timedelta(seconds=self._settings.error_window_s)
+        nudges = [t for t in self._error_nudges.get(cid, []) if now - t < window]
+        if len(nudges) >= self._settings.error_nudges:
+            self._begin_rollover(
+                run, "errors", f"{len(nudges)} nudges did not help; last: {_last_text(snap)}"
+            )
+            return
+        if nudges and now - nudges[-1] < timedelta(
+            seconds=self._settings.error_backoff_s * 2 ** (len(nudges) - 1)
+        ):
+            return
+        text = (
+            f"Your last step ended with an error: {_last_text(snap)}\n"
+            "Continue with the brief. If the same error comes back, try a different approach."
+        )
+        try:
+            self._conversations.deliver(self._server_ref(run.id), cid, EvidenceMessage(text))
+        except ConversationError as exc:
+            log.warning("%s: cannot nudge the errored conversation: %s", run.id, exc)
+            return
+        self._error_nudges[cid] = [*nudges, now]
+        log.warning("%s: conversation errored; nudge %d", run.id, len(nudges) + 1)
+
+    def _context_pressure(self, run: Run, snap: ConversationSnapshot) -> str | None:
+        if snap.context_tokens is None:
+            return None
+        ctx = self._catalog.get(run.model_key).ctx
+        limit = int(ctx * self._settings.rollover_context_fraction)
+        if snap.context_tokens < limit:
+            return None
+        return f"{snap.context_tokens} of {ctx} context tokens in use"
+
+    def _repeated_failures(self, run: Run) -> str | None:
+        """N failed claims in a row within the active conversation."""
+        active = self._active_conversation(run.id)
+        since = active.active_at or active.started_at if active else run.launched_at
+        claims = [
+            e
+            for e in self._state.evaluations(run.id)
+            if e.trigger == "claim" and not e.open and e.started_at >= since
+        ]
+        streak = 0
+        for e in reversed(claims):
+            if e.status != "failed":
+                break
+            streak += 1
+        if streak < self._settings.failures_before_rollover:
+            return None
+        failing = sorted(
+            k for k, r in (claims[-1].results or {}).items() if r.get("status") != "passed"
+        )
+        return f"{streak} completion claims in a row failed the checks ({', '.join(failing)})"
+
+    # --- blocked --------------------------------------------------------------------------
+
+    def _step_blocked(self, run: Run) -> None:
+        """Answer a declare_blocked request; a confirmed blocker ends the run."""
+        try:
+            raw = read_json(
+                self.paths(run.id).agent_dir, ".dgx", "blocked.json", max_bytes=MAX_HANDOFF_BYTES
+            )
+        except FileNotFoundError:
+            return
+        except AgentFileError as exc:
+            self._warn_bad_request(run.id, str(exc))
+            return
+        file_id = raw.get("id") if isinstance(raw, dict) else None
+        if not isinstance(file_id, str) or not _REQUEST_ID.match(file_id):
+            return
+        key = f"blocked:{run.id}"
+        if key not in self._answered:
+            # After a restart: an answer already written for this request stands.
+            prior = self._read_control(run.id, "blocked.json")
+            if prior and prior.get("request_id") == file_id:
+                self._answered[key] = (file_id, None, None)
+        if self._answered.get(key, ("",))[0] == file_id:
+            return
+        blocker, problems = checkpoints.validate_blocker(
+            {k: v for k, v in raw.items() if k != "id"}
+        )
+        active = self._active_conversation(run.id)
+        confirming = active is not None and active.reason == "blocked-review"
+        if problems:
+            message = "Not accepted as a blocker. Keep working on the brief."
+        elif confirming:
+            message = "The blocker is confirmed. The run ends as blocked; stop now."
+        else:
+            message = (
+                "Declared. A fresh conversation reviews the blocker before the run ends."
+                " Stop now: finish with the message 'blocked declared'."
+            )
+        answer = {"request_id": file_id, "accepted": not problems, "problems": problems,
+                  "message": message}  # fmt: skip
+        self._write_control(run.id, "blocked.json", json.dumps(answer))
+        self._answered[key] = (file_id, None, None)
+        if problems:
+            log.info("%s: blocker declaration refused: %s", run.id, problems)
+            return
+        if confirming:
+            first = _blocker_of(active) if active else None
+            record = {
+                "blocker": blocker,
+                "first_declaration": first,
+                "confirmed_by_conversation": active.n if active else None,
+                "confirmed_at": self._clock.now().isoformat(),
+            }
+            self._state.record_blocked(run.id, json.dumps(record))
+            log.warning("%s: blocker confirmed: %s", run.id, blocker["missing_capability"])
+            self._state.request_stop(run.id, "blocked")
+            self.stop_agent(run.id, block=False)
+            return
+        self._begin_rollover(run, "blocked-review", json.dumps(blocker))
+
+    def _read_control(self, run_id: str, name: str) -> dict[str, Any] | None:
+        try:
+            data = json.loads((self.paths(run_id).control_dir / name).read_text())
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     # --- acceptance checks ---------------------------------------------------------
 
@@ -1981,8 +2593,15 @@ class Controller:
             self._publish_project(run.id)
 
     def _deliver_failure(self, run: Run, ev: Evaluation) -> None:
-        """Hand the failures back to the builder, which resumes to repair them."""
+        """Hand the failures back to the builder, which resumes to repair them.
+
+        After several failed claims in a row, a fresh conversation gets them instead,
+        with a diagnosis, rather than the same conversation trying again.
+        """
         if run.conversation_id is None:
+            return
+        repeated = self._repeated_failures(run)
+        if repeated is not None and self._begin_rollover(run, "failures", repeated):
             return
         text = failure_message(
             ev,
@@ -2376,13 +2995,14 @@ class Controller:
                 model=model.key,
                 base_url=f"{self._settings.inference_url}/v1",
                 max_input_tokens=model.ctx,
+                max_output_tokens=model.max_output_tokens,
             ),
             message=planning.planning_message(
                 plan.request,
                 model_key=model.key,
                 max_budget_hours=self._settings.max_budget_hours,
             ),
-            demo_tool=False,
+            builder_tools=False,
         )
         try:
             cid = self._conversations.start(request)
@@ -2554,8 +3174,10 @@ class Controller:
     def _stop_agent_locked(self, run: Run) -> StopEvidence:
         started = self._clock.now()
         notes: list[str] = []
-        self._abandon_recovery(run.id, f"agent execution is ending ({run.outcome or 'stopped'})")
-        self._abandon_evaluation(run.id, f"agent execution is ending ({run.outcome or 'stopped'})")
+        ending = f"agent execution is ending ({run.outcome or 'stopped'})"
+        self._abandon_recovery(run.id, ending)
+        self._abandon_evaluation(run.id, ending)
+        self._state.abandon_rollover(run.id, ending, self._clock.now())
         # 1. A sandbox that (re)starts from now on never starts the Agent Server.
         self._write_control(run.id, "mode", "demo-only\n")
 

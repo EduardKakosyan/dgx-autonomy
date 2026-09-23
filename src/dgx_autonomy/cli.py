@@ -195,6 +195,8 @@ def _print_status(result: dict[str, Any]) -> None:
     containers = result.pop("containers", None)
     evaluation = result.pop("evaluation", None)
     criteria = result.pop("criteria", None)
+    conversations = result.pop("conversations", None) or []
+    blocked = result.pop("blocked", None)
     _print(result, False)
     for op in ops:
         line = f"  {op['kind']:<20} {op['status']}"
@@ -231,6 +233,13 @@ def _print_status(result: dict[str, Any]) -> None:
         )
         for key, r in evaluation["results"].items():
             print(f"            {r['status']:<8} {key}  {r.get('summary') or ''}")
+    if len(conversations) > 1 or any(c["status"] != "active" for c in conversations):
+        chain = ", ".join(f"#{c['n']} {c['status']} ({c['reason']})" for c in conversations)
+        print(f"conversations {chain}")
+    if blocked:
+        b = blocked["blocker"]
+        print(f"blocked     {b['missing_capability']}")
+        print(f"            needed: {b['needed']}; tried: {'; '.join(b['alternatives_tried'])}")
     if evidence:
         verdict = "NOT VERIFIED" if evidence["failed"] else "verified"
         print(
@@ -344,6 +353,23 @@ def print_report(r: dict[str, Any]) -> None:
             print(f"      changed since the previous evaluation: {', '.join(changes[:10])}")
         print(f"      evidence: {e['evidence_dir']}")
 
+    if r.get("blocked"):
+        b = r["blocked"]["blocker"]
+        print("\nBlocked (declared, then confirmed by a fresh conversation)")
+        print(f"  missing: {b['missing_capability']}")
+        for alt in b["alternatives_tried"]:
+            print(f"  tried:   {alt}")
+        print(f"  needed:  {b['needed']}")
+
+    conversations = r.get("conversations") or []
+    if len(conversations) > 1:
+        print("\nConversations (fresh ones continue from checkpoints)")
+        for c in conversations:
+            print(f"  #{c['n']} {c['status']:<9} {c['reason']:<15} from {c['started_at']}")
+        for k in r.get("checkpoints") or []:
+            problems = f"; {'; '.join(k['problems'])}" if k["problems"] else ""
+            print(f"  checkpoint #{k['n']} {k['source']} ({k['reason']}){problems}")
+
     print("\nStronger-model reviews (requested manually; separate from the checks)")
     if not r["reviews"]:
         print("  none requested")
@@ -392,6 +418,125 @@ def cmd_review_record(args: argparse.Namespace) -> int:
         {"run_id": args.run_id, "n": args.n, "reviewer": args.reviewer, "text": text},
     )
     _print(result, args.json)
+    return 0
+
+
+def cmd_rollover(args: argparse.Namespace) -> int:
+    """Replace the run's conversation with a fresh one that continues from a checkpoint."""
+    request = {"run_id": args.run_id} | ({"detail": args.detail} if args.detail else {})
+    result = call(_socket(args), "rollover", request)
+    if args.json:
+        _print(result, True)
+    else:
+        print(
+            f"conversation #{result['n']} requested; the current one is asked for a handoff"
+            f" (`dgx-autonomy checkpoints {args.run_id}` shows the chain)"
+        )
+    return 0
+
+
+def cmd_checkpoints(args: argparse.Namespace) -> int:
+    result = call(_socket(args), "checkpoints", {"run_id": args.run_id} if args.run_id else {})
+    if args.json:
+        _print(result, True)
+        return 0
+    print(f"run {result['run_id']}")
+    for c in result["conversations"]:
+        detail = f": {c['detail']}" if c.get("detail") else ""
+        print(f"conversation #{c['n']} {c['status']} ({c['reason']}{detail[:160]})")
+        print(f"    {c['conversation_id']}, from checkpoint {c['from_checkpoint'] or '-'}")
+    for k in result["checkpoints"]:
+        print(
+            f"\ncheckpoint #{k['n']} {k['source']} ({k['reason']}) from conversation"
+            f" {k['from_conversation'][:8]} at event {k['event_position']}, snapshot"
+            f" {str(k['workspace_sha'])[:12]}, supersedes {k['supersedes'] or '-'}"
+        )
+        for problem in k["problems"]:
+            print(f"    problem: {problem}")
+        print(_indent(json.dumps(k["handoff"], indent=2)[:4000], "    "))
+        print(f"    verified by the environment: {json.dumps(k['verified'])[:600]}")
+    return 0
+
+
+def _print_qualification(q: dict[str, Any]) -> None:
+    print(f"qualification of {q['model_key']}: {q['status']} (step {q['step']})")
+    for name, step in q.get("steps", {}).items():
+        mark = "ok  " if step.get("ok") else ("…   " if step.get("ok") is None else "FAIL")
+        facts = {k: v for k, v in step.items() if k not in ("ok", "probes", "error")}
+        print(f"  {mark} {name:<12} {json.dumps(facts, default=str)[:180]}")
+        for probe in step.get("probes") or []:
+            mark = "ok  " if probe["ok"] else "FAIL"
+            print(f"         {mark} {probe['probe']}: {probe['detail'][:120]}")
+        if step.get("error"):
+            print(f"         {step['error']}")
+    if q.get("memory"):
+        print(f"  memory {json.dumps(q['memory'])}")
+    for failure in q.get("failures") or []:
+        print(f"  failure: {failure}")
+    print(f"  record: {q.get('path')}")
+
+
+def cmd_qualify(args: argparse.Namespace) -> int:
+    """Qualify a model with the whole workload running; follow it to the verdict."""
+    sock = _socket(args)
+    job = call(sock, "qualify.start", {"model_key": args.model})
+    if args.json and not args.follow:
+        _print(job, True)
+        return 0
+    last_step = None
+    while job["status"] == "running":
+        if job["step"] != last_step:
+            print(f"{time.strftime('%H:%M:%S')} {job['step']}…", flush=True)
+            last_step = job["step"]
+        time.sleep(args.interval)
+        job = call(sock, "qualify.status", {"model_key": job["model_key"]})
+    if args.json:
+        _print(job, True)
+    else:
+        _print_qualification(job)
+    return 0 if job["status"] == "qualified" else 1
+
+
+def cmd_qualification(args: argparse.Namespace) -> int:
+    request = {"model_key": args.model} if args.model else {}
+    job = call(_socket(args), "qualify.status", request)
+    if args.json:
+        _print(job, True)
+    else:
+        _print_qualification(job)
+    return 0
+
+
+def cmd_readiness(args: argparse.Namespace) -> int:
+    """Run every target-host smoke test in sequence and record one report."""
+    from .readiness import PACKAGE_ROOT, run_readiness
+
+    status = call(_socket(args), "inference.status")
+    out = Path(args.out or PACKAGE_ROOT / "readiness" / time.strftime("%Y%m%dT%H%M%S"))
+    report = run_readiness(
+        out,
+        model_key=status.get("model_key"),
+        with_reservation=args.with_reservation,
+        only=args.only or (),
+    )
+    print(
+        f"readiness {'PASSED' if report['passed'] else 'NOT PASSED'}; report: {out / 'report.md'}"
+    )
+    return 0 if report["passed"] else 1
+
+
+def cmd_retire(args: argparse.Namespace) -> int:
+    """Take ended runs' retained demos down (their sandboxes); the records stay."""
+    sock = _socket(args)
+    ids = list(args.run_ids)
+    if args.all_ended:
+        ids += [r["run_id"] for r in call(sock, "runs") if r["phase"] in TERMINAL_PHASES]
+    if not ids:
+        print("dgx-autonomy: name runs to retire, or --all-ended", file=sys.stderr)
+        return 2
+    for run_id in ids:
+        result = call(sock, "retire", {"run_id": run_id})
+        print(f"{run_id}  {'sandbox removed' if result['sandbox_removed'] else 'no sandbox'}")
     return 0
 
 
@@ -607,6 +752,40 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ssh-host", help=f"ssh host of the DGX (default: {DEFAULT_SSH_HOST})")
     s.add_argument("--local-port", type=int, help="laptop port (default: the DGX port)")
     s.set_defaults(func=cmd_tunnel)
+
+    s = sub.add_parser("rollover", help="continue a run in a fresh conversation (checkpoint)")
+    s.add_argument("run_id")
+    s.add_argument("--detail", help="why, for the record and the next conversation")
+    s.set_defaults(func=cmd_rollover)
+
+    s = sub.add_parser("checkpoints", help="a run's conversations and checkpoint chain")
+    s.add_argument("run_id", nargs="?", help="run id (default: the latest run)")
+    s.set_defaults(func=cmd_checkpoints)
+
+    s = sub.add_parser("qualify", help="qualify a model with the whole workload running")
+    s.add_argument("model", help="model key from models.yaml")
+    s.add_argument("--no-follow", dest="follow", action="store_false", help="start and return")
+    s.add_argument("--interval", type=float, default=15.0, help=argparse.SUPPRESS)
+    s.set_defaults(func=cmd_qualify)
+
+    s = sub.add_parser("qualification", help="the latest qualification result")
+    s.add_argument("model", nargs="?", help="model key (default: the latest of any)")
+    s.set_defaults(func=cmd_qualification)
+
+    s = sub.add_parser("readiness", help="run every target-host smoke test; record a report")
+    s.add_argument("--only", nargs="*", help="run only suites whose path or name contains this")
+    s.add_argument(
+        "--with-reservation",
+        action="store_true",
+        help="also test reserve/release (stops claude-qwen for a few seconds)",
+    )
+    s.add_argument("--out", help="report directory (default: readiness/<time>/ in the checkout)")
+    s.set_defaults(func=cmd_readiness)
+
+    s = sub.add_parser("retire", help="take ended runs' demos down (removes their sandboxes)")
+    s.add_argument("run_ids", nargs="*")
+    s.add_argument("--all-ended", action="store_true", help="every run that has ended")
+    s.set_defaults(func=cmd_retire)
 
     s = sub.add_parser("ps", help="processes in a run's sandbox, by role")
     s.add_argument("run_id", nargs="?", help="run id (default: the latest run)")

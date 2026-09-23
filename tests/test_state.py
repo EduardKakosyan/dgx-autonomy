@@ -394,7 +394,7 @@ def test_a_phase_4_database_gains_the_frozen_agreement_and_evaluations(tmp_path:
         == 2
     )
     raw = sqlite3.connect(path)
-    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 5
+    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 6
     raw.close()
     store.close()
 
@@ -404,6 +404,7 @@ def test_v4_database_gains_plans_and_a_plan_launches_once(tmp_path: Path) -> Non
     StateStore(path).close()
     db = sqlite3.connect(path)
     db.execute("drop table plans")
+    _undo_v6(db)
     db.execute("pragma user_version = 4")
     db.commit()
     db.close()
@@ -441,4 +442,85 @@ def test_v4_database_gains_plans_and_a_plan_launches_once(tmp_path: Path) -> Non
         )  # fmt: skip
     assert store.get_run("r2") is None
     assert store.set_plan_state("p1", "closed", LAUNCH).state == "launched"
+    store.close()
+
+
+def _undo_v6(db: sqlite3.Connection) -> None:
+    db.execute("drop table conversations")
+    db.execute("drop table checkpoints")
+    db.execute("alter table runs drop column current_checkpoint_id")
+    db.execute("alter table runs drop column blocked")
+
+
+def test_v5_database_gains_conversation_history_and_checkpoints(tmp_path: Path) -> None:
+    path = tmp_path / "v5.sqlite3"
+    store = StateStore(path)
+    store.create_run(
+        run_id="old", model_key="m", launched_at=LAUNCH, deadline_at=DEADLINE, brief_path="b"
+    )
+    store.set_conversation_id("old", "c-old")
+    store.create_run(
+        run_id="new", model_key="m", launched_at=LAUNCH, deadline_at=DEADLINE, brief_path="b"
+    )
+    store.close()
+    db = sqlite3.connect(path)
+    _undo_v6(db)
+    db.execute("pragma user_version = 5")
+    db.commit()
+    db.close()
+
+    store = StateStore(path)
+    [first] = store.conversations("old")
+    assert (first.n, first.conversation_id, first.status) == (1, "c-old", "active")
+    assert store.conversations("new") == []
+    assert store.record_first_conversation("new", "c-new", LAUNCH).status == "active"
+
+    # A rollover: intent, checkpoint, then the new conversation becomes the run's.
+    row = store.begin_rollover(
+        "old", conversation_id_for_n=lambda n: f"c-old-{n}", reason="stuck", detail="loop",
+        now=LAUNCH,
+    )  # fmt: skip
+    assert (row.n, row.conversation_id, row.status) == (2, "c-old-2", "handoff")
+    again = store.begin_rollover(
+        "old", conversation_id_for_n=lambda n: "x", reason="forced", detail=None, now=LAUNCH
+    )
+    assert again == row  # one rollover at a time
+    row = store.note_handoff_request(row.id, "req-1", LAUNCH)
+    assert (row.handoff_request_id, row.handoff_attempts) == ("req-1", 1)
+    ckpt = store.record_checkpoint(
+        row.id, from_conversation_id="c-old", event_position=42, workspace_sha="tree1",
+        source="agent_handoff", reason="stuck", handoff={"roadmap": []},
+        verified={"evaluation": None}, problems=[], now=LAUNCH,
+    )  # fmt: skip
+    assert (ckpt.n, ckpt.supersedes_id, ckpt.event_position) == (1, None, 42)
+    with pytest.raises(StateError, match="not waiting for a handoff"):
+        store.record_checkpoint(
+            row.id, from_conversation_id="c-old", event_position=None, workspace_sha=None,
+            source="controller_fallback", reason="stuck", handoff={}, verified={},
+            problems=[], now=LAUNCH,
+        )  # fmt: skip
+    run = store.activate_conversation(row.id, LAUNCH)
+    assert (run.conversation_id, run.current_checkpoint_id) == ("c-old-2", ckpt.id)
+    assert [(c.n, c.status) for c in store.conversations("old")] == [(1, "ended"), (2, "active")]
+    assert store.open_rollover("old") is None
+
+    # The next checkpoint supersedes this one; an abandoned rollover changes nothing else.
+    row3 = store.begin_rollover(
+        "old", conversation_id_for_n=lambda n: f"c-old-{n}", reason="forced", detail=None,
+        now=LAUNCH,
+    )  # fmt: skip
+    ckpt2 = store.record_checkpoint(
+        row3.id, from_conversation_id="c-old-2", event_position=7, workspace_sha="tree2",
+        source="controller_fallback", reason="forced", handoff={}, verified={},
+        problems=["no handoff"], now=LAUNCH,
+    )  # fmt: skip
+    assert ckpt2.supersedes_id == ckpt.id and ckpt2.problems == ["no handoff"]
+    store.abandon_rollover("old", "the run is ending", LAUNCH)
+    assert [c.status for c in store.conversations("old")] == ["ended", "ended", "abandoned"]
+    old = store.get_run("old")
+    assert old is not None and old.conversation_id == "c-old-2"
+    assert store.record_blocked("old", '{"x": 1}').blocked == '{"x": 1}'
+    raw = sqlite3.connect(path)
+    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 6
+    raw.close()
     store.close()

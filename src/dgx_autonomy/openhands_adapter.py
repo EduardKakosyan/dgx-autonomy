@@ -52,8 +52,12 @@ _NAMESPACE = uuid.UUID("5f0c1d0e-8a57-4d8e-9c55-6a2f3f1d9b21")
 _TEXT_LIMIT = 300
 _EVENT_FILE = re.compile(r"^event-(\d+)-[0-9a-fA-F-]+\.json$")
 _MAX_EVENT_BYTES = 4 * 1024 * 1024
-# The custom tool the Agent Server loads with --import-modules (demo_tool.py).
+# The custom tools the Agent Server loads with --import-modules (demo_tool.py,
+# handoff_tool.py).
 DEMO_TOOL_NAME = "start_demo"
+HANDOFF_TOOL_NAME = "write_handoff"
+BLOCKED_TOOL_NAME = "declare_blocked"
+BUILDER_TOOLS = (DEMO_TOOL_NAME, HANDOFF_TOOL_NAME, BLOCKED_TOOL_NAME)
 
 
 class ConversationError(RuntimeError):
@@ -179,6 +183,7 @@ class OpenHandsConversations:
             base_url=request.llm.base_url,
             api_key=SecretStr("local-llama-server"),
             max_input_tokens=request.llm.max_input_tokens,
+            max_output_tokens=request.llm.max_output_tokens,
             usage_id="agent",
         )
         # cli_mode drops the browser tool set; the run needs terminal + file editor,
@@ -186,8 +191,9 @@ class OpenHandsConversations:
         from openhands.sdk import Tool
 
         agent = get_default_agent(llm=llm, cli_mode=True)
-        if request.demo_tool:
-            agent = agent.model_copy(update={"tools": [*agent.tools, Tool(name=DEMO_TOOL_NAME)]})
+        if request.builder_tools:
+            extra = [Tool(name=name) for name in BUILDER_TOOLS]
+            agent = agent.model_copy(update={"tools": [*agent.tools, *extra]})
         workspace = RemoteWorkspace(
             host=request.server.url,
             working_dir=request.working_dir,
@@ -238,7 +244,7 @@ class OpenHandsConversations:
         )
         items = last.body.get("items") if isinstance(last.body, dict) else None
         last_event = summarize_event(items[0]) if items else None
-        return ConversationSnapshot(conversation_id, status, last_event)
+        return ConversationSnapshot(conversation_id, status, last_event, context_tokens(body))
 
     def resume(self, server: ServerRef, conversation_id: str) -> None:
         # 409 = already running, which is what we want.
@@ -296,7 +302,31 @@ class OpenHandsConversations:
         return out
 
 
+def context_tokens(info: Mapping[str, Any]) -> int | None:
+    """The agent's latest request size from the conversation's usage stats.
+
+    SDK 1.49.4: stats.usage_to_metrics[<usage id>].accumulated_token_usage.per_turn_token
+    is prompt + completion tokens of the latest call (accumulation keeps the latest).
+    """
+    stats = info.get("stats")
+    usage = stats.get("usage_to_metrics") if isinstance(stats, dict) else None
+    agent = usage.get("agent") if isinstance(usage, dict) else None
+    acc = agent.get("accumulated_token_usage") if isinstance(agent, dict) else None
+    value = acc.get("per_turn_token") if isinstance(acc, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 # --- the conversation as the SDK persisted it ---------------------------------------
+
+
+def persisted_event_count(conversations_dir: Path, conversation_id: str) -> int | None:
+    """How many events the SDK has saved for the conversation (None if unreadable)."""
+    try:
+        cid = uuid.UUID(conversation_id).hex
+        with open_dir(conversations_dir.parent, conversations_dir.name, cid, "events") as fd:
+            return sum(1 for n in os.listdir(fd) if _EVENT_FILE.match(n))
+    except (OSError, ValueError):
+        return None
 
 
 def persisted_status(conversations_dir: Path, conversation_id: str) -> str | None:

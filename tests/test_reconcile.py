@@ -253,7 +253,9 @@ def test_after_a_reboot_the_run_resumes_the_same_conversation(harness: Harness) 
     assert len(h.conversation.delivered) == 1
 
 
-@pytest.mark.parametrize(("before", "phase"), [("finished", "finished"), ("error", "failed")])
+# An errored conversation is not resumed by the recovery; the usual handling of
+# errors (a nudge, test_rollover.py) takes it from there, and the run goes on.
+@pytest.mark.parametrize(("before", "phase"), [("finished", "finished"), ("error", "running")])
 def test_a_conversation_that_had_ended_is_not_resumed(
     harness: Harness, before: str, phase: str
 ) -> None:
@@ -268,7 +270,8 @@ def test_a_conversation_that_had_ended_is_not_resumed(
     h.controller.reconcile_once()  # the sandbox, then the conversation
     [rec] = h.state.recoveries(run_id)
     assert rec.status == "done" and rec.status_before == before
-    assert h.conversation.delivered == []
+    # No recovery notice; at most the nudge an errored conversation always gets.
+    assert all("restarted" not in m.text for m in h.conversation.delivered)
     h.controller.reconcile_once()
     assert _phase(h, run_id) == phase
 

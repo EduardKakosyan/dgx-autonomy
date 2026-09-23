@@ -11,6 +11,9 @@ from __future__ import annotations
 import json
 import uuid
 
+import pytest
+
+from dgx_autonomy.controller import RequestError
 from dgx_autonomy.openhands_adapter import conversation_id_for
 from dgx_autonomy.runtime import agent_container_name
 
@@ -121,3 +124,19 @@ def test_a_removed_sandbox_and_a_failed_demo_stay_down(harness: Harness) -> None
 
     assert summary["demos"] == []
     assert h.runtime.started == []
+
+
+def test_retire_takes_an_ended_runs_demo_down_for_good(harness: Harness) -> None:
+    h = harness
+    run_id = h.running_run(budget_hours=1)
+    with pytest.raises(RequestError, match="stop it first"):
+        h.controller.handle("retire", {"run_id": run_id})
+    h.controller.handle("stop", {"run_id": run_id})
+    assert h.controller.handle("retire", {"run_id": run_id}) == {
+        "run_id": run_id,
+        "sandbox_removed": True,
+    }
+    assert agent_container_name(run_id) not in h.runtime.containers
+    h.restart_controller()
+    assert h.controller.reconcile_on_start()["demos"] == []
+    assert agent_container_name(run_id) not in h.runtime.containers

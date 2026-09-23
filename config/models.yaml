@@ -23,3 +23,25 @@ models:
     cache_type_v: q8_0
     extra_args: []
     status: unqualified
+
+  qwen3.8-flash-next:
+    # The preferred model (Qwen Community License 1.0): 125B total / 6B active MoE.
+    # Unsloth's UD-Q3_K_XL pack is three shards, 89,986,353,824 bytes (83.8 GiB);
+    # llama.cpp loads a split GGUF from its first shard. It does not fit next to
+    # claude-qwen: hold the reservation (`dgx-autonomy reserve`) to use it.
+    repo: unsloth/Qwen3.8-Flash-Next-GGUF
+    revision: 38bb39ee97821de2c9009abb7e93950eec396e66
+    files:
+      - UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
+      - UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf
+      - UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf
+    gguf: qwen3.8-flash-next/UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
+    size_bytes: 89986353824
+    ctx: 65536
+    parallel: 1
+    template: embedded
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    max_output_tokens: 16384
+    extra_args: []
+    status: unqualified

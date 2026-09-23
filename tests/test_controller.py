@@ -92,6 +92,7 @@ def test_launch_to_running_to_finished(harness: Harness) -> None:
     assert request.working_dir == AGENT_PROJECT_DIR
     assert request.llm.base_url == f"{h.settings.inference_url}/v1"
     assert request.llm.model == "qwen3.6-35b-a3b"
+    assert request.llm.max_output_tokens == 16384
     assert BRIEF.strip() in request.message
     run = h.state.get_run(run_id)
     assert run is not None and run.conversation_id == request.conversation_id
@@ -242,7 +243,8 @@ def test_agent_container_exit_fails_the_run(harness: Harness) -> None:
 
 
 @pytest.mark.parametrize("status", ["error", "stuck"])
-def test_conversation_error_or_stuck_fails_the_run(harness: Harness, status: str) -> None:
+def test_conversation_error_or_stuck_does_not_end_the_run(harness: Harness, status: str) -> None:
+    """Only the deadline, a stop or a confirmed blocker end a run (test_rollover.py)."""
     h = harness
     run_id = _launch(h)
     h.inference_ready()
@@ -250,7 +252,9 @@ def test_conversation_error_or_stuck_fails_the_run(harness: Harness, status: str
     h.controller.reconcile_once()
     h.conversation.status = status
     h.controller.reconcile_once()
-    assert _phase(h, run_id) == "failed"
+    h.controller.reconcile_once()
+    assert _phase(h, run_id) == "running"
+    assert h.conversation.delivered  # a nudge, or a handoff request
 
 
 def test_a_second_model_does_not_silently_replace_the_first(harness: Harness) -> None:

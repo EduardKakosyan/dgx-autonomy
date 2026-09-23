@@ -115,7 +115,7 @@ def test_a_plan_gets_its_own_sandbox_and_a_planning_conversation(harness: Harnes
     h.controller.reconcile_once()
     [request] = h.conversation.started
     assert request.conversation_id == conversation_id_for(f"plan-{plan_id}")
-    assert request.demo_tool is False
+    assert request.builder_tools is False
     assert request.working_dir == AGENT_WORKDIR
     assert REQUEST in request.message
     assert f"{DRAFT_DIR}/brief.md" in request.message

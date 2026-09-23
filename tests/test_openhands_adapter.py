@@ -177,3 +177,23 @@ def test_persisted_events_do_not_follow_agent_symlinks(tmp_path: Path) -> None:
     state.unlink()
     os.symlink(outside, state)
     assert persisted_status(convs, CID) is None
+
+
+def test_context_tokens_come_from_the_agents_latest_usage() -> None:
+    from dgx_autonomy.openhands_adapter import context_tokens
+
+    info = {
+        "stats": {
+            "usage_to_metrics": {
+                "agent": {
+                    "accumulated_token_usage": {"prompt_tokens": 90000, "per_turn_token": 41200}
+                },
+                "condenser": {"accumulated_token_usage": {"per_turn_token": 999}},
+            }
+        }
+    }
+    assert context_tokens(info) == 41200
+    assert context_tokens({}) is None
+    assert context_tokens({"stats": {"usage_to_metrics": {"agent": {}}}}) is None
+    assert context_tokens({"stats": {"usage_to_metrics": {"agent": {
+        "accumulated_token_usage": {"per_turn_token": True}}}}}) is None  # fmt: skip

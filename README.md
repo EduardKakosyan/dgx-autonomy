@@ -146,7 +146,9 @@ dgx-autonomy report [RUN_ID]          # claims, check results, human judgment, e
 dgx-autonomy evaluate RUN_ID          # run the frozen checks again on an ended run
 dgx-autonomy review-request RUN_ID [--note TEXT]    # bundle for a manual stronger-model review
 dgx-autonomy review-record RUN_ID N --reviewer M --file review.md
-dgx-autonomy logs RUN_ID [--follow]   # summarized OpenHands events
+dgx-autonomy logs RUN_ID [--follow]   # summarized OpenHands events (the active conversation)
+dgx-autonomy checkpoints [RUN_ID]     # conversations and the checkpoint chain
+dgx-autonomy rollover RUN_ID [--detail TEXT]   # continue in a fresh conversation now
 dgx-autonomy stop RUN_ID              # end agent execution now; the demo stays up
 dgx-autonomy tunnel [RUN_ID]          # prints: ssh -N -L <p>:127.0.0.1:<p> hugo-dgx1
 dgx-autonomy ps [RUN_ID]              # the sandbox's processes, by role
@@ -156,6 +158,9 @@ dgx-autonomy reserve [--model M]      # displace claude-qwen, start the owned ll
 dgx-autonomy release                  # remove the owned llama-server, restore claude-qwen
 dgx-autonomy reservation              # held or not, since when, memory available
 dgx-autonomy egress [HOST:PORT ...]   # is the egress policy in place / probe through it
+dgx-autonomy qualify MODEL            # qualify a model with the whole workload running
+dgx-autonomy qualification [MODEL]    # the latest qualification result
+dgx-autonomy readiness [--only X] [--with-reservation]   # every smoke test, one report
 ```
 
 ### Planning
@@ -366,6 +371,64 @@ sent anywhere. The operator runs the review, then `review-record` attaches the r
 The report shows the result in its own section. It never changes a check result or
 the verdict.
 
+### Continuity: fresh conversations and checkpoints
+
+Inside one conversation, OpenHands manages the context itself: its condenser
+summarizes old events when the conversation grows. Some situations need a fresh
+conversation instead. The controller then *rolls the run over*. The run, its deadline,
+its sandbox, its demo and its project stay; the conversation is replaced.
+
+| trigger | when |
+|---|---|
+| `stuck` | the SDK's stuck detector fired (repeating actions or errors, monologue) |
+| `errors` | the conversation errored again after 3 nudges within an hour (the nudges wait 30 s, 60 s, 120 s) |
+| `context` | its latest LLM request used 85% of the model's context |
+| `failures` | 3 completion claims in a row failed the acceptance checks |
+| `blocked-review` | the builder declared itself blocked (see below) |
+| `forced` | `dgx-autonomy rollover RUN_ID` |
+
+A conversation that errors or gets stuck no longer fails the run. Only the deadline,
+a stop, or a confirmed blocker end a run. Rollovers for `context` and `failures` are
+at least 10 minutes apart; for `stuck` and `errors`, at least 1 minute.
+
+A rollover, one controller tick at a time, each step durable (`conversations` table):
+
+1. **Handoff.** The old conversation gets a `HANDOFF REQUEST <id>` and answers with the
+   `write_handoff` tool: a summary, the roadmap (each item `done`, `in_progress`,
+   `todo` or `blocked`, with evidence), decisions, approaches tried and how they went,
+   open failures, and next steps. The controller validates structure and evidence and
+   writes its answer back, so the tool tells the agent what to fix. Evidence is a
+   project path that exists (checked without following symlinks) or `eval:N` for an
+   evaluation that exists. A `done` item must name evidence. A `verified` field is
+   refused: the environment records verified results itself.
+2. **Checkpoint.** A valid handoff becomes a checkpoint (`agent_handoff`). If none
+   arrives within 10 minutes, the controller records a `controller_fallback`. It
+   carries the last valid handoff forward, marked as older, plus the old conversation's
+   last actions as observed, and marks nothing done. Each checkpoint records the
+   conversation and event position it came from, the project snapshot, what the
+   environment verified (the latest evaluation) and the checkpoint it supersedes. The
+   old conversation is interrupted and paused before the new one starts, so there is
+   never more than one executor.
+3. **Fresh conversation.** Its id is derived from the run and its number, so a start
+   retried after a crash attaches instead of duplicating. Its first message is the
+   recovery context, within 25% of the model's context. It contains the frozen brief,
+   then the checkpoint (labelled as the previous conversation's claims), what the
+   environment verified, the latest failure evidence, and the previous conversation's
+   last actions. The least important parts are clipped or dropped first; the brief
+   points at `/brief/brief.md`. After `stuck`, `errors` and `failures` it is told to
+   diagnose why nothing progressed and to change approach.
+
+A controller restart continues an open rollover from its record. A sandbox recovery
+during a rollover does not resume the old conversation. A stop abandons the rollover.
+
+**Blocked.** A builder that finds no viable path calls `declare_blocked` with the
+missing capability, at least two alternatives it tried, and what would be needed.
+Operating restrictions (no keys, no payments, no other services) are boundaries, not
+blockers. A valid first declaration starts a `blocked-review` rollover: a fresh
+conversation gets the blocker and must verify it and try another approach. Only a
+declaration from that reviewing conversation ends the run: outcome `blocked`, stopped
+like any other stop (the demo stays). `status` and `report` then show the blocker.
+
 ### Crashes and DGX restarts
 
 Compose restarts the controller (`restart: unless-stopped`), and Docker starts it
@@ -481,32 +544,72 @@ The sudoers entry (`host/sudoers-autonomy`) lets jim run exactly `reserve`,
 `release` and `status`. The helper is a root-owned, standard-library-only copy of
 `src/dgx_autonomy/reservation.py`, run with `python3 -I`, and it takes no options.
 
+## Models: qualification
+
+`config/models.yaml` lists the models the environment can serve, with their pinned
+GGUF, context, cache types, `max_output_tokens` and a `status`. A model is made the
+`default` only after `dgx-autonomy qualify MODEL` has passed on the DGX.
+
+Qualification runs in the controller and takes about as long as a small run. Nothing
+may be running or planning, because the owned llama-server is switched to MODEL:
+
+1. **preflight**: enough memory for the weights plus 8 GiB (counting what removing the
+   current model frees). A model that does not fit next to `claude-qwen` needs the
+   reservation first: `dgx-autonomy reserve --no-inference`.
+2. **load**: load time, and the memory the model took.
+3. **tool calls**: five OpenAI-style tool calls through llama.cpp's parser: a single
+   argument, a choice between two tools, a nested array of objects (the shape of
+   `write_handoff`), a shell command, and a tool-result round trip. All must pass.
+4. **long prompt**: one request filling 75% of the configured context, with a word
+   to recall from its start. Prefill and decode speed come from llama.cpp's timings.
+5. **workload**: a real run (a counter page served with start_demo, one Playwright and
+   one pytest check) must finish VERIFIED in 45 minutes, with the agent, the demo and
+   the evaluator's Chromium all running.
+
+MemAvailable and swap are sampled every 5 s throughout. The model qualifies only if
+every step passed, MemAvailable never fell below 4 GiB and swap grew by less than
+1 GiB. The record, with every sample, is in
+`/var/lib/dgx-autonomy/qualification/<model>/<time>.json`. Copy the measured values into
+`models.yaml` (the controller reads the packaged file, so rebuild its image). A
+controller restart interrupts a qualification, which then reads `interrupted`; run it
+again.
+
+`dgx-autonomy readiness` runs every target-host smoke test in sequence, each in its own
+pytest process. It writes `readiness/<time>/report.md` (and `.json`, the JUnit files
+and each suite's output) in the checkout, naming the model that served. The reboot
+checks are manual (`tests/dgx/test_reboot.md`). The reservation test runs only with
+`--with-reservation`, because it stops `claude-qwen` for a few seconds.
+
 ## Layout on the DGX
 
 ```text
 /var/lib/dgx-autonomy/            controller-owned (root), mounted at the same path in the controller
   control/control.sock            0600, owned by jim
   state/controller.sqlite3        runs, operations, demos, recoveries, criteria, evaluations,
-                                  reviews, plans
+                                  reviews, plans, conversations, checkpoints
                                   (never mounted into agent, inference or evaluator)
   state/controller.lock           the controller's writer lock (flock)
   policy/egress.json              written by dgx-autonomy-egress: boot id, rules sha256
   reservation/record.json         present while claude-qwen is displaced (host helper)
   reservation/prior/              the unit text and `systemctl cat` before reserve
+  qualification/<model>/<t>.json  model qualification: steps, measurements, memory samples
   runs/<id>/frozen/               the agreement, frozen at launch; read-only at /brief in the agent
     brief.md, checks/, manifest.json   (checks/ is also read-only at /checks in evaluators)
   runs/<id>/evidence/eval-<n>/    evaluation evidence (controller-owned; never mounted into the agent)
   runs/<id>/snapshots.git/        project snapshots (controller-owned git directory, 0700)
   runs/<id>/reviews/review-<n>/   manual review bundles
-  runs/<id>/control/              mounted read-only at /dgx-control: mode, demo.json
+  runs/<id>/control/              mounted read-only at /dgx-control: mode, demo.json,
+                                  handoff.json, blocked.json (the controller's answers)
   plans/<id>/agent/               uid 10001; the planner's /workspace: draft/, conversations/
   plans/<id>/dryruns/dry-<n>/     dry runs of the draft checks (controller-owned)
   runs/<id>/secrets/              Agent Server session key and secret key, 0700 root
   runs/<id>/agent/                uid 10001; the agent's /workspace
     project/                      what the agent builds
-    conversations/                OpenHands SDK persistence (SDK-owned format); read
-                                  by `logs`/`status` once the Agent Server is gone
-    .dgx/                         start_demo request and the demo's log
+    conversations/                OpenHands SDK persistence (SDK-owned format), one
+                                  directory per conversation; read by `logs`/`status`
+                                  once the Agent Server is gone
+    .dgx/                         start_demo, write_handoff and declare_blocked requests;
+                                  the demo's log
 /home/jim/models/                 GGUFs, mounted read-only into inference at /models
 ```
 
@@ -530,6 +633,7 @@ ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_controller_kill.py -s'
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_protected_eval.py -s'
 ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_plan_to_launch.py -s'
+ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_forced_reset.py -s'
 # stops claude-qwen for a few minutes; opt in explicitly:
 ssh hugo-dgx1 'cd ~/dgx-autonomy && DGX_AUTONOMY_RESERVATION_TEST=1 ~/.local/bin/uv run pytest -m dgx tests/dgx/test_reserve_release.py -s'
 ```
@@ -545,3 +649,5 @@ check requires. The builder's tampering with the checks must fail, its first cla
 must fail, and its repair must pass. With `-s` it prints the report.
 `test_plan_to_launch.py` scripts two planning turns, crashes the controller between
 them, dry-runs the checks, launches the reviewed digest and expects the run VERIFIED.
+`test_forced_reset.py` forces a rollover halfway through six slow steps and expects the
+agent's own handoff, a VERIFIED finish in conversation #2, and steps 1-3 untouched.

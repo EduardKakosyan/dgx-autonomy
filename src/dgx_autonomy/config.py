@@ -37,6 +37,10 @@ class ModelConfig:
     cache_type_v: str
     extra_args: tuple[str, ...]
     status: str
+    # The most tokens one response may generate. Sent with every request and set as
+    # llama-server's default, so a reasoning loop cannot hold the only slot until the
+    # context is full (seen on hugo-dgx1: 10 000+ tokens, 20+ minutes, both runs waiting).
+    max_output_tokens: int = 16384
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,7 @@ def _model_from(key: str, raw: Mapping[str, Any]) -> ModelConfig:
             cache_type_v=str(raw.get("cache_type_v", "f16")),
             extra_args=tuple(str(a) for a in raw.get("extra_args") or ()),
             status=str(raw.get("status", "unqualified")),
+            max_output_tokens=int(raw.get("max_output_tokens", 16384)),
         )
     except KeyError as missing:
         raise ConfigError(f"model {key}: missing field {missing}") from None
@@ -176,6 +181,26 @@ class Settings:
     # the same completion claim after this backoff, doubling up to the maximum.
     evaluation_retry_s: float = 30.0
     evaluation_retry_max_s: float = 15 * 60.0
+    # Continuity (checkpoints.py). A conversation is replaced by a fresh one when its
+    # latest request used this share of the model's context...
+    rollover_context_fraction: float = 0.85
+    # ...when this many completion claims in a row failed the checks...
+    failures_before_rollover: int = 3
+    # ...or when it errored again after this many nudges within the window (each nudge
+    # waits twice as long as the previous one).
+    error_nudges: int = 3
+    error_window_s: float = 60 * 60.0
+    error_backoff_s: float = 30.0
+    # How long the old conversation has to write its handoff before the controller
+    # records a fallback checkpoint itself.
+    handoff_timeout_s: float = 10 * 60.0
+    # The least time between rollovers for context and failures, and for the rest
+    # (stuck, errors). A forced rollover or a blocker review is never held back.
+    rollover_min_interval_s: float = 10 * 60.0
+    rollover_retry_s: float = 60.0
+    # The recovery context may use this share of the model's context (at ~3
+    # characters per token).
+    recovery_context_fraction: float = 0.25
 
     @property
     def runs_dir(self) -> Path:

@@ -18,6 +18,11 @@ Tables:
 - `reviews`: manually requested stronger-model reviews, kept apart from the checks.
 - `plans`: interactive planning sessions (planning.py). A plan has no deadline; its
   launch freezes the agreed draft and creates the run, which gets one then.
+- `conversations`: every OpenHands conversation a run has had, in order. A rollover
+  (checkpoints.py) replaces the active conversation with a fresh one; the run's
+  `conversation_id` always names the active one.
+- `checkpoints`: the structured handoff each rollover starts from, written by the
+  agent (validated) or, failing that, recorded by the controller.
 
 `pragma user_version` records the schema version. Older databases are migrated in
 place on open.
@@ -49,8 +54,10 @@ EvaluationStatus = Literal["intended", "passed", "failed", "inconclusive", "infr
 EvaluationTrigger = Literal["claim", "final", "requested"]
 ReviewStatus = Literal["requested", "recorded"]
 PlanState = Literal["starting", "open", "launched", "closed", "failed"]
+ConversationRowStatus = Literal["handoff", "starting", "active", "ended", "abandoned"]
+CheckpointSource = Literal["agent_handoff", "controller_fallback"]
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 TERMINAL_PHASES: frozenset[str] = frozenset({"stopped", "finished", "failed"})
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "launched": frozenset({"running", "failed", "stopping"}),
@@ -230,6 +237,52 @@ create table if not exists plans (
 """
 
 
+_CONVERSATIONS_TABLE = """
+create table if not exists conversations (
+    id                 text primary key,   -- <run_id>.conv.<n>
+    run_id             text not null references runs(id),
+    n                  integer not null,
+    conversation_id    text not null,      -- the SDK conversation id (derived, stable)
+    -- handoff: the previous conversation is asked for its handoff; starting: the
+    -- checkpoint is recorded and this conversation is being started; active: the
+    -- run's conversation; ended: replaced; abandoned: the rollover was given up
+    status             text not null check (status in
+                           ('handoff', 'starting', 'active', 'ended', 'abandoned')),
+    reason             text not null,      -- launch | stuck | errors | context | failures
+                                           -- | blocked-review | forced
+    detail             text,
+    from_checkpoint_id text,               -- the checkpoint it starts from (n > 1)
+    handoff_request_id text,               -- the request sent to the previous conversation
+    handoff_attempts   integer not null default 0,
+    started_at         text not null,
+    attempted_at       text not null,
+    active_at          text,
+    ended_at           text,
+    unique (run_id, n),
+    unique (conversation_id)
+);
+"""
+
+_CHECKPOINTS_TABLE = """
+create table if not exists checkpoints (
+    id              text primary key,   -- <run_id>.ckpt.<n>
+    run_id          text not null references runs(id),
+    n               integer not null,
+    conversation_id text not null,      -- the conversation it hands off from
+    event_position  integer,            -- events in that conversation when recorded
+    workspace_sha   text,               -- project snapshot (tree) when recorded
+    supersedes_id   text,
+    source          text not null check (source in ('agent_handoff', 'controller_fallback')),
+    reason          text not null,
+    handoff         text not null,      -- JSON: the validated handoff, or the fallback
+    verified        text not null,      -- JSON: what the controller itself established
+    problems        text,               -- JSON list: why an agent handoff was not used
+    created_at      text not null,
+    unique (run_id, n)
+);
+"""
+
+
 class StateError(RuntimeError):
     """A lifecycle rule would be broken."""
 
@@ -263,6 +316,10 @@ class Run:
     # frozen.bundle_digest of the brief and checks, recorded at launch. None for
     # runs launched before the agreement was frozen (schema < 4).
     frozen_digest: str | None = None
+    # The checkpoint the active conversation started from (None: the first one).
+    current_checkpoint_id: str | None = None
+    # JSON: the blocker a fresh conversation confirmed (outcome `blocked`).
+    blocked: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -365,6 +422,45 @@ class Evaluation:
 
 
 @dataclass(frozen=True)
+class ConversationRow:
+    id: str
+    run_id: str
+    n: int
+    conversation_id: str
+    status: ConversationRowStatus
+    reason: str
+    detail: str | None
+    from_checkpoint_id: str | None
+    handoff_request_id: str | None
+    handoff_attempts: int
+    started_at: datetime
+    attempted_at: datetime
+    active_at: datetime | None
+    ended_at: datetime | None
+
+    @property
+    def rolling_over(self) -> bool:
+        return self.status in ("handoff", "starting")
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    id: str
+    run_id: str
+    n: int
+    conversation_id: str
+    event_position: int | None
+    workspace_sha: str | None
+    supersedes_id: str | None
+    source: CheckpointSource
+    reason: str
+    handoff: dict[str, Any]
+    verified: dict[str, Any]
+    problems: list[str]
+    created_at: datetime
+
+
+@dataclass(frozen=True)
 class Plan:
     id: str
     state: PlanState
@@ -432,6 +528,21 @@ def _migrate(db: sqlite3.Connection) -> None:
         if version < 5:
             # v4 -> v5: interactive planning sessions.
             db.execute(_PLANS_TABLE)
+        if version < 6:
+            # v5 -> v6: conversation history, checkpoints, the confirmed blocker. A
+            # run's existing conversation becomes its first one.
+            db.execute("alter table runs add column current_checkpoint_id text")
+            db.execute("alter table runs add column blocked text")
+            db.execute(_CONVERSATIONS_TABLE)
+            db.execute(_CHECKPOINTS_TABLE)
+            db.execute(
+                "insert into conversations (id, run_id, n, conversation_id, status, reason,"
+                " started_at, attempted_at, active_at)"
+                " select id || '.conv.1', id, 1, conversation_id,"
+                " case when phase in ('stopped', 'finished', 'failed') then 'ended'"
+                " else 'active' end, 'launch', launched_at, launched_at, launched_at"
+                " from runs where conversation_id is not null"
+            )
         problems = db.execute("pragma foreign_key_check").fetchall()
         if problems:
             raise StateError(f"schema migration broke foreign keys: {problems}")
@@ -1211,6 +1322,236 @@ class StateStore:
             raise StateError(f"no review {review_id}")
         return _review(row)
 
+    # --- conversations and checkpoints ---------------------------------------------
+
+    def record_first_conversation(
+        self, run_id: str, conversation_id: str, now: datetime
+    ) -> ConversationRow:
+        """The run's first conversation (from the launch step). Idempotent."""
+        with self._tx() as db:
+            db.execute(
+                "insert or ignore into conversations (id, run_id, n, conversation_id, status,"
+                " reason, started_at, attempted_at, active_at)"
+                " values (?, ?, 1, ?, 'active', 'launch', ?, ?, ?)",
+                (f"{run_id}.conv.1", run_id, conversation_id, _iso(now), _iso(now), _iso(now)),
+            )
+        return self._require_conversation(f"{run_id}.conv.1")
+
+    def conversations(self, run_id: str) -> list[ConversationRow]:
+        with self._lock:
+            rows = self._db.execute(
+                "select * from conversations where run_id = ? order by n", (run_id,)
+            ).fetchall()
+        return [_conversation(r) for r in rows]
+
+    def open_rollover(self, run_id: str) -> ConversationRow | None:
+        with self._lock:
+            row = self._db.execute(
+                "select * from conversations where run_id = ? and status in"
+                " ('handoff', 'starting')",
+                (run_id,),
+            ).fetchone()
+        return _conversation(row) if row else None
+
+    def begin_rollover(
+        self,
+        run_id: str,
+        *,
+        conversation_id_for_n: Any,
+        reason: str,
+        detail: str | None,
+        now: datetime,
+    ) -> ConversationRow:
+        """Persist the intent to replace the run's conversation before anything is sent.
+
+        Returns the open rollover instead if there is one. `conversation_id_for_n`
+        derives the new conversation's id from its number, so a retried start after
+        a crash attaches to the same conversation.
+        """
+        with self._tx() as db:
+            row = db.execute(
+                "select id from conversations where run_id = ? and status in"
+                " ('handoff', 'starting')",
+                (run_id,),
+            ).fetchone()
+            if row is not None:
+                conv_id = str(row["id"])
+            else:
+                n = int(
+                    db.execute(
+                        "select coalesce(max(n), 0) + 1 from conversations where run_id = ?",
+                        (run_id,),
+                    ).fetchone()[0]
+                )
+                conv_id = f"{run_id}.conv.{n}"
+                db.execute(
+                    "insert into conversations (id, run_id, n, conversation_id, status, reason,"
+                    " detail, started_at, attempted_at) values (?, ?, ?, ?, 'handoff', ?, ?, ?, ?)",
+                    (
+                        conv_id,
+                        run_id,
+                        n,
+                        str(conversation_id_for_n(n)),
+                        reason,
+                        detail,
+                        _iso(now),
+                        _iso(now),
+                    ),
+                )
+        return self._require_conversation(conv_id)
+
+    def note_handoff_request(self, conv_id: str, request_id: str, now: datetime) -> ConversationRow:
+        with self._tx() as db:
+            db.execute(
+                "update conversations set handoff_request_id = ?,"
+                " handoff_attempts = handoff_attempts + 1, attempted_at = ?"
+                " where id = ? and status = 'handoff'",
+                (request_id, _iso(now), conv_id),
+            )
+        return self._require_conversation(conv_id)
+
+    def retry_rollover(self, conv_id: str, now: datetime) -> ConversationRow:
+        """A controller restart: the attempt's timeouts count from now."""
+        with self._tx() as db:
+            db.execute(
+                "update conversations set attempted_at = ? where id = ?"
+                " and status in ('handoff', 'starting')",
+                (_iso(now), conv_id),
+            )
+        return self._require_conversation(conv_id)
+
+    def record_checkpoint(
+        self,
+        conv_id: str,
+        *,
+        from_conversation_id: str,
+        event_position: int | None,
+        workspace_sha: str | None,
+        source: CheckpointSource,
+        reason: str,
+        handoff: Mapping[str, Any],
+        verified: Mapping[str, Any],
+        problems: Sequence[str],
+        now: datetime,
+    ) -> Checkpoint:
+        """The checkpoint a rollover starts from, in one transaction with the rollover
+        moving on (`starting`) and the run pointing at it. Newer checkpoints supersede
+        older ones; nothing older is changed."""
+        with self._tx() as db:
+            row = db.execute(
+                "select run_id, status from conversations where id = ?", (conv_id,)
+            ).fetchone()
+            if row is None or row["status"] != "handoff":
+                raise StateError(f"conversation {conv_id} is not waiting for a handoff")
+            run_id = str(row["run_id"])
+            current = db.execute(
+                "select current_checkpoint_id from runs where id = ?", (run_id,)
+            ).fetchone()
+            n = int(
+                db.execute(
+                    "select coalesce(max(n), 0) + 1 from checkpoints where run_id = ?", (run_id,)
+                ).fetchone()[0]
+            )
+            ckpt_id = f"{run_id}.ckpt.{n}"
+            db.execute(
+                "insert into checkpoints (id, run_id, n, conversation_id, event_position,"
+                " workspace_sha, supersedes_id, source, reason, handoff, verified, problems,"
+                " created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ckpt_id,
+                    run_id,
+                    n,
+                    from_conversation_id,
+                    event_position,
+                    workspace_sha,
+                    current["current_checkpoint_id"] if current else None,
+                    source,
+                    reason,
+                    json.dumps(handoff, sort_keys=True),
+                    json.dumps(verified, sort_keys=True),
+                    json.dumps(list(problems)),
+                    _iso(now),
+                ),
+            )
+            db.execute("update runs set current_checkpoint_id = ? where id = ?", (ckpt_id, run_id))
+            db.execute(
+                "update conversations set status = 'starting', from_checkpoint_id = ?,"
+                " attempted_at = ? where id = ?",
+                (ckpt_id, _iso(now), conv_id),
+            )
+            db.execute(
+                "update conversations set status = 'ended', ended_at = ?"
+                " where run_id = ? and status = 'active'",
+                (_iso(now), run_id),
+            )
+        return self._require_checkpoint(ckpt_id)
+
+    def activate_conversation(self, conv_id: str, now: datetime) -> Run:
+        """The new conversation has started: it is the run's conversation from now on."""
+        with self._tx() as db:
+            row = db.execute(
+                "select run_id, conversation_id, status from conversations where id = ?",
+                (conv_id,),
+            ).fetchone()
+            if row is None or row["status"] != "starting":
+                raise StateError(f"conversation {conv_id} is not starting")
+            db.execute(
+                "update conversations set status = 'active', active_at = ? where id = ?",
+                (_iso(now), conv_id),
+            )
+            db.execute(
+                "update runs set conversation_id = ? where id = ?",
+                (row["conversation_id"], row["run_id"]),
+            )
+        return self._require_run(str(row["run_id"]))
+
+    def abandon_rollover(self, run_id: str, detail: str, now: datetime) -> None:
+        """Give an open rollover up (the run is ending). A rollover that already
+        recorded its checkpoint keeps it; the previous conversation stays the run's."""
+        with self._tx() as db:
+            db.execute(
+                "update conversations set status = 'abandoned', ended_at = ?,"
+                " detail = coalesce(detail || '; ', '') || ?"
+                " where run_id = ? and status in ('handoff', 'starting')",
+                (_iso(now), detail, run_id),
+            )
+
+    def checkpoints(self, run_id: str) -> list[Checkpoint]:
+        with self._lock:
+            rows = self._db.execute(
+                "select * from checkpoints where run_id = ? order by n", (run_id,)
+            ).fetchall()
+        return [_checkpoint(r) for r in rows]
+
+    def get_checkpoint(self, ckpt_id: str) -> Checkpoint | None:
+        with self._lock:
+            row = self._db.execute("select * from checkpoints where id = ?", (ckpt_id,)).fetchone()
+        return _checkpoint(row) if row else None
+
+    def record_blocked(self, run_id: str, blocker_json: str) -> Run:
+        """The confirmed blocker. Persisted before the stop that ends the run."""
+        with self._tx() as db:
+            db.execute(
+                "update runs set blocked = coalesce(blocked, ?) where id = ?",
+                (blocker_json, run_id),
+            )
+        return self._require_run(run_id)
+
+    def _require_conversation(self, conv_id: str) -> ConversationRow:
+        with self._lock:
+            row = self._db.execute(
+                "select * from conversations where id = ?", (conv_id,)
+            ).fetchone()
+        if row is None:
+            raise StateError(f"no conversation {conv_id}")
+        return _conversation(row)
+
+    def _require_checkpoint(self, ckpt_id: str) -> Checkpoint:
+        ckpt = self.get_checkpoint(ckpt_id)
+        if ckpt is None:
+            raise StateError(f"no checkpoint {ckpt_id}")
+        return ckpt
+
     # --- planning ------------------------------------------------------------------
 
     def create_plan(self, *, plan_id: str, model_key: str, request: str, now: datetime) -> Plan:
@@ -1340,6 +1681,8 @@ def _run(row: sqlite3.Row) -> Run:
         outcome=cast(RunOutcome | None, row["outcome"]),
         stop_evidence=row["stop_evidence"],
         frozen_digest=row["frozen_digest"],
+        current_checkpoint_id=row["current_checkpoint_id"],
+        blocked=row["blocked"],
     )
 
 
@@ -1465,4 +1808,41 @@ def _plan(row: sqlite3.Row) -> Plan:
         dry_run=json.loads(row["dry_run"]) if row["dry_run"] else None,
         run_id=row["run_id"],
         launched_digest=row["launched_digest"],
+    )
+
+
+def _conversation(row: sqlite3.Row) -> ConversationRow:
+    return ConversationRow(
+        id=row["id"],
+        run_id=row["run_id"],
+        n=int(row["n"]),
+        conversation_id=row["conversation_id"],
+        status=cast(ConversationRowStatus, row["status"]),
+        reason=row["reason"],
+        detail=row["detail"],
+        from_checkpoint_id=row["from_checkpoint_id"],
+        handoff_request_id=row["handoff_request_id"],
+        handoff_attempts=int(row["handoff_attempts"]),
+        started_at=_parse(row["started_at"]),
+        attempted_at=_parse(row["attempted_at"]),
+        active_at=_parse(row["active_at"]) if row["active_at"] else None,
+        ended_at=_parse(row["ended_at"]) if row["ended_at"] else None,
+    )
+
+
+def _checkpoint(row: sqlite3.Row) -> Checkpoint:
+    return Checkpoint(
+        id=row["id"],
+        run_id=row["run_id"],
+        n=int(row["n"]),
+        conversation_id=row["conversation_id"],
+        event_position=row["event_position"],
+        workspace_sha=row["workspace_sha"],
+        supersedes_id=row["supersedes_id"],
+        source=cast(CheckpointSource, row["source"]),
+        reason=row["reason"],
+        handoff=json.loads(row["handoff"]),
+        verified=json.loads(row["verified"]),
+        problems=json.loads(row["problems"] or "[]"),
+        created_at=_parse(row["created_at"]),
     )

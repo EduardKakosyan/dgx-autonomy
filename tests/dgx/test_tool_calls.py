@@ -14,6 +14,8 @@ from typing import Any
 
 import pytest
 
+from dgx_autonomy.config import PACKAGED_MODELS_FILE, load_models
+
 from dgx_helpers import wait_for
 
 pytestmark = pytest.mark.dgx
@@ -52,7 +54,7 @@ def _chat(control: Callable[..., Any], body: dict[str, Any]) -> dict[str, Any]:
 
 def test_inference_is_ready(inference: dict[str, Any]) -> None:
     assert inference["ready"], inference
-    assert inference["model_key"] == "qwen3.6-35b-a3b"
+    assert inference["model_key"] == load_models(PACKAGED_MODELS_FILE).default
     assert inference["slots_total"] and inference["slots_total"] >= 1
 
 

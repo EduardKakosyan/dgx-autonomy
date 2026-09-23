@@ -96,6 +96,8 @@ def test_inference_argv_gets_the_gpu_and_a_read_only_model_dir(settings: Setting
     assert "dgx-autonomy.model=qwen3.6-35b-a3b" in _flag_values(argv, "--label")
     assert _flag_values(argv, "--model") == [f"/models/{model.gguf}"]
     assert _flag_values(argv, "--ctx-size") == [str(model.ctx)]
+    # A response is bounded even when the client sends no max_tokens.
+    assert _flag_values(argv, "--n-predict") == [str(model.max_output_tokens)] == ["16384"]
     assert _flag_values(argv, "--alias") == [model.key]
     assert _flag_values(argv, "--host") == ["0.0.0.0"]
     assert "--jinja" in argv

@@ -243,6 +243,7 @@ class LlmEndpoint:
     model: str
     base_url: str
     max_input_tokens: int
+    max_output_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -252,8 +253,9 @@ class ConversationRequest:
     working_dir: str
     llm: LlmEndpoint
     message: str
-    # The builder gets start_demo; the planner does not (it serves nothing).
-    demo_tool: bool = True
+    # The builder gets start_demo, write_handoff and declare_blocked; the planner
+    # gets none of them (it serves nothing and hands nothing over).
+    builder_tools: bool = True
 
 
 @dataclass(frozen=True)
@@ -272,6 +274,9 @@ class ConversationSnapshot:
     # | finished | error | stuck | deleting.
     status: str
     last_event: EventSummary | None
+    # Tokens of the agent's latest LLM request (prompt + completion), from the SDK's
+    # usage metrics: how full its context is. None when not reported yet.
+    context_tokens: int | None = None
 
 
 @dataclass(frozen=True)

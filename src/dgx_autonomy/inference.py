@@ -49,6 +49,7 @@ def inference_command(model: ModelConfig, port: int) -> tuple[str, ...]:
         "--flash-attn", "on",
         "--cache-type-k", model.cache_type_k,
         "--cache-type-v", model.cache_type_v,
+        "--n-predict", str(model.max_output_tokens),
         "--jinja",
         "--metrics",
     ]  # fmt: skip

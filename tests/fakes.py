@@ -458,6 +458,12 @@ class FakeConversation:
     start_entered: threading.Event = field(default_factory=threading.Event)
     trace: list[str] = field(default_factory=list)
     event_limits: list[int] = field(default_factory=list)
+    # `status` is the status of the newest conversation; earlier ones (replaced by a
+    # rollover) keep theirs here. What each conversation was sent, by id.
+    others: dict[str, str] = field(default_factory=dict)
+    current: str | None = None
+    sent_to: list[tuple[str, EvidenceMessage]] = field(default_factory=list)
+    context_tokens: int | None = None
 
     def server_restarted(self, run_id: str) -> None:
         """What the Agent Server does when it loads a conversation that was RUNNING
@@ -472,12 +478,25 @@ class FakeConversation:
             self.start_gate.wait(10)
         if self.fail_start is not None:
             raise self.fail_start
+        if self.current is not None and request.conversation_id != self.current:
+            if any(r.conversation_id == request.conversation_id for r in self.started):
+                return request.conversation_id  # it exists already: attach
+            self.others[self.current] = self.status
+            self.status = "running"
+        self.current = request.conversation_id
         self.started.append(request)
         return request.conversation_id
 
+    def _status(self, conversation_id: str) -> str:
+        if conversation_id in self.others:
+            return self.others[conversation_id]
+        return self.status
+
     def inspect(self, server: ServerRef, conversation_id: str) -> ConversationSnapshot:
         last = self.event_log[-1] if self.event_log else None
-        return ConversationSnapshot(conversation_id, self.status, last)
+        return ConversationSnapshot(
+            conversation_id, self._status(conversation_id), last, self.context_tokens
+        )
 
     def resume(self, server: ServerRef, conversation_id: str) -> None:
         self.resumed.append(conversation_id)
@@ -487,7 +506,10 @@ class FakeConversation:
         if self.fail_pause is not None:
             raise self.fail_pause
         self.paused.append(conversation_id)
-        if self.pause_to is not None and self.status == "running":
+        if conversation_id in self.others:
+            if self.others[conversation_id] == "running":
+                self.others[conversation_id] = "paused"
+        elif self.pause_to is not None and self.status == "running":
             self.status = self.pause_to
 
     def interrupt(self, server: ServerRef, conversation_id: str) -> None:
@@ -501,6 +523,11 @@ class FakeConversation:
         if self.fail_deliver is not None:
             raise self.fail_deliver
         self.delivered.append(evidence)
+        self.sent_to.append((conversation_id, evidence))
+        if conversation_id in self.others:
+            if evidence.run:
+                self.others[conversation_id] = "running"
+            return
         # A user message with run=True runs a conversation that is not running; a
         # FINISHED one is set IDLE first (SDK 1.49.4, LocalConversation.send_message).
         if evidence.run and self.status in ("error", "paused", "idle", "finished"):

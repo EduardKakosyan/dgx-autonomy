@@ -58,12 +58,13 @@ RUN set -eux; \
     (gpasswd -d openhands sudo || true); \
     ! grep -Rqs '^[^#]*NOPASSWD' /etc/sudoers /etc/sudoers.d
 
-# The supervisor/helper and the start_demo tool, root-owned so the agent (uid 10001)
-# cannot change what the controller runs inside the sandbox. The Agent Server loads
-# the tool with --import-modules; it imports only the SDK and the standard library.
+# The supervisor/helper and the builder's tools (start_demo, write_handoff,
+# declare_blocked), root-owned so the agent (uid 10001) cannot change what the
+# controller runs inside the sandbox. The Agent Server loads the tools with
+# --import-modules; they import only the SDK, pydantic and the standard library.
 COPY --chown=root:root --chmod=0644 containers/sandbox/dgx_sandbox.py /opt/dgx-autonomy/dgx_sandbox.py
 COPY --chown=root:root --chmod=0644 src/dgx_autonomy/__init__.py src/dgx_autonomy/demo_tool.py \
-     /opt/dgx-autonomy/tools/dgx_autonomy/
+     src/dgx_autonomy/handoff_tool.py /opt/dgx-autonomy/tools/dgx_autonomy/
 RUN set -eux; \
     chmod 0755 /opt/dgx-autonomy /opt/dgx-autonomy/tools /opt/dgx-autonomy/tools/dgx_autonomy; \
     /usr/local/bin/python3 -I -m py_compile /opt/dgx-autonomy/dgx_sandbox.py; \
@@ -80,4 +81,4 @@ USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/python3", "-I", "/opt/dgx-autonomy/dgx_sandbox.py", "supervise", "--", \
             "/usr/local/bin/openhands-agent-server", \
             "--extra-python-path", "/opt/dgx-autonomy/tools", \
-            "--import-modules", "dgx_autonomy.demo_tool"]
+            "--import-modules", "dgx_autonomy.demo_tool,dgx_autonomy.handoff_tool"]
