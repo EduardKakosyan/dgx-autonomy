@@ -1,0 +1,6 @@
+# /etc/sudoers.d/dgx-autonomy (installed 0440 root:root by host/install.sh)
+#
+# jim may run the reservation helper, and only with these exact arguments. The
+# helper is root-owned, takes no options, and runs `python3 -I` (no user site, no
+# PYTHONPATH, no working-directory imports). Nothing else is granted.
+jim ALL=(root) NOPASSWD: /usr/local/sbin/dgx-autonomy-reservation reserve, /usr/local/sbin/dgx-autonomy-reservation release, /usr/local/sbin/dgx-autonomy-reservation status

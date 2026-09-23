@@ -1,0 +1,19 @@
+# Installed by host/install.sh to /etc/systemd/system/.
+#
+# Loads the agent egress policy (nftables-autonomy.nft) before Docker starts, so no
+# agent container ever runs without it, and records that it is loaded for this boot.
+# The controller refuses to create an agent container without that record.
+[Unit]
+Description=dgx-autonomy: egress policy for agent containers
+Before=docker.service
+Wants=network-pre.target
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/dgx-autonomy-egress load
+ExecStop=/usr/local/sbin/dgx-autonomy-egress unload
+
+[Install]
+WantedBy=multi-user.target

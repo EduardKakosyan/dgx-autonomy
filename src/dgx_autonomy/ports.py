@@ -62,6 +62,15 @@ class Mount:
 
 
 @dataclass(frozen=True)
+class PortBinding:
+    """A published container port. runtime.py refuses any host address but loopback."""
+
+    host_ip: str
+    host_port: int
+    container_port: int
+
+
+@dataclass(frozen=True)
 class ContainerSpec:
     """Everything `docker run` is allowed to receive. Hardening is on by default."""
 
@@ -80,6 +89,9 @@ class ContainerSpec:
     cpus: str | None = None
     pids_limit: int | None = None
     restart: str | None = None
+    ports: tuple[PortBinding, ...] = ()
+    dns: tuple[str, ...] = ()
+    entrypoint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +107,10 @@ class ContainerState:
 class ContainerPort(Protocol):
     def inspect_container(self, name: str) -> ContainerState | None: ...
     def ensure_container(self, spec: ContainerSpec) -> ContainerState: ...
+    def remove_container(self, name: str) -> bool:
+        """Stop and remove; False when there was nothing to remove."""
+        ...
+
     def container_logs(self, name: str, tail: int = 40) -> str: ...
 
 
@@ -106,6 +122,10 @@ class WorkspaceSpec:
     brief_file: Path
     session_api_key: str
     secret_key: str
+    # Controller-owned, read-only in the sandbox: the supervisor mode and demo status.
+    control_dir: Path
+    # 127.0.0.1:<demo_host_port> on the DGX -> the demo port in the sandbox.
+    demo_host_port: int
 
 
 @dataclass(frozen=True)
@@ -121,9 +141,82 @@ class RuntimeSnapshot:
     containers: tuple[ContainerState, ...]
 
 
+@dataclass(frozen=True)
+class SandboxProcess:
+    """One process inside the agent sandbox, as the in-sandbox helper classified it.
+
+    role: supervisor (PID 1) | controller (created by docker exec) | demo (the
+    recorded demo session) | zombie | agent (everything else: the Agent Server, its
+    tools, and anything they started, daemonized or not).
+    """
+
+    pid: int
+    ppid: int
+    sid: int
+    state: str
+    cmd: str
+    role: str = "agent"
+
+
+@dataclass(frozen=True)
+class KillReport:
+    """What ending the `agent` processes inside the sandbox found and left behind."""
+
+    container_running: bool
+    before: tuple[SandboxProcess, ...] = ()
+    survivors: tuple[SandboxProcess, ...] = ()
+
+
+@dataclass(frozen=True)
+class DemoSpec:
+    """A demo the controller runs in the sandbox, in a session of its own."""
+
+    run_id: str
+    command: str
+    port: int
+    # A previous demo session to end first (the agent asked for a new demo).
+    replace_session: int | None = None
+
+
+@dataclass(frozen=True)
+class DemoHandle:
+    session_id: int
+
+
+@dataclass(frozen=True)
+class DemoStatus:
+    alive: bool
+    listening: bool
+    log_tail: str = ""
+
+
 class RuntimePort(ContainerPort, Protocol):
     def inspect(self, run_id: str) -> RuntimeSnapshot: ...
+    def network_bridge(self, network: str) -> str | None:
+        """The host interface of a Docker network, or None when it does not exist."""
+        ...
+
+    def run_to_completion(self, spec: ContainerSpec, timeout_s: float) -> tuple[int, str]:
+        """`docker run --rm`: exit code and stdout of a short-lived container."""
+        ...
+
     def ensure_workspace(self, spec: WorkspaceSpec) -> WorkspaceHandle: ...
+    def sandbox_processes(
+        self, run_id: str, keep_session: int | None
+    ) -> tuple[SandboxProcess, ...] | None:
+        """Classified processes, or None when the sandbox is not running."""
+        ...
+
+    def stop_agent(self, run_id: str, keep_session: int | None, grace_s: float) -> KillReport:
+        """End every `agent` process; spare the demo session `keep_session`."""
+        ...
+
+    def restart_sandbox(self, run_id: str) -> None:
+        """Hard reset. The supervisor comes back in the mode the control dir says."""
+        ...
+
+    def ensure_demo(self, spec: DemoSpec) -> DemoHandle: ...
+    def demo_status(self, run_id: str, session_id: int, port: int) -> DemoStatus: ...
 
 
 # --- conversations -----------------------------------------------------------------
@@ -181,6 +274,10 @@ class ConversationPort(Protocol):
     def inspect(self, server: ServerRef, conversation_id: str) -> ConversationSnapshot: ...
     def resume(self, server: ServerRef, conversation_id: str) -> None: ...
     def pause(self, server: ServerRef, conversation_id: str) -> None: ...
+    def interrupt(self, server: ServerRef, conversation_id: str) -> None:
+        """Cancel the in-flight LLM call; the conversation ends up paused."""
+        ...
+
     def deliver(
         self, server: ServerRef, conversation_id: str, evidence: EvidenceMessage
     ) -> None: ...

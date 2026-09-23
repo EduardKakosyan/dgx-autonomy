@@ -9,8 +9,9 @@ import pytest
 
 from dgx_autonomy.config import Settings, load_models
 from dgx_autonomy.inference import inference_container_spec
-from dgx_autonomy.ports import ContainerSpec, Mount, WorkspaceSpec
+from dgx_autonomy.ports import ContainerSpec, DemoSpec, Mount, PortBinding, WorkspaceSpec
 from dgx_autonomy.runtime import (
+    SANDBOX_HELPER,
     CommandResult,
     DockerError,
     DockerRuntime,
@@ -34,6 +35,8 @@ def _workspace(tmp_path: Path) -> WorkspaceSpec:
         brief_file=tmp_path / "runs" / "r" / "brief.md",
         session_api_key="session-key",
         secret_key="secret-key",
+        control_dir=tmp_path / "runs" / "r" / "control",
+        demo_host_port=43007,
     )
 
 
@@ -60,12 +63,19 @@ def test_agent_argv_is_unprivileged_and_has_no_socket(settings: Settings, tmp_pa
     assert _flag_values(argv, "--memory") == [settings.agent_memory]
     assert "--privileged" not in argv
     assert "--gpus" not in argv
-    assert not any(a in ("-p", "--publish", "--network=host") for a in argv)
+    assert not any(a in ("-p", "--network=host") for a in argv)
+    # Exactly one published port: the demo, on host loopback only.
+    assert _flag_values(argv, "--publish") == [f"127.0.0.1:43007:{settings.demo_port}"]
     assert _flag_values(argv, "--network") == [settings.internal_network, settings.egress_network]
     mounts = _flag_values(argv, "--mount")
     assert not any("docker.sock" in m for m in mounts)
-    assert f"type=bind,source={tmp_path}/runs/r/agent,target=/workspace" in mounts
-    assert f"type=bind,source={tmp_path}/runs/r/brief.md,target=/brief/brief.md,readonly" in mounts
+    assert sorted(mounts) == sorted(
+        [
+            f"type=bind,source={tmp_path}/runs/r/agent,target=/workspace",
+            f"type=bind,source={tmp_path}/runs/r/brief.md,target=/brief/brief.md,readonly",
+            f"type=bind,source={tmp_path}/runs/r/control,target=/dgx-control,readonly",
+        ]
+    )
     assert "OH_SESSION_API_KEYS_0=session-key" in _flag_values(argv, "--env")
     assert argv[-5:] == [settings.agent_image, "--host", "0.0.0.0", "--port", "8000"]
     labels = _flag_values(argv, "--label")
@@ -191,3 +201,144 @@ def test_inspect_finds_run_containers_by_label(settings: Settings) -> None:
     snap = DockerRuntime(settings, runner).inspect("r1")
     assert [c.name for c in snap.containers] == ["agent"]
     assert runner.calls[0] == ["docker", "ps", "-a", "-q", "--filter", "label=dgx-autonomy.run=r1"]
+
+
+@pytest.mark.parametrize("host_ip", ["0.0.0.0", "", "192.168.1.5", "100.75.80.123", "::"])
+def test_ports_are_only_published_on_loopback(host_ip: str) -> None:
+    spec = ContainerSpec(
+        name="x", image="i", user="1:1", ports=(PortBinding(host_ip, 43000, 3000),)
+    )
+    with pytest.raises(UnsafeSpecError, match=r"127\.0\.0\.1"):
+        docker_run_argv(spec)
+
+
+def _running_agent(settings: Settings) -> dict[str, CommandResult]:
+    name = "dgx-autonomy-agent-r1"
+    return {"docker container inspect": CommandResult(0, _inspect_json(name, True), "")}
+
+
+def _exec_argv(settings: Settings, *args: str) -> list[str]:
+    return [
+        "docker", "exec", "--user", f"{settings.agent_uid}:{settings.agent_gid}",
+        "dgx-autonomy-agent-r1", *SANDBOX_HELPER, *args,
+    ]  # fmt: skip
+
+
+def test_stop_agent_runs_the_isolated_helper_as_the_sandbox_user(settings: Settings) -> None:
+    answer = {
+        "before": [
+            {"pid": 7, "ppid": 1, "sid": 7, "state": "S", "cmd": "openhands-agent-server"},
+            {"pid": 40, "ppid": 1, "sid": 40, "state": "S", "cmd": "tmux new-session"},
+        ],
+        "survivors": [],
+    }
+    runner = FakeRunner(
+        {**_running_agent(settings), "docker exec": CommandResult(0, json.dumps(answer), "")}
+    )
+    report = DockerRuntime(settings, runner).stop_agent("r1", keep_session=55, grace_s=5)
+    [call] = runner.commands("exec")
+    assert call == _exec_argv(settings, "kill-agent", "--grace", "5", "--keep-sid", "55")
+    # -I: the agent's uid cannot hook the helper through user site-packages or PYTHON*.
+    assert "-I" in call
+    assert report.container_running
+    assert [p.cmd for p in report.before] == ["openhands-agent-server", "tmux new-session"]
+    assert report.survivors == ()
+
+
+def test_stop_agent_on_a_stopped_sandbox_kills_nothing(settings: Settings) -> None:
+    runner = FakeRunner(
+        {
+            "docker container inspect": CommandResult(
+                0, _inspect_json("dgx-autonomy-agent-r1", False), ""
+            )
+        }
+    )
+    report = DockerRuntime(settings, runner).stop_agent("r1", keep_session=None, grace_s=5)
+    assert not report.container_running
+    assert runner.commands("exec") == []
+
+
+def test_helper_failures_become_docker_errors(settings: Settings) -> None:
+    runner = FakeRunner(
+        {**_running_agent(settings), "docker exec": CommandResult(1, "", "OCI runtime exec failed")}
+    )
+    with pytest.raises(DockerError, match="OCI runtime exec failed"):
+        DockerRuntime(settings, runner).stop_agent("r1", keep_session=None, grace_s=5)
+
+
+def test_ensure_demo_passes_the_command_as_one_argument(settings: Settings) -> None:
+    runner = FakeRunner({"docker exec": CommandResult(0, '{"session_id": 88}', "")})
+    command = "pnpm build && pnpm start; echo '$HOME'"
+    handle = DockerRuntime(settings, runner).ensure_demo(
+        DemoSpec("r1", command, 3000, replace_session=12)
+    )
+    assert handle.session_id == 88
+    [call] = runner.commands("exec")
+    assert call == _exec_argv(
+        settings, "demo-start", "--port", "3000", "--command", command, "--replace-sid", "12"
+    )
+
+
+def test_sandbox_processes_parses_roles(settings: Settings) -> None:
+    answer = {
+        "processes": [
+            {"pid": 1, "ppid": 0, "sid": 1, "state": "S", "cmd": "supervise", "role": "supervisor"},
+            {"pid": 30, "ppid": 1, "sid": 30, "state": "S", "cmd": "http.server", "role": "demo"},
+        ]
+    }
+    runner = FakeRunner(
+        {**_running_agent(settings), "docker exec": CommandResult(0, json.dumps(answer), "")}
+    )
+    procs = DockerRuntime(settings, runner).sandbox_processes("r1", keep_session=30)
+    assert procs is not None
+    assert [(p.pid, p.role) for p in procs] == [(1, "supervisor"), (30, "demo")]
+    assert runner.commands("exec")[0][-3:] == ["ps", "--keep-sid", "30"]
+
+
+def test_restart_sandbox(settings: Settings) -> None:
+    runner = FakeRunner()
+    DockerRuntime(settings, runner).restart_sandbox("r1")
+    assert runner.commands("restart") == [
+        ["docker", "restart", "--time", "10", "dgx-autonomy-agent-r1"]
+    ]
+
+
+def test_network_bridge_reads_the_fixed_name_or_dockers_default(settings: Settings) -> None:
+    named = [
+        {"Id": "8cd12396a84d0000", "Options": {"com.docker.network.bridge.name": "dgx-egress"}}
+    ]
+    default = [{"Id": "253366c1381bffff", "Options": {}}]
+    runner = FakeRunner(
+        responses={
+            "docker network inspect dgx-autonomy-egress": CommandResult(0, json.dumps(named), ""),
+            "docker network inspect old": CommandResult(0, json.dumps(default), ""),
+            "docker network inspect gone": CommandResult(1, "", "Error: network gone not found"),
+        }
+    )
+    rt = DockerRuntime(settings, runner)
+    assert rt.network_bridge("dgx-autonomy-egress") == "dgx-egress"
+    assert rt.network_bridge("old") == "br-253366c1381b"
+    assert rt.network_bridge("gone") is None
+
+
+def test_remove_container_only_removes_what_exists(settings: Settings) -> None:
+    runner = FakeRunner(
+        responses={
+            "docker container inspect missing": CommandResult(1, "", "Error: No such container"),
+            "docker container inspect there": CommandResult(0, json.dumps([{"Id": "c1"}]), ""),
+        }
+    )
+    rt = DockerRuntime(settings, runner)
+    assert rt.remove_container("missing") is False
+    assert rt.remove_container("there") is True
+    assert runner.commands("rm") == [["docker", "rm", "-f", "there"]]
+
+
+def test_run_to_completion_is_attached_and_removed(settings: Settings) -> None:
+    runner = FakeRunner(responses={"docker run --rm": CommandResult(0, '{"ok": 1}\n', "")})
+    spec = ContainerSpec(name="p", image="img", user="10001:10001", dns=("1.1.1.1",))
+    code, out = DockerRuntime(settings, runner).run_to_completion(spec, 30)
+    assert (code, out) == (0, '{"ok": 1}\n')
+    argv = runner.commands("run")[0]
+    assert argv[:3] == ["docker", "run", "--rm"] and "-d" not in argv
+    assert _flag_values(argv, "--dns") == ["1.1.1.1"]

@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import os
+import uuid
+from pathlib import Path
+
 import pytest
 
 from dgx_autonomy.openhands_adapter import (
     ConversationError,
     OpenHandsConversations,
     conversation_id_for,
+    persisted_events,
+    persisted_status,
     summarize_event,
 )
 from dgx_autonomy.ports import HttpResponse, ServerRef
@@ -139,3 +146,34 @@ def test_events_page_and_offset() -> None:
     )
     events = OpenHandsConversations(http).events(SERVER, CID, since=98, limit=5)
     assert [e.text for e in events] == ["e98", "e99", "e100", "e101", "e102"]
+
+
+def _persist(root: Path, cid: str, events: list[dict[str, object]], status: str) -> Path:
+    conv = root / "conversations" / uuid.UUID(cid).hex
+    (conv / "events").mkdir(parents=True)
+    (conv / "base_state.json").write_text(json.dumps({"execution_status": status}))
+    for i, ev in enumerate(events):
+        (conv / "events" / f"event-{i:05d}-{uuid.uuid4()}.json").write_text(json.dumps(ev))
+    return root / "conversations"
+
+
+def test_persisted_events_and_status_after_the_agent_server_is_gone(tmp_path: Path) -> None:
+    evs = [{"kind": "AgentErrorEvent", "error": f"e{i}"} for i in range(12)]
+    convs = _persist(tmp_path, CID, evs, "paused")
+    assert persisted_status(convs, CID) == "paused"
+    assert [e.text for e in persisted_events(convs, CID, 9, 5)] == ["e9", "e10", "e11"]
+    assert [e.text for e in persisted_events(convs, CID, 0, 1, last=True)] == ["e11"]
+    assert persisted_events(convs, "8f2c0a8e-0000-0000-0000-000000000000", 0, 5) == []
+
+
+def test_persisted_events_do_not_follow_agent_symlinks(tmp_path: Path) -> None:
+    convs = _persist(tmp_path, CID, [{"kind": "AgentErrorEvent", "error": "ok"}], "paused")
+    outside = tmp_path / "controller-only.json"
+    outside.write_text(json.dumps({"kind": "AgentErrorEvent", "error": "leaked"}))
+    events_dir = convs / uuid.UUID(CID).hex / "events"
+    os.symlink(outside, events_dir / f"event-00001-{uuid.uuid4()}.json")
+    assert [e.text for e in persisted_events(convs, CID, 0, 10)] == ["ok"]
+    state = convs / uuid.UUID(CID).hex / "base_state.json"
+    state.unlink()
+    os.symlink(outside, state)
+    assert persisted_status(convs, CID) is None

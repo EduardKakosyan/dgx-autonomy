@@ -145,3 +145,129 @@ def test_latest_run_and_listing(tmp_path: Path) -> None:
     latest = store.latest_run()
     assert latest is not None and latest.id == "r2"
     assert [r.id for r in store.list_runs()] == ["r1", "r2"]
+
+
+# The Phase 1 schema, verbatim, as databases on the DGX still have it.
+_V1_SCHEMA = """
+create table runs (
+    id              text primary key,
+    phase           text not null check (phase in ('launched', 'running', 'finished', 'failed')),
+    model_key       text not null,
+    launched_at     text not null,
+    deadline_at     text not null,
+    brief_path      text not null,
+    conversation_id text
+);
+create trigger runs_deadline_immutable
+before update of deadline_at on runs
+when new.deadline_at is not old.deadline_at
+begin
+    select raise(abort, 'runs.deadline_at is immutable');
+end;
+create table operations (
+    id          text primary key,
+    run_id      text not null references runs(id),
+    kind        text not null,
+    status      text not null check (status in ('intended', 'done', 'failed')),
+    resource_id text,
+    error       text,
+    created_at  text not null,
+    unique (run_id, kind)
+);
+"""
+
+
+def test_a_phase_1_database_is_migrated_in_place(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "controller.sqlite3"
+    path.parent.mkdir()
+    db = sqlite3.connect(path)
+    db.executescript(_V1_SCHEMA)
+    db.execute(
+        "insert into runs values ('old', 'finished', 'm', ?, ?, 'b', 'c1')",
+        (LAUNCH.isoformat(), DEADLINE.isoformat()),
+    )
+    db.execute(
+        "insert into operations values ('old.workspace.create', 'old', 'workspace.create',"
+        " 'done', 'cid', null, ?)",
+        (LAUNCH.isoformat(),),
+    )
+    db.commit()
+    db.close()
+
+    store = StateStore(path)
+    old = store.get_run("old")
+    assert old is not None
+    assert (old.phase, old.outcome, old.stop_requested, old.conversation_id) == (
+        "finished",
+        "finished",
+        False,
+        "c1",
+    )
+    assert [o.status for o in store.operations("old")] == ["done"]
+    # The new phases are accepted, and the deadline trigger survived the rebuild.
+    _launch(store, "r1")
+    store.request_stop("r1", "expired")
+    raw = sqlite3.connect(path)
+    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
+        raw.execute("update runs set deadline_at = 'x' where id = 'r1'")
+    assert raw.execute("pragma user_version").fetchone()[0] == 2
+    assert raw.execute("pragma foreign_key_check").fetchall() == []
+    raw.close()
+    store.close()
+    StateStore(path).close()  # opening again is a no-op
+
+
+def test_stop_request_is_durable_and_first_reason_wins(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _launch(store)
+    store.set_phase("r1", "running")
+    run = store.request_stop("r1", "stopped")
+    assert (run.phase, run.outcome, run.stop_requested) == ("stopping", "stopped", True)
+    run = store.request_stop("r1", "expired")
+    assert run.outcome == "stopped"
+    # While stopping, nothing but the verified end of agent execution moves the run.
+    assert store.try_set_phase("r1", "running") is False
+    assert store.try_set_phase("r1", "finished") is False
+    with pytest.raises(StateError):
+        store.set_phase("r1", "failed")
+    run = store.record_stop("r1", '{"failed": true}', verified=False)
+    assert run.phase == "stopping" and run.stop_evidence == '{"failed": true}'
+    run = store.record_stop("r1", '{"failed": false}', verified=True)
+    assert run.phase == "stopped" and run.terminal
+    assert store.active_runs() == []
+
+
+def test_ended_runs_ignore_stop_requests(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _launch(store)
+    store.set_phase("r1", "running")
+    store.set_phase("r1", "finished")
+    run = store.request_stop("r1", "expired")
+    assert (run.phase, run.outcome, run.stop_requested) == ("finished", "finished", False)
+
+
+def test_demo_ports_are_reserved_once_per_run(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _launch(store, "r1")
+    _launch(store, "r2")
+    a = store.reserve_demo("r1", port=3000, host_port_base=43000, host_port_count=2, now=LAUNCH)
+    again = store.reserve_demo("r1", port=3000, host_port_base=43000, host_port_count=2, now=LAUNCH)
+    b = store.reserve_demo("r2", port=3000, host_port_base=43000, host_port_count=2, now=LAUNCH)
+    assert (a.host_port, again.host_port, b.host_port) == (43000, 43000, 43001)
+    _launch(store, "r3")
+    with pytest.raises(StateError, match="no free demo port"):
+        store.reserve_demo("r3", port=3000, host_port_base=43000, host_port_count=2, now=LAUNCH)
+
+
+def test_a_refused_demo_request_keeps_the_command_to_relaunch(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _launch(store)
+    store.reserve_demo("r1", port=3000, host_port_base=43000, host_port_count=10, now=LAUNCH)
+    store.record_demo_request(
+        "r1", request_id="a", command="pnpm start", state="starting", message=None, now=LAUNCH
+    )
+    store.set_demo_state("r1", state="running", message=None, now=LAUNCH, session_id=77)
+    demo = store.record_demo_request(
+        "r1", request_id="b", command=None, state="refused", message="port", now=LAUNCH
+    )
+    assert (demo.command, demo.session_id, demo.request_id) == ("pnpm start", 77, "b")

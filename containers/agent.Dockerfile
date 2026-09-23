@@ -4,9 +4,17 @@
 # toolchain for building web apps.
 #
 # The controller runs this image with --user 10001:10001, --cap-drop ALL,
-# --security-opt no-new-privileges, resource limits, no Docker socket and no
-# published ports (runtime.py). This file also removes the image's passwordless
-# sudo, so the sandbox does not depend on no-new-privileges alone.
+# --security-opt no-new-privileges, resource limits, no Docker socket, and one
+# published port: the demo's, on host loopback only (runtime.py). This file also
+# removes the image's passwordless sudo, so the sandbox does not depend on
+# no-new-privileges alone.
+#
+# PID 1 is sandbox/dgx_sandbox.py, not the base image's tini. It starts the Agent
+# Server in a session of its own and stays up when the controller ends agent
+# execution, so the demo (another session) survives. With /dgx-control/mode set to
+# `demo-only` it never starts the Agent Server, including after a restart.
+#
+# Build context: autonomy/ (compose sets it to ..), for src/dgx_autonomy/demo_tool.py.
 
 # 1.49.4-python, pinned by the multi-arch index digest (linux/arm64 included).
 ARG AGENT_SERVER_IMAGE=ghcr.io/openhands/agent-server:1.49.4-python@sha256:9b215fb9ad536bd6bc07964b046a45f378cd05c0d0a856bd1be3adaf6c46c69c
@@ -50,9 +58,26 @@ RUN set -eux; \
     (gpasswd -d openhands sudo || true); \
     ! grep -Rqs '^[^#]*NOPASSWD' /etc/sudoers /etc/sudoers.d
 
+# The supervisor/helper and the start_demo tool, root-owned so the agent (uid 10001)
+# cannot change what the controller runs inside the sandbox. The Agent Server loads
+# the tool with --import-modules; it imports only the SDK and the standard library.
+COPY --chown=root:root --chmod=0644 containers/sandbox/dgx_sandbox.py /opt/dgx-autonomy/dgx_sandbox.py
+COPY --chown=root:root --chmod=0644 src/dgx_autonomy/__init__.py src/dgx_autonomy/demo_tool.py \
+     /opt/dgx-autonomy/tools/dgx_autonomy/
+RUN set -eux; \
+    chmod 0755 /opt/dgx-autonomy /opt/dgx-autonomy/tools /opt/dgx-autonomy/tools/dgx_autonomy; \
+    /usr/local/bin/python3 -I -m py_compile /opt/dgx-autonomy/dgx_sandbox.py; \
+    /usr/local/bin/python3 -I /opt/dgx-autonomy/dgx_sandbox.py ps > /dev/null; \
+    rm -rf /opt/dgx-autonomy/__pycache__
+
 # Global installs go to the agent's own workspace, the only place it can write.
 ENV PATH=/opt/node22/bin:/workspace/.npm-global/bin:/workspace/.pnpm-home:${PATH} \
     PNPM_HOME=/workspace/.pnpm-home \
     npm_config_prefix=/workspace/.npm-global
 
 USER 10001:10001
+
+ENTRYPOINT ["/usr/local/bin/python3", "-I", "/opt/dgx-autonomy/dgx_sandbox.py", "supervise", "--", \
+            "/usr/local/bin/openhands-agent-server", \
+            "--extra-python-path", "/opt/dgx-autonomy/tools", \
+            "--import-modules", "dgx_autonomy.demo_tool"]

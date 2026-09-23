@@ -1,0 +1,35 @@
+#!/bin/sh
+# dgx-autonomy-egress load|unload — installed root-owned at /usr/local/sbin/.
+#
+# load:   apply /etc/dgx-autonomy/nftables-autonomy.nft, then write a marker with this
+#         boot's id and the rules' sha256. The controller creates agent containers
+#         only while the marker matches the current boot.
+# unload: remove the marker, then the table.
+set -eu
+
+RULES=/etc/dgx-autonomy/nftables-autonomy.nft
+MARKER_DIR=/var/lib/dgx-autonomy/policy
+MARKER="$MARKER_DIR/egress.json"
+
+case "${1:-}" in
+  load)
+    /usr/sbin/nft -f "$RULES"
+    /usr/sbin/nft list table inet dgx_autonomy > /dev/null
+    install -d -m 0755 "$MARKER_DIR"
+    boot_id=$(cat /proc/sys/kernel/random/boot_id)
+    sha=$(sha256sum "$RULES" | cut -d' ' -f1)
+    tmp="$MARKER.tmp"
+    printf '{"table": "inet dgx_autonomy", "boot_id": "%s", "rules_sha256": "%s", "loaded_at": "%s"}\n' \
+      "$boot_id" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$MARKER"
+    ;;
+  unload)
+    rm -f "$MARKER"
+    /usr/sbin/nft delete table inet dgx_autonomy 2> /dev/null || true
+    ;;
+  *)
+    echo "usage: $0 load|unload" >&2
+    exit 2
+    ;;
+esac

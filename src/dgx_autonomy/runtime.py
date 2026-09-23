@@ -1,9 +1,14 @@
 """docker CLI adapter behind RuntimePort.
 
 Only the controller container holds the Docker socket. Every container it creates
-goes through `docker_run_argv`, which refuses a socket mount and always adds the
-hardening flags. The agent container is built here directly rather than through
-OpenHands `DockerWorkspace`, which adds no `--user`, `--cap-drop` or security options.
+goes through `docker_run_argv`, which refuses a socket mount, refuses to publish a
+port anywhere but host loopback, and always adds the hardening flags. The agent
+container is built here directly rather than through OpenHands `DockerWorkspace`,
+which adds no `--user`, `--cap-drop` or security options.
+
+Inside the agent sandbox, PID 1 is `containers/sandbox/dgx_sandbox.py`. The
+controller reaches it with `docker exec` as the sandbox user: to list and classify
+processes, to end agent execution, and to start or check the demo session.
 """
 
 from __future__ import annotations
@@ -12,14 +17,20 @@ import json
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from .config import Settings
 from .ports import (
     ContainerSpec,
     ContainerState,
+    DemoHandle,
+    DemoSpec,
+    DemoStatus,
+    KillReport,
     Mount,
+    PortBinding,
     RuntimeSnapshot,
+    SandboxProcess,
     WorkspaceHandle,
     WorkspaceSpec,
 )
@@ -30,10 +41,19 @@ LABEL_OP = f"{LABEL_PREFIX}.op"
 LABEL_ROLE = f"{LABEL_PREFIX}.role"
 
 FORBIDDEN_MOUNT_SOURCES = frozenset({"/var/run/docker.sock", "/run/docker.sock"})
+BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 
 AGENT_WORKDIR = "/workspace"
 AGENT_PROJECT_DIR = f"{AGENT_WORKDIR}/project"
 AGENT_BRIEF_PATH = "/brief/brief.md"
+# Controller-owned, mounted read-only: `mode` (agent | demo-only) and `demo.json`.
+AGENT_CONTROL_DIR = "/dgx-control"
+# The agent writes its start_demo request here (see demo_tool.py).
+AGENT_STATE_DIR = f"{AGENT_WORKDIR}/.dgx"
+
+# The in-sandbox helper, run isolated (-I) so the agent's uid cannot hook its imports.
+SANDBOX_HELPER = ("/usr/local/bin/python3", "-I", "/opt/dgx-autonomy/dgx_sandbox.py")
+LOOPBACK = "127.0.0.1"
 
 
 @dataclass(frozen=True)
@@ -71,6 +91,11 @@ def _check_spec(spec: ContainerSpec) -> None:
         raise UnsafeSpecError(f"{spec.name}: containers must run as a non-root user")
     if not spec.cap_drop_all:
         raise UnsafeSpecError(f"{spec.name}: containers must drop all capabilities")
+    for p in spec.ports:
+        if p.host_ip != LOOPBACK:
+            raise UnsafeSpecError(
+                f"{spec.name}: ports may only be published on {LOOPBACK}, not {p.host_ip!r}"
+            )
 
 
 def _mount_arg(m: Mount) -> str:
@@ -78,10 +103,11 @@ def _mount_arg(m: Mount) -> str:
     return f"{arg},readonly" if m.read_only else arg
 
 
-def docker_run_argv(spec: ContainerSpec) -> list[str]:
-    """The exact argv for `docker run -d`. Pure, so tests can assert on it."""
+def docker_run_argv(spec: ContainerSpec, *, detach: bool = True) -> list[str]:
+    """The exact argv for `docker run -d` (or `--rm`, attached). Pure, so tests can
+    assert on it."""
     _check_spec(spec)
-    argv = ["docker", "run", "-d", "--name", spec.name]
+    argv = ["docker", "run", "-d" if detach else "--rm", "--name", spec.name]
     for key, value in sorted(spec.labels.items()):
         argv += ["--label", f"{key}={value}"]
     argv += ["--user", str(spec.user), "--cap-drop", "ALL"]
@@ -99,10 +125,16 @@ def docker_run_argv(spec: ContainerSpec) -> list[str]:
         argv += ["--restart", spec.restart]
     for net in spec.networks:
         argv += ["--network", net]
+    for server in spec.dns:
+        argv += ["--dns", server]
+    for p in spec.ports:
+        argv += ["--publish", f"{p.host_ip}:{p.host_port}:{p.container_port}"]
     for m in spec.mounts:
         argv += ["--mount", _mount_arg(m)]
     for key, value in sorted(spec.env.items()):
         argv += ["--env", f"{key}={value}"]
+    if spec.entrypoint is not None:
+        argv += ["--entrypoint", spec.entrypoint]
     argv.append(spec.image)
     argv += list(spec.command)
     return argv
@@ -115,9 +147,12 @@ def agent_container_name(run_id: str) -> str:
 def agent_container_spec(settings: Settings, spec: WorkspaceSpec) -> ContainerSpec:
     """The unprivileged sandbox that runs the Agent Server and its tools.
 
-    It sees its own workspace (project + SDK conversation storage) and a read-only
-    brief. It gets the private inference network and an egress network, but no
-    Docker socket, no controller state and no published ports.
+    It sees its own workspace (project + SDK conversation storage), a read-only
+    brief and a read-only control directory. It gets the private inference network
+    and an egress network, but no Docker socket and no controller state. The only
+    published port is the demo's, on host loopback. The host's egress rules
+    (host/nftables-autonomy.nft) keep it off the DGX, the LAN and the tailnet, so it
+    resolves names through public resolvers rather than the host's (the LAN router).
     """
     return ContainerSpec(
         name=agent_container_name(spec.run_id),
@@ -127,7 +162,10 @@ def agent_container_spec(settings: Settings, spec: WorkspaceSpec) -> ContainerSp
         mounts=(
             Mount(str(spec.agent_dir), AGENT_WORKDIR),
             Mount(str(spec.brief_file), AGENT_BRIEF_PATH, read_only=True),
+            Mount(str(spec.control_dir), AGENT_CONTROL_DIR, read_only=True),
         ),
+        ports=(PortBinding(LOOPBACK, spec.demo_host_port, settings.demo_port),),
+        dns=settings.agent_dns,
         env={
             # The Agent Server listens on the private network; require the key.
             "OH_SESSION_API_KEYS_0": spec.session_api_key,
@@ -196,6 +234,38 @@ class DockerRuntime:
             raise DockerError(f"{spec.name} vanished right after start")
         return started
 
+    def remove_container(self, name: str) -> bool:
+        if self.inspect_container(name) is None:
+            return False
+        res = self._docker("rm", "-f", name, timeout=120.0)
+        if res.returncode != 0:
+            raise DockerError(f"docker rm {name}: {res.stderr.strip()}")
+        return True
+
+    def network_bridge(self, network: str) -> str | None:
+        res = self._docker("network", "inspect", network)
+        if res.returncode != 0:
+            if "not found" in (res.stderr + res.stdout).lower():
+                return None
+            raise DockerError(f"docker network inspect {network}: {res.stderr.strip()}")
+        items = json.loads(res.stdout or "[]")
+        if not items:
+            return None
+        options = items[0].get("Options") or {}
+        # Docker names the bridge br-<id prefix> unless the network sets a name.
+        return str(options.get(BRIDGE_NAME_OPTION) or f"br-{str(items[0].get('Id', ''))[:12]}")
+
+    def run_to_completion(self, spec: ContainerSpec, timeout_s: float) -> tuple[int, str]:
+        argv = docker_run_argv(spec, detach=False)
+        try:
+            res = self._run(argv, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            self._docker("rm", "-f", spec.name)
+            raise DockerError(f"{spec.name}: no result in {timeout_s:.0f}s") from None
+        if res.returncode != 0 and not res.stdout.strip():
+            raise DockerError(f"docker run {spec.name}: {res.stderr.strip()[-1500:]}")
+        return res.returncode, res.stdout
+
     def container_logs(self, name: str, tail: int = 40) -> str:
         res = self._docker("logs", "--tail", str(tail), name)
         return (res.stdout + res.stderr).strip()
@@ -218,3 +288,100 @@ class DockerRuntime:
             running=container.running,
             url=f"http://{agent_container_name(spec.run_id)}:{self._settings.agent_port}",
         )
+
+    # --- inside the sandbox --------------------------------------------------------
+
+    def _sandbox(self, run_id: str, *args: str, timeout: float = 60.0) -> dict[str, Any]:
+        """Run the in-sandbox helper as the sandbox user and parse its JSON answer."""
+        uid, gid = self._settings.agent_uid, self._settings.agent_gid
+        argv = [
+            "docker", "exec", "--user", f"{uid}:{gid}",
+            agent_container_name(run_id), *SANDBOX_HELPER, *args,
+        ]  # fmt: skip
+        try:
+            res = self._run(argv, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise DockerError(f"sandbox {args[0]}: no answer in {timeout:.0f}s") from None
+        if res.returncode != 0:
+            detail = (res.stderr.strip() or res.stdout.strip())[-1500:]
+            raise DockerError(f"sandbox {args[0]}: exit {res.returncode}: {detail}")
+        try:
+            out = json.loads(res.stdout)
+        except ValueError:
+            raise DockerError(f"sandbox {args[0]}: not JSON: {res.stdout[-500:]!r}") from None
+        if not isinstance(out, dict):
+            raise DockerError(f"sandbox {args[0]}: unexpected answer {out!r}")
+        return out
+
+    def _running(self, run_id: str) -> bool:
+        state = self.inspect_container(agent_container_name(run_id))
+        return state is not None and state.running
+
+    def sandbox_processes(
+        self, run_id: str, keep_session: int | None
+    ) -> tuple[SandboxProcess, ...] | None:
+        if not self._running(run_id):
+            return None
+        args = ["ps"] + (["--keep-sid", str(keep_session)] if keep_session else [])
+        return _procs(self._sandbox(run_id, *args).get("processes"))
+
+    def stop_agent(self, run_id: str, keep_session: int | None, grace_s: float) -> KillReport:
+        if not self._running(run_id):
+            return KillReport(container_running=False)
+        args = ["kill-agent", "--grace", f"{grace_s:g}"]
+        if keep_session:
+            args += ["--keep-sid", str(keep_session)]
+        out = self._sandbox(run_id, *args, timeout=grace_s + 60.0)
+        return KillReport(
+            container_running=True,
+            before=_procs(out.get("before")),
+            survivors=_procs(out.get("survivors")),
+        )
+
+    def restart_sandbox(self, run_id: str) -> None:
+        name = agent_container_name(run_id)
+        res = self._docker("restart", "--time", "10", name, timeout=120.0)
+        if res.returncode != 0:
+            raise DockerError(f"docker restart {name}: {res.stderr.strip()}")
+
+    def ensure_demo(self, spec: DemoSpec) -> DemoHandle:
+        args = ["demo-start", "--port", str(spec.port), "--command", spec.command]
+        if spec.replace_session:
+            args += ["--replace-sid", str(spec.replace_session)]
+        out = self._sandbox(spec.run_id, *args, timeout=60.0)
+        try:
+            return DemoHandle(session_id=int(out["session_id"]))
+        except (KeyError, TypeError, ValueError):
+            raise DockerError(f"sandbox demo-start: unexpected answer {out!r}") from None
+
+    def demo_status(self, run_id: str, session_id: int, port: int) -> DemoStatus:
+        if not self._running(run_id):
+            return DemoStatus(alive=False, listening=False)
+        out = self._sandbox(
+            run_id, "demo-status", "--sid", str(session_id), "--port", str(port), timeout=30.0
+        )
+        return DemoStatus(
+            alive=bool(out.get("alive")),
+            listening=bool(out.get("listening")),
+            log_tail=str(out.get("log_tail") or ""),
+        )
+
+
+def _procs(raw: object) -> tuple[SandboxProcess, ...]:
+    if not isinstance(raw, list):
+        return ()
+    out = []
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        out.append(
+            SandboxProcess(
+                pid=int(p.get("pid", 0)),
+                ppid=int(p.get("ppid", 0)),
+                sid=int(p.get("sid", 0)),
+                state=str(p.get("state", "?")),
+                cmd=str(p.get("cmd", "")),
+                role=str(p.get("role", "agent")),
+            )
+        )
+    return tuple(out)

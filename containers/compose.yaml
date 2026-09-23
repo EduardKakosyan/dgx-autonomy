@@ -46,16 +46,25 @@ services:
   agent-image:
     image: dgx-autonomy/agent:1.49.4
     build:
-      context: .
-      dockerfile: agent.Dockerfile
+      # autonomy/: the image copies containers/sandbox/ and src/dgx_autonomy/demo_tool.py.
+      context: ..
+      dockerfile: containers/agent.Dockerfile
     profiles: [images]
 
+# The bridges have fixed host interface names: the host egress rules
+# (host/nftables-autonomy.nft) match them, and the controller refuses to start an
+# agent container when the names differ. Renaming means recreating the networks.
 networks:
   # Controller <-> Agent Server <-> llama-server. No route out.
   internal:
     name: dgx-autonomy-internal
     internal: true
-  # Internet access for the agent's dependency installs and research. Phase 3 puts
-  # host-enforced egress rules on this network; a Docker bridge alone is not a policy.
+    driver_opts:
+      com.docker.network.bridge.name: dgx-internal
+  # Internet access for the agent's dependency installs and research. The host rules
+  # keep it off the DGX itself, the LAN and the tailnet; a Docker bridge alone is not
+  # a policy.
   egress:
     name: dgx-autonomy-egress
+    driver_opts:
+      com.docker.network.bridge.name: dgx-egress

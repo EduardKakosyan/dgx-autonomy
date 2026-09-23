@@ -12,17 +12,31 @@ on a run:
     GET  /api/conversations/{id}                  -> execution_status
     GET  /api/conversations/{id}/events/search    -> paged events
     POST /api/conversations/{id}/events           -> user message (+ run)
-    POST /api/conversations/{id}/run | /pause
+    POST /api/conversations/{id}/run | /pause | /interrupt
+
+`/pause` takes effect between agent steps and waits for an in-flight LLM call;
+`/interrupt` cancels that call. Neither ends the processes the agent's tools
+started: on hugo-dgx1 the tmux server, its shell and a backgrounded command all
+outlived both (the stop evidence records this for every stop), so the controller
+ends agent execution by killing the sandbox's agent processes (runtime.stop_agent).
+
+Once agent execution has been ended (stop or deadline) the Agent Server is gone,
+so `persisted_status` / `persisted_events` read the conversation the SDK persisted
+under the workspace. They only read, and never follow a symlink the agent planted.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import uuid
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from .agent_files import open_dir, read_json, read_json_at
 from .ports import (
     ConversationRequest,
     ConversationSnapshot,
@@ -36,6 +50,10 @@ from .ports import (
 CONVERSATIONS = "/api/conversations"
 _NAMESPACE = uuid.UUID("5f0c1d0e-8a57-4d8e-9c55-6a2f3f1d9b21")
 _TEXT_LIMIT = 300
+_EVENT_FILE = re.compile(r"^event-(\d+)-[0-9a-fA-F-]+\.json$")
+_MAX_EVENT_BYTES = 4 * 1024 * 1024
+# The custom tool the Agent Server loads with --import-modules (demo_tool.py).
+DEMO_TOOL_NAME = "start_demo"
 
 
 class ConversationError(RuntimeError):
@@ -154,8 +172,12 @@ class OpenHandsConversations:
             max_input_tokens=request.llm.max_input_tokens,
             usage_id="agent",
         )
-        # cli_mode drops the browser tool set; Phase 1 needs terminal + file editor.
+        # cli_mode drops the browser tool set; the run needs terminal + file editor,
+        # plus start_demo, which the Agent Server image loads with --import-modules.
+        from openhands.sdk import Tool
+
         agent = get_default_agent(llm=llm, cli_mode=True)
+        agent = agent.model_copy(update={"tools": [*agent.tools, Tool(name=DEMO_TOOL_NAME)]})
         workspace = RemoteWorkspace(
             host=request.server.url,
             working_dir=request.working_dir,
@@ -213,7 +235,10 @@ class OpenHandsConversations:
         )
 
     def pause(self, server: ServerRef, conversation_id: str) -> None:
-        self._call(server, "POST", f"{CONVERSATIONS}/{conversation_id}/pause")
+        self._call(server, "POST", f"{CONVERSATIONS}/{conversation_id}/pause", timeout=15.0)
+
+    def interrupt(self, server: ServerRef, conversation_id: str) -> None:
+        self._call(server, "POST", f"{CONVERSATIONS}/{conversation_id}/interrupt", timeout=15.0)
 
     def deliver(self, server: ServerRef, conversation_id: str, evidence: EvidenceMessage) -> None:
         self._send(server, conversation_id, evidence.text, run=True)
@@ -240,3 +265,57 @@ class OpenHandsConversations:
             if not page_id or not items:
                 break
         return out
+
+
+# --- the conversation as the SDK persisted it ---------------------------------------
+
+
+def persisted_status(conversations_dir: Path, conversation_id: str) -> str | None:
+    """execution_status from base_state.json, or None if it cannot be read.
+
+    Stale by nature: an Agent Server killed mid-step never wrote its last status.
+    """
+    try:
+        state = read_json(
+            conversations_dir.parent,
+            conversations_dir.name,
+            uuid.UUID(conversation_id).hex,
+            "base_state.json",
+            max_bytes=_MAX_EVENT_BYTES,
+        )
+    except (OSError, ValueError):
+        return None
+    status = state.get("execution_status") if isinstance(state, dict) else None
+    return str(status) if status is not None else None
+
+
+def persisted_events(
+    conversations_dir: Path,
+    conversation_id: str,
+    since: int,
+    limit: int,
+    *,
+    last: bool = False,
+) -> list[EventSummary]:
+    """Events [since, since+limit) from the SDK's event files, in index order.
+
+    `last=True` returns the final `limit` events instead.
+    """
+    try:
+        cid = uuid.UUID(conversation_id).hex
+        with open_dir(conversations_dir.parent, conversations_dir.name, cid, "events") as fd:
+            numbered = sorted(
+                (int(m.group(1)), n) for n in os.listdir(fd) if (m := _EVENT_FILE.match(n))
+            )
+            chosen = numbered[-limit:] if last else numbered[since : since + limit]
+            out = []
+            for _, name in chosen:
+                try:
+                    raw = read_json_at(fd, name, _MAX_EVENT_BYTES)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(raw, dict):
+                    out.append(summarize_event(raw))
+            return out
+    except (OSError, ValueError):
+        return []

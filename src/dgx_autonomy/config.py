@@ -15,6 +15,7 @@ DEFAULT_MODELS_DIR = "/home/jim/models"
 DEFAULT_INFERENCE_IMAGE = "dgx-autonomy/inference:f95b0d9"
 DEFAULT_AGENT_IMAGE = "dgx-autonomy/agent:1.49.4"
 PACKAGED_MODELS_FILE = Path(__file__).resolve().parents[2] / "config" / "models.yaml"
+BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 
 
 class ConfigError(ValueError):
@@ -108,6 +109,16 @@ class Settings:
     agent_image: str = DEFAULT_AGENT_IMAGE
     internal_network: str = "dgx-autonomy-internal"
     egress_network: str = "dgx-autonomy-egress"
+    # Host interface names of those networks (compose sets them). The host's egress
+    # rules (host/nftables-autonomy.nft) match these names.
+    internal_bridge: str = "dgx-internal"
+    egress_bridge: str = "dgx-egress"
+    # The agent resolves names through public resolvers: the host's upstream (the LAN
+    # router) is on the other side of the egress policy.
+    agent_dns: tuple[str, ...] = ("1.1.1.1", "9.9.9.9")
+    # Create no agent container unless the egress policy is loaded on this boot.
+    require_egress_policy: bool = True
+    boot_id_file: Path = BOOT_ID_FILE
     inference_name: str = "dgx-autonomy-inference"
     inference_port: int = 8080
     agent_port: int = 8000
@@ -123,6 +134,18 @@ class Settings:
     poll_seconds: float = 5.0
     inference_load_timeout_s: float = 30 * 60.0
     agent_start_timeout_s: float = 5 * 60.0
+    # The demo listens on this port in the sandbox; the only published port. It is
+    # bound to 127.0.0.1 on the DGX, at a host port reserved per run from the range.
+    demo_port: int = 3000
+    demo_host_port_base: int = 43000
+    demo_host_port_count: int = 1000
+    demo_start_timeout_s: float = 180.0
+    # Stop: wait this long for the paused conversation to go quiet, then SIGTERM the
+    # agent processes and give them `stop_kill_grace_s` before SIGKILL.
+    stop_grace_s: float = 30.0
+    stop_kill_grace_s: float = 5.0
+    # How often the deadline watchdog looks at the clock. Independent of poll_seconds.
+    watchdog_interval_s: float = 1.0
 
     @property
     def runs_dir(self) -> Path:
@@ -131,6 +154,16 @@ class Settings:
     @property
     def state_db(self) -> Path:
         return self.data_dir / "state" / "controller.sqlite3"
+
+    @property
+    def egress_marker(self) -> Path:
+        """Written by dgx-autonomy-egress (host) when it loads the rules."""
+        return self.data_dir / "policy" / "egress.json"
+
+    @property
+    def reservation_record(self) -> Path:
+        """Written by the reservation helper (host) while claude-qwen is displaced."""
+        return self.data_dir / "reservation" / "record.json"
 
     @property
     def inference_url(self) -> str:
@@ -149,6 +182,7 @@ class Settings:
             operator_gid=_int_or_none(e.get("DGX_AUTONOMY_OPERATOR_GID")),
             inference_image=e.get("DGX_AUTONOMY_INFERENCE_IMAGE", DEFAULT_INFERENCE_IMAGE),
             agent_image=e.get("DGX_AUTONOMY_AGENT_IMAGE", DEFAULT_AGENT_IMAGE),
+            require_egress_policy=e.get("DGX_AUTONOMY_REQUIRE_EGRESS_POLICY", "1") != "0",
         )
 
 

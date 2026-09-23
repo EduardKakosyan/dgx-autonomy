@@ -1,0 +1,82 @@
+#!/usr/sbin/nft -f
+#
+# dgx-autonomy egress policy. Loaded by dgx-autonomy-egress.service before Docker
+# starts; installed at /etc/dgx-autonomy/nftables-autonomy.nft.
+#
+# Agent containers sit on two bridges with fixed names (containers/compose.yaml):
+#   dgx-egress    internet access for dependency installs and research
+#   dgx-internal  controller <-> Agent Server <-> llama-server (Docker: internal)
+#
+# From those bridges the agent may reach the internet and other containers on the
+# same bridge (the owned llama-server). It may not reach the DGX itself (any of its
+# addresses: Docker gateways, LAN, Tailscale), the LAN, the tailnet, other Docker
+# networks, link-local, or multicast. Replies to connections the host opened (the
+# controller, the demo's loopback publication) are unaffected.
+#
+# This is a table of its own. It does not touch Docker's, Tailscale's or anyone
+# else's rules, and Docker does not flush it. A packet must pass every base chain on
+# a hook, so a drop here is final whatever the other tables accept.
+
+table inet dgx_autonomy
+delete table inet dgx_autonomy
+
+table inet dgx_autonomy {
+	set agent_bridges {
+		type ifname
+		elements = { "dgx-egress", "dgx-internal" }
+	}
+
+	set blocked_v4 {
+		type ipv4_addr
+		flags interval
+		elements = {
+			0.0.0.0/8,        # "this network"
+			10.0.0.0/8,       # RFC 1918
+			100.64.0.0/10,    # CGNAT: Tailscale addresses and 100.100.100.100
+			127.0.0.0/8,      # loopback
+			169.254.0.0/16,   # link-local, cloud metadata
+			172.16.0.0/12,    # RFC 1918, including every other Docker network
+			192.0.0.0/24,     # IETF protocol assignments
+			192.168.0.0/16,   # RFC 1918: the LAN (192.168.50.0/24) and its router
+			198.18.0.0/15,    # benchmarking
+			224.0.0.0/4,      # multicast
+			240.0.0.0/4       # reserved, broadcast
+		}
+	}
+
+	set blocked_v6 {
+		type ipv6_addr
+		flags interval
+		elements = {
+			::/128, ::1/128,
+			::ffff:0.0.0.0/96, # IPv4-mapped: same policy as above, no bypass
+			fc00::/7,          # ULA: the LAN's fd21:… and Tailscale's fd7a:115c:a1e0::/48
+			fe80::/10,         # link-local
+			ff00::/8           # multicast
+		}
+	}
+
+	# Container -> the DGX itself (any local address). Nothing on the host is for
+	# the agent: DNS goes to public resolvers (the agent's --dns), not the host.
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		iifname != @agent_bridges accept
+		ct state established,related accept
+		counter reject with icmpx admin-prohibited
+	}
+
+	# Container -> anywhere else.
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+		iifname != @agent_bridges accept
+		ct state established,related accept
+		# Same bridge (only seen when br_netfilter is loaded): agent -> llama-server.
+		iifname "dgx-egress" oifname "dgx-egress" accept
+		iifname "dgx-internal" oifname "dgx-internal" accept
+		ip daddr @blocked_v4 counter reject with icmpx admin-prohibited
+		ip6 daddr @blocked_v6 counter reject with icmpx admin-prohibited
+		# dgx-internal is `internal` in Docker; keep it that way even if that changes.
+		iifname "dgx-internal" counter reject with icmpx admin-prohibited
+		accept
+	}
+}

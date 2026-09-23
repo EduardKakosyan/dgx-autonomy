@@ -84,3 +84,39 @@ def test_cli_rejects_budgets_over_forty_hours(tmp_path: Path) -> None:
     brief.write_text("x")
     with pytest.raises(SystemExit):
         main(["launch", "--brief", str(brief), "--budget-hours", "41"])
+
+
+def _status_handler(demo: dict[str, Any] | None) -> Any:
+    def handler(op: str, args: Mapping[str, Any]) -> Any:
+        assert op == "status"
+        return {"run_id": "r1", "phase": "stopped", "demo": demo}
+
+    return handler
+
+
+def test_cli_tunnel_prints_the_loopback_forward(
+    sock_dir: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DGX_AUTONOMY_SSH_HOST", raising=False)
+    demo = {"host_port": 43007, "state": "running", "listening": True}
+    srv = ControlServer(sock_dir / "c.sock", _status_handler(demo))
+    srv.start()
+    try:
+        assert main(["--socket", str(srv.path), "tunnel"]) == 0
+        out = capsys.readouterr()
+        assert out.out.strip() == "ssh -N -L 43007:127.0.0.1:43007 hugo-dgx1"
+        assert "http://127.0.0.1:43007/" in out.err
+        assert main(["--socket", str(srv.path), "tunnel", "--local-port", "8888"]) == 0
+        assert capsys.readouterr().out.strip() == "ssh -N -L 8888:127.0.0.1:43007 hugo-dgx1"
+    finally:
+        srv.shutdown()
+
+
+def test_cli_tunnel_without_a_demo_port(sock_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    srv = ControlServer(sock_dir / "c.sock", _status_handler(None))
+    srv.start()
+    try:
+        assert main(["--socket", str(srv.path), "tunnel"]) == 1
+        assert "no demo port" in capsys.readouterr().err
+    finally:
+        srv.shutdown()

@@ -1,0 +1,28 @@
+# Installed by host/install.sh to /etc/systemd/system/.
+#
+# While the reservation record exists (`dgx-autonomy reserve`), answer claude-qwen's
+# client port with 503 "in use by the autonomous coding environment". The reservation
+# helper starts and stops it; being enabled, it also comes back after a reboot that
+# happens while the reservation is held.
+[Unit]
+Description=dgx-autonomy: tell claude-qwen clients that the DGX inference is reserved
+ConditionPathExists=/var/lib/dgx-autonomy/reservation/record.json
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/var/lib/dgx-autonomy/reservation/notice.env
+ExecStart=/usr/bin/python3 -I /usr/local/lib/dgx-autonomy/busy_notice.py --host ${NOTICE_HOST} --port ${NOTICE_PORT}
+Restart=on-failure
+RestartSec=5
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

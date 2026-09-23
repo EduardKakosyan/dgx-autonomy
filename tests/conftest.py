@@ -16,6 +16,7 @@ def settings(tmp_path: Path) -> Settings:
         models_dir=tmp_path / "models",
         models_file=PACKAGED_MODELS_FILE,
         socket_path=tmp_path / "control.sock",
+        boot_id_file=tmp_path / "proc" / "boot_id",
     )
 
 

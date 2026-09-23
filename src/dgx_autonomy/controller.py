@@ -4,49 +4,83 @@ A command (for example `launch`) only persists the requested transition and wake
 reconcile loop. The loop does the work, one idempotent step per tick:
 
     launched: ensure inference -> ensure workspace -> start conversation -> running
-    running:  observe the conversation; FINISHED -> finished, ERROR/STUCK -> failed
+    running:  observe the conversation; FINISHED -> finished, ERROR/STUCK -> failed;
+              serve start_demo requests
+    stopping: end agent execution (retried until it is verified)
 
 Every external side effect is preceded by a durable operation intent. A step that is
 not ready yet (the model still loading, the Agent Server still booting) leaves the
 intent in place and is re-checked on the next tick, so no SDK or HTTP call blocks
 the loop for long.
+
+The deadline is enforced by `deadline.DeadlineWatchdog` on its own thread, not by
+this loop, so an SDK call that hangs here cannot delay it. Deadline and `stop` share
+one sequence, `stop_agent`: persist the stop, pause the conversation and cancel its
+LLM call, wait (bounded) for quiet, end every agent process in the sandbox, verify
+none is left, and keep (or relaunch) the demo.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import secrets
 import signal
 import stat
 import threading
+import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .agent_files import AgentFileError, read_json
 from .config import ConfigError, ModelCatalog, Settings, load_models
+from .deadline import DeadlineWatchdog
+from .egress import EgressPolicyError, check_policy, probe, probe_targets
 from .inference import InferenceError, InferenceManager
-from .openhands_adapter import ConversationError, conversation_id_for
+from .openhands_adapter import (
+    ConversationError,
+    conversation_id_for,
+    persisted_events,
+    persisted_status,
+)
 from .ports import (
     Clock,
     ConversationPort,
     ConversationRequest,
     ConversationSnapshot,
+    DemoSpec,
+    DemoStatus,
+    EventSummary,
     HttpClient,
     LlmEndpoint,
     RuntimePort,
+    SandboxProcess,
     ServerRef,
+    WorkspaceHandle,
     WorkspaceSpec,
 )
-from .runtime import AGENT_BRIEF_PATH, AGENT_PROJECT_DIR, DockerError, agent_container_name
-from .state import Operation, OperationKind, Run, StateStore
+from .runtime import (
+    AGENT_BRIEF_PATH,
+    AGENT_PROJECT_DIR,
+    DockerError,
+    agent_container_name,
+)
+from .state import Demo, Operation, OperationKind, Run, StateStore
 
 log = logging.getLogger("dgx_autonomy.controller")
 
 FAILED_CONVERSATION_STATUSES = frozenset({"error", "stuck"})
 MAX_BRIEF_BYTES = 256 * 1024
+MAX_DEMO_REQUEST_BYTES = 16 * 1024
+MAX_DEMO_COMMAND = 4096
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Processes that are the Agent Server itself rather than something a tool started.
+_SERVER_MARKERS = ("openhands-agent-server", ".openvscode-server")
 
 
 class SystemClock:
@@ -76,8 +110,44 @@ class RunPaths:
         return self.agent_dir / "project"
 
     @property
+    def conversations_dir(self) -> Path:
+        return self.agent_dir / "conversations"
+
+    @property
+    def control_dir(self) -> Path:
+        """Controller-owned; read-only at /dgx-control in the sandbox."""
+        return self.root / "control"
+
+    @property
     def secrets_dir(self) -> Path:
         return self.root / "secrets"
+
+
+@dataclass(frozen=True)
+class StopEvidence:
+    """What ending agent execution found and did. Persisted as JSON on the run.
+
+    `after_pause` lists the agent processes still present after the pause and the
+    bounded wait, before anything was killed: whether pausing the conversation
+    ended the tools' processes is read from here, not assumed.
+    `failed` means cessation could not be shown; the run then stays `stopping`.
+    """
+
+    run_id: str
+    reason: str
+    started_at: str
+    finished_at: str
+    container_running: bool
+    conversation_status: str | None
+    quiescent: bool | None
+    after_pause: list[dict[str, Any]]
+    tool_processes_after_pause: int
+    survivors: list[dict[str, Any]] | None
+    sandbox_restarted: bool
+    inference_busy_slots: int | None
+    demo: dict[str, Any] | None
+    failed: bool
+    notes: list[str] = field(default_factory=list)
 
 
 def _atomic_write(path: Path, data: str, mode: int) -> None:
@@ -92,6 +162,8 @@ def agent_message(brief: str) -> str:
         "You are working unattended; nobody will answer questions until the work is done.\n"
         f"Your project directory is {AGENT_PROJECT_DIR}. The agreed brief is below and is also"
         f" available read-only at {AGENT_BRIEF_PATH}.\n"
+        "To serve the app for the operator, use the start_demo tool: it is the only way to"
+        " keep the app running after your work ends.\n"
         "Complete the brief, verify the result yourself, then finish.\n\n"
         "--- BRIEF ---\n"
         f"{brief.strip()}\n"
@@ -100,6 +172,35 @@ def agent_message(brief: str) -> str:
 
 def _new_run_id(now: datetime) -> str:
     return f"{now:%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
+
+
+def _proc_view(p: SandboxProcess) -> dict[str, Any]:
+    return {"pid": p.pid, "sid": p.sid, "state": p.state, "cmd": p.cmd}
+
+
+def _is_server_process(p: SandboxProcess) -> bool:
+    return any(marker in p.cmd for marker in _SERVER_MARKERS)
+
+
+def _clip(text: str, limit: int = 1500) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else "…" + text[-limit:]
+
+
+def demo_request_problem(command: object, port: object, demo_port: int) -> str | None:
+    """Why a start_demo request is refused, or None when it is acceptable."""
+    if not isinstance(command, str) or not command.strip():
+        return "command must be a non-empty string"
+    if len(command) > MAX_DEMO_COMMAND:
+        return f"command is longer than {MAX_DEMO_COMMAND} characters"
+    if "\x00" in command:
+        return "command contains a NUL byte"
+    if isinstance(port, bool) or not isinstance(port, int) or port != demo_port:
+        return (
+            f"the demo must listen on port {demo_port}; it is the only port published to "
+            f"the operator (got {port!r})"
+        )
+    return None
 
 
 class Controller:
@@ -115,6 +216,7 @@ class Controller:
         http: HttpClient,
         clock: Clock,
         chown: Callable[[Path, int, int], None] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._settings = settings
         self._state = state
@@ -125,9 +227,13 @@ class Controller:
         self._http = http
         self._clock = clock
         self._chown = chown if chown is not None else _default_chown
+        self._sleep = sleep
         self._wake = threading.Event()
         self._reconcile_lock = threading.Lock()
         self._snapshots: dict[str, ConversationSnapshot] = {}
+        self._stop_locks: dict[str, threading.Lock] = {}
+        self._stop_locks_guard = threading.Lock()
+        self._bad_requests: dict[str, str] = {}
 
     # --- paths & secrets -----------------------------------------------------------
 
@@ -147,7 +253,17 @@ class Controller:
             f = p.secrets_dir / name
             if not f.exists():
                 _atomic_write(f, secrets.token_urlsafe(32), 0o600)
+        p.control_dir.mkdir(exist_ok=True)
+        os.chmod(p.control_dir, 0o755)
+        # Never reset an existing mode: after a stop it must stay demo-only.
+        if not (p.control_dir / "mode").exists():
+            _atomic_write(p.control_dir / "mode", "agent\n", 0o644)
         return p
+
+    def _write_control(self, run_id: str, name: str, data: str) -> None:
+        control = self.paths(run_id).control_dir
+        control.mkdir(parents=True, exist_ok=True)
+        _atomic_write(control / name, data, 0o644)
 
     def _server_ref(self, run_id: str) -> ServerRef:
         key = (self.paths(run_id).secrets_dir / "session_api_key").read_text().strip()
@@ -163,9 +279,14 @@ class Controller:
             "status": self.status,
             "runs": lambda a: [self._run_view(r) for r in self._state.list_runs()],
             "logs": self.logs,
+            "stop": self.stop,
+            "processes": self.processes,
             "inference.ensure": self.inference_ensure,
-            "inference.status": lambda a: self._inference.status().as_dict(),
+            "inference.status": self.inference_status,
             "inference.request": self.inference_request,
+            "inference.stop": self.inference_stop,
+            "network.policy": lambda a: check_policy(self._settings, self._runtime).as_dict(),
+            "network.probe": self.network_probe,
         }
         handler = handlers.get(op)
         if handler is None:
@@ -222,15 +343,25 @@ class Controller:
     def status(self, args: Mapping[str, Any]) -> dict[str, Any]:
         run = self._resolve(args)
         view = self._run_view(run)
-        snap = self._snapshots.get(run.id)
-        if snap is None and run.conversation_id is not None:
-            snap = self._try_inspect(run)
-        view["conversation_status"] = snap.status if snap else None
-        view["last_event"] = asdict(snap.last_event) if snap and snap.last_event else None
+        view["stop_requested"] = run.stop_requested
+        if run.phase == "stopped" and run.conversation_id is not None:
+            # The Agent Server is gone; read what the SDK persisted.
+            conv_dir = self.paths(run.id).conversations_dir
+            view["conversation_status"] = persisted_status(conv_dir, run.conversation_id)
+            last = persisted_events(conv_dir, run.conversation_id, 0, 1, last=True)
+            view["last_event"] = asdict(last[0]) if last else None
+        else:
+            snap = self._snapshots.get(run.id)
+            if snap is None and run.conversation_id is not None:
+                snap = self._try_inspect(run)
+            view["conversation_status"] = snap.status if snap else None
+            view["last_event"] = asdict(snap.last_event) if snap and snap.last_event else None
         view["operations"] = [
             {"kind": o.kind, "status": o.status, "resource_id": o.resource_id, "error": o.error}
             for o in self._state.operations(run.id)
         ]
+        view["demo"] = self._demo_view(run)
+        view["stop_evidence"] = json.loads(run.stop_evidence) if run.stop_evidence else None
         return view
 
     def logs(self, args: Mapping[str, Any]) -> dict[str, Any]:
@@ -239,17 +370,51 @@ class Controller:
         limit = min(500, max(1, int(args.get("limit", 200))))
         if run.conversation_id is None:
             return {"run_id": run.id, "events": [], "next": since, "phase": run.phase}
-        try:
-            events = self._conversations.events(
-                self._server_ref(run.id), run.conversation_id, since, limit
+        events: list[EventSummary] | None = None
+        if run.phase != "stopped":
+            try:
+                events = list(
+                    self._conversations.events(
+                        self._server_ref(run.id), run.conversation_id, since, limit
+                    )
+                )
+            except ConversationError as exc:
+                log.info("%s: Agent Server unavailable (%s); reading persisted events", run.id, exc)
+        if events is None:
+            events = persisted_events(
+                self.paths(run.id).conversations_dir, run.conversation_id, since, limit
             )
-        except ConversationError as exc:
-            raise RequestError(f"cannot read events: {exc}") from None
         return {
             "run_id": run.id,
             "events": [asdict(e) for e in events],
             "next": since + len(events),
             "phase": run.phase,
+        }
+
+    def stop(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """End agent execution now; keep the demo. Returns the run's status."""
+        run = self._resolve(args)
+        if run.terminal:
+            view = self.status({"run_id": run.id})
+            view["message"] = f"run already {run.phase}; nothing to stop"
+            return view
+        self._state.request_stop(run.id, "stopped")
+        log.warning("%s: stop requested by the operator", run.id)
+        self.stop_agent(run.id)
+        return self.status({"run_id": run.id})
+
+    def processes(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """The sandbox's processes, classified by the in-sandbox helper (diagnostic)."""
+        run = self._resolve(args)
+        demo = self._state.get_demo(run.id)
+        try:
+            procs = self._runtime.sandbox_processes(run.id, demo.session_id if demo else None)
+        except DockerError as exc:
+            raise RequestError(str(exc)) from None
+        return {
+            "run_id": run.id,
+            "sandbox_running": procs is not None,
+            "processes": [asdict(p) for p in procs or ()],
         }
 
     def inference_ensure(self, args: Mapping[str, Any]) -> dict[str, Any]:
@@ -259,6 +424,51 @@ class Controller:
         except (ConfigError, InferenceError, DockerError) as exc:
             raise RequestError(str(exc)) from None
         return self._inference.status().as_dict()
+
+    def inference_status(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        view = self._inference.status().as_dict()
+        view["reservation"] = self._reservation_state()
+        return view
+
+    def _reservation_state(self) -> str:
+        """held | reserving | releasing | none, from the host helper's record."""
+        try:
+            raw = json.loads(self._settings.reservation_record.read_text())
+        except FileNotFoundError:
+            return "none"
+        except (OSError, ValueError) as exc:
+            return f"unreadable ({exc})"
+        return str(raw.get("state", "unknown")) if isinstance(raw, dict) else "unknown"
+
+    def inference_stop(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Remove the owned llama-server (before `release`). Refused while a run needs it."""
+        active = [r.id for r in self._state.active_runs()]
+        if active:
+            raise RequestError(
+                f"run {', '.join(active)} still uses the model; `dgx-autonomy stop` it first"
+            )
+        try:
+            removed = self._runtime.remove_container(self._settings.inference_name)
+        except DockerError as exc:
+            raise RequestError(str(exc)) from None
+        log.info("owned llama-server %s", "removed" if removed else "was not running")
+        return {"removed": removed, **self.inference_status({})}
+
+    def network_probe(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Connect to `targets` from the agent's network position (diagnostic)."""
+        try:
+            targets = probe_targets(args.get("targets"))
+            timeout = float(args.get("timeout_s", 5.0))
+        except (TypeError, ValueError) as exc:
+            raise RequestError(str(exc)) from None
+        if not 0 < timeout <= 30:
+            raise RequestError("timeout_s must be in (0, 30]")
+        try:
+            result = probe(self._settings, self._runtime, targets, timeout)
+        except DockerError as exc:
+            raise RequestError(str(exc)) from None
+        result["policy"] = check_policy(self._settings, self._runtime).as_dict()
+        return result
 
     def inference_request(self, args: Mapping[str, Any]) -> dict[str, Any]:
         try:
@@ -273,6 +483,7 @@ class Controller:
         return {
             "run_id": run.id,
             "phase": run.phase,
+            "outcome": run.outcome,
             "model_key": run.model_key,
             "launched_at": run.launched_at.isoformat(),
             "deadline_at": run.deadline_at.isoformat(),
@@ -281,10 +492,44 @@ class Controller:
             "workspace_dir": str(self.paths(run.id).project_dir),
         }
 
+    def _demo_view(self, run: Run) -> dict[str, Any] | None:
+        demo = self._state.get_demo(run.id)
+        if demo is None:
+            return None
+        live = self._demo_live(demo)
+        return {
+            "command": demo.command,
+            "port": demo.port,
+            "host_port": demo.host_port,
+            "url": f"http://127.0.0.1:{demo.host_port}/",
+            "state": demo.state,
+            "message": demo.message,
+            "session_id": demo.session_id,
+            "alive": live.alive if live else None,
+            "listening": live.listening if live else None,
+        }
+
+    def _demo_live(self, demo: Demo) -> DemoStatus | None:
+        if demo.session_id is None:
+            return None
+        try:
+            return self._runtime.demo_status(demo.run_id, demo.session_id, demo.port)
+        except DockerError as exc:
+            log.warning("%s: cannot check the demo: %s", demo.run_id, exc)
+            return None
+
     # --- reconciliation ------------------------------------------------------------
 
     def wake(self) -> None:
         self._wake.set()
+
+    def deadline_watchdog(self) -> DeadlineWatchdog:
+        return DeadlineWatchdog(
+            state=self._state,
+            clock=self._clock,
+            on_expired=self.expire,
+            interval_s=self._settings.watchdog_interval_s,
+        )
 
     def run_forever(self, stop: threading.Event) -> None:
         while not stop.is_set():
@@ -301,31 +546,43 @@ class Controller:
                     # Keep the loop alive; the next tick retries from durable state.
                     log.exception("reconcile %s failed", run.id)
 
+    def _phase_is(self, run_id: str, *phases: str) -> bool:
+        """Re-read the phase: a stop may have moved the run on during a slow step."""
+        run = self._state.get_run(run_id)
+        return run is not None and run.phase in phases
+
     def _reconcile_run(self, run: Run) -> None:
+        if run.phase == "stopping":
+            # Another thread (the watchdog, a `stop` command) may be on it already.
+            self.stop_agent(run.id, block=False)
+            return
         if run.phase == "launched":
-            if not self._step_inference(run):
+            if not self._step_inference(run) or not self._phase_is(run.id, "launched"):
                 return
             server = self._step_workspace(run)
-            if server is None:
+            if server is None or not self._phase_is(run.id, "launched"):
                 return
             if not self._step_conversation(run, server):
                 return
-            self._state.set_phase(run.id, "running")
+            if not self._state.try_set_phase(run.id, "running"):
+                return
             log.info("%s is running", run.id)
             run = self._state.get_run(run.id) or run
         if run.phase == "running" and run.conversation_id is not None:
             self._observe(run)
+            if self._phase_is(run.id, "running"):
+                self._step_demo(run)
 
     def _fail(self, run: Run, op: Operation, error: str) -> None:
         log.error("%s: %s failed: %s", run.id, op.kind, error)
         self._state.fail_operation(op.id, error)
-        self._state.set_phase(run.id, "failed")
+        self._state.try_set_phase(run.id, "failed")
 
     def _intent(self, run: Run, kind: OperationKind) -> Operation | None:
         """The intent for `kind`, or None when the run already failed at this step."""
         op = self._state.record_intent(run.id, kind, self._clock.now())
         if op.status == "failed":
-            self._state.set_phase(run.id, "failed")
+            self._state.try_set_phase(run.id, "failed")
             return None
         return op
 
@@ -359,6 +616,36 @@ class Controller:
             self._fail(run, op, f"llama-server not ready in time ({status.health})")
         return False
 
+    def _workspace_spec(self, run_id: str, op_id: str) -> WorkspaceSpec:
+        paths = self._prepare_run_dirs(run_id)
+        demo = self._state.reserve_demo(
+            run_id,
+            port=self._settings.demo_port,
+            host_port_base=self._settings.demo_host_port_base,
+            host_port_count=self._settings.demo_host_port_count,
+            now=self._clock.now(),
+        )
+        return WorkspaceSpec(
+            run_id=run_id,
+            op_id=op_id,
+            agent_dir=paths.agent_dir,
+            brief_file=paths.brief,
+            session_api_key=(paths.secrets_dir / "session_api_key").read_text().strip(),
+            secret_key=(paths.secrets_dir / "secret_key").read_text().strip(),
+            control_dir=paths.control_dir,
+            demo_host_port=demo.host_port,
+        )
+
+    def _ensure_workspace(self, run_id: str, op_id: str) -> WorkspaceHandle:
+        """Create or restart the sandbox, only inside the host's egress policy."""
+        if self._settings.require_egress_policy:
+            policy = check_policy(self._settings, self._runtime)
+            if not policy.ok:
+                raise EgressPolicyError(
+                    "refusing to start the agent sandbox: " + "; ".join(policy.problems)
+                )
+        return self._runtime.ensure_workspace(self._workspace_spec(run_id, op_id))
+
     def _step_workspace(self, run: Run) -> ServerRef | None:
         op = self._intent(run, "workspace.create")
         if op is None:
@@ -369,18 +656,9 @@ class Controller:
         name = agent_container_name(run.id)
         resource = op.resource_id
         if resource is None:
-            paths = self._prepare_run_dirs(run.id)
-            spec = WorkspaceSpec(
-                run_id=run.id,
-                op_id=op.id,
-                agent_dir=paths.agent_dir,
-                brief_file=paths.brief,
-                session_api_key=server.api_key,
-                secret_key=(paths.secrets_dir / "secret_key").read_text().strip(),
-            )
             try:
-                handle = self._runtime.ensure_workspace(spec)
-            except DockerError as exc:
+                handle = self._ensure_workspace(run.id, op.id)
+            except (DockerError, EgressPolicyError) as exc:
                 self._fail(run, op, str(exc))
                 return None
             resource = handle.container_id
@@ -418,11 +696,14 @@ class Controller:
             cid = self._conversations.start(request)
         except ConversationError as exc:
             # The Agent Server answered health but refused; retry until the start timeout.
+            if not self._phase_is(run.id, "launched"):
+                return False
             if self._timed_out(op, self._settings.agent_start_timeout_s):
                 self._fail(run, op, str(exc))
             else:
                 log.warning("%s: conversation start will be retried: %s", run.id, exc)
             return False
+        # Recorded even if a stop arrived meanwhile: logs need the id.
         self._state.set_conversation_id(run.id, cid)
         self._state.complete_operation(op.id, cid)
         return True
@@ -442,14 +723,309 @@ class Controller:
             return
         self._snapshots[run.id] = snap
         if snap.status == "finished":
-            self._state.set_phase(run.id, "finished")
+            if not self._state.try_set_phase(run.id, "finished"):
+                return
             log.info("%s finished", run.id)
         elif snap.status in FAILED_CONVERSATION_STATUSES:
-            self._state.set_phase(run.id, "failed")
+            if not self._state.try_set_phase(run.id, "failed"):
+                return
             log.warning("%s conversation ended %s", run.id, snap.status)
         else:
             return
         self._publish_project(run.id)
+
+    # --- the demo ------------------------------------------------------------------
+
+    def _read_demo_request(self, run_id: str) -> dict[str, Any] | None:
+        """The agent's pending start_demo request, if it is one we can answer."""
+        agent_dir = self.paths(run_id).agent_dir
+        try:
+            raw = read_json(
+                agent_dir, ".dgx", "demo-request.json", max_bytes=MAX_DEMO_REQUEST_BYTES
+            )
+        except FileNotFoundError:
+            return None
+        except AgentFileError as exc:
+            self._warn_bad_request(run_id, str(exc))
+            return None
+        rid = raw.get("id") if isinstance(raw, dict) else None
+        if not isinstance(rid, str) or not _REQUEST_ID.match(rid):
+            self._warn_bad_request(run_id, "demo request without a valid id")
+            return None
+        return dict(raw)
+
+    def _warn_bad_request(self, run_id: str, why: str) -> None:
+        if self._bad_requests.get(run_id) != why:
+            self._bad_requests[run_id] = why
+            log.warning("%s: ignoring demo request: %s", run_id, why)
+
+    def _step_demo(self, run: Run) -> None:
+        demo = self._state.get_demo(run.id)
+        if demo is None:
+            return
+        request = self._read_demo_request(run.id)
+        if request is not None and request["id"] != demo.request_id:
+            self._handle_demo_request(run, demo, request)
+        elif demo.state == "starting" and demo.session_id is not None:
+            self._check_demo_start(run, demo)
+
+    def _handle_demo_request(self, run: Run, demo: Demo, request: Mapping[str, Any]) -> None:
+        rid = str(request["id"])
+        command = request.get("command")
+        port = request.get("port", self._settings.demo_port)
+        now = self._clock.now()
+        problem = demo_request_problem(command, port, self._settings.demo_port)
+        if problem is not None or not isinstance(command, str) or not isinstance(port, int):
+            demo = self._state.record_demo_request(
+                run.id, request_id=rid, command=None, state="refused", message=problem, now=now
+            )
+            log.warning("%s: refused demo request %s: %s", run.id, rid, problem)
+            self._publish_demo_status(demo)
+            return
+        # The spec is durable before anything starts: it is what a sandbox restart
+        # relaunches.
+        previous_session = demo.session_id
+        self._state.record_demo_request(
+            run.id, request_id=rid, command=command, state="starting", message=None, now=now
+        )
+        try:
+            handle = self._runtime.ensure_demo(
+                DemoSpec(run.id, command, port, replace_session=previous_session)
+            )
+        except DockerError as exc:
+            demo = self._state.set_demo_state(
+                run.id, state="failed", message=f"could not start the demo: {exc}", now=now
+            )
+        else:
+            demo = self._state.set_demo_state(
+                run.id, state="starting", message=None, now=now, session_id=handle.session_id
+            )
+            log.info("%s: demo %s started (session %s)", run.id, rid, handle.session_id)
+        self._publish_demo_status(demo)
+
+    def _check_demo_start(self, run: Run, demo: Demo) -> None:
+        live = self._demo_live(demo)
+        if live is None:
+            return
+        now = self._clock.now()
+        waited = (now - demo.updated_at).total_seconds()
+        if live.listening:
+            demo = self._state.set_demo_state(
+                run.id, state="running", message=f"listening on port {demo.port}", now=now
+            )
+        elif not live.alive:
+            demo = self._state.set_demo_state(
+                run.id,
+                state="failed",
+                message=(
+                    f"the command exited before listening on port {demo.port}. "
+                    f"Last output:\n{_clip(live.log_tail)}"
+                ),
+                now=now,
+            )
+        elif waited > self._settings.demo_start_timeout_s:
+            demo = self._state.set_demo_state(
+                run.id,
+                state="failed",
+                message=(
+                    f"not listening on port {demo.port} after {waited:.0f}s; the command is "
+                    f"still running. Last output:\n{_clip(live.log_tail)}"
+                ),
+                now=now,
+            )
+        else:
+            return
+        log.info("%s: demo %s", run.id, demo.state)
+        self._publish_demo_status(demo)
+
+    def _publish_demo_status(self, demo: Demo) -> None:
+        """The answer the agent's start_demo tool waits for (read-only to the agent)."""
+        body = {
+            "request_id": demo.request_id,
+            "state": demo.state,
+            "message": demo.message,
+            "port": demo.port,
+            "updated_at": demo.updated_at.isoformat(),
+        }
+        self._write_control(demo.run_id, "demo.json", json.dumps(body))
+
+    # --- deadline and stop ---------------------------------------------------------
+
+    def expire(self, run_id: str) -> dict[str, Any] | None:
+        """The deadline passed: persist that, then end agent execution."""
+        self._state.request_stop(run_id, "expired")
+        return self.stop_agent(run_id)
+
+    def _stop_lock(self, run_id: str) -> threading.Lock:
+        with self._stop_locks_guard:
+            return self._stop_locks.setdefault(run_id, threading.Lock())
+
+    def stop_agent(self, run_id: str, *, block: bool = True) -> dict[str, Any] | None:
+        """End agent execution for a run whose stop is persisted; keep its demo.
+
+        Safe to call from several threads: one does the work, a blocking caller
+        waits and gets the recorded evidence, a non-blocking caller gets None.
+        """
+        lock = self._stop_lock(run_id)
+        if not lock.acquire(blocking=block):
+            return None
+        try:
+            run = self._state.get_run(run_id)
+            if run is None:
+                raise RequestError(f"no run {run_id}")
+            if run.phase == "stopped":
+                return json.loads(run.stop_evidence) if run.stop_evidence else None
+            if run.phase != "stopping":
+                raise RequestError(f"{run_id} is {run.phase}; persist the stop request first")
+            return asdict(self._stop_agent_locked(run))
+        finally:
+            lock.release()
+
+    def _stop_agent_locked(self, run: Run) -> StopEvidence:
+        started = self._clock.now()
+        notes: list[str] = []
+        # 1. A sandbox that (re)starts from now on never starts the Agent Server.
+        self._write_control(run.id, "mode", "demo-only\n")
+
+        # 2. Pause the conversation and cancel its in-flight LLM call.
+        try:
+            container = self._runtime.inspect_container(agent_container_name(run.id))
+        except DockerError as exc:
+            notes.append(f"inspect: {exc}")
+            container = None
+        running = container is not None and container.running
+        conversation_status: str | None = None
+        quiescent: bool | None = None
+        if running and run.conversation_id is not None:
+            server = self._server_ref(run.id)
+            for name, call in (
+                ("interrupt", self._conversations.interrupt),
+                ("pause", self._conversations.pause),
+            ):
+                try:
+                    call(server, run.conversation_id)
+                except ConversationError as exc:
+                    notes.append(f"{name}: {exc}")
+            # 3. Bounded wait for the conversation to go quiet.
+            conversation_status = self._wait_quiescent(server, run.conversation_id)
+            quiescent = conversation_status is not None and conversation_status != "running"
+
+        # 4. End every agent process that is left; spare the demo session.
+        demo = self._state.get_demo(run.id)
+        keep = demo.session_id if demo is not None else None
+        after_pause: list[SandboxProcess] = []
+        survivors: list[SandboxProcess] | None
+        try:
+            report = self._runtime.stop_agent(run.id, keep, self._settings.stop_kill_grace_s)
+            after_pause = list(report.before)
+            survivors = list(report.survivors)
+        except DockerError as exc:
+            notes.append(f"kill: {exc}")
+            survivors = None
+
+        # 5. Could not end, or could not show the end of, agent execution in place:
+        #    hard reset. The supervisor comes back demo-only, so the agent does not.
+        restarted = False
+        if survivors is None or survivors:
+            try:
+                self._runtime.restart_sandbox(run.id)
+                restarted = True
+                procs = self._runtime.sandbox_processes(run.id, None)
+                survivors = [p for p in procs or () if p.role == "agent"]
+            except DockerError as exc:
+                notes.append(f"restart: {exc}")
+                survivors = None
+        failed = survivors is None or bool(survivors)
+
+        # 6. The killed Agent Server's connection is closed, which cancels generation.
+        busy = self._wait_inference_idle()
+
+        # 7. Keep the demo; relaunch the recorded spec if the sandbox restarted.
+        demo_view = self._retain_demo(run, demo, reset=restarted or not running, notes=notes)
+
+        evidence = StopEvidence(
+            run_id=run.id,
+            reason=run.outcome or "stopped",
+            started_at=started.isoformat(),
+            finished_at=self._clock.now().isoformat(),
+            container_running=running,
+            conversation_status=conversation_status,
+            quiescent=quiescent,
+            after_pause=[_proc_view(p) for p in after_pause],
+            tool_processes_after_pause=sum(1 for p in after_pause if not _is_server_process(p)),
+            survivors=None if survivors is None else [_proc_view(p) for p in survivors],
+            sandbox_restarted=restarted,
+            inference_busy_slots=busy,
+            demo=demo_view,
+            failed=failed,
+            notes=notes,
+        )
+        self._state.record_stop(run.id, json.dumps(asdict(evidence)), verified=not failed)
+        if failed:
+            log.error("%s: could not show that agent execution ended: %s", run.id, evidence)
+        else:
+            log.info(
+                "%s: agent execution ended (%s); %d agent processes after pause, %d from tools",
+                run.id,
+                evidence.reason,
+                len(after_pause),
+                evidence.tool_processes_after_pause,
+            )
+            self._publish_project(run.id)
+        return evidence
+
+    def _wait_quiescent(self, server: ServerRef, conversation_id: str) -> str | None:
+        end = self._clock.now() + timedelta(seconds=self._settings.stop_grace_s)
+        while True:
+            try:
+                status: str | None = self._conversations.inspect(server, conversation_id).status
+            except (ConversationError, OSError):
+                status = None
+            if (status is not None and status != "running") or self._clock.now() >= end:
+                return status
+            self._sleep(1.0)
+
+    def _wait_inference_idle(self) -> int | None:
+        end = self._clock.now() + timedelta(seconds=self._settings.stop_grace_s)
+        while True:
+            try:
+                busy = self._inference.status().slots_busy
+            except (InferenceError, DockerError):
+                return None
+            if not busy or self._clock.now() >= end:
+                return busy
+            self._sleep(1.0)
+
+    def _retain_demo(
+        self, run: Run, demo: Demo | None, *, reset: bool, notes: list[str]
+    ) -> dict[str, Any] | None:
+        if demo is None or demo.command is None:
+            return None
+        if reset:
+            # The demo went down with the sandbox. Bring the sandbox back (demo-only)
+            # and relaunch exactly the recorded spec; the agent does not come back.
+            try:
+                op = self._state.record_intent(run.id, "workspace.create", self._clock.now())
+                self._ensure_workspace(run.id, op.id)
+                handle = self._runtime.ensure_demo(DemoSpec(run.id, demo.command, demo.port))
+                demo = self._state.set_demo_state(
+                    run.id,
+                    state="starting",
+                    message="relaunched from the recorded spec after the sandbox restarted",
+                    now=self._clock.now(),
+                    session_id=handle.session_id,
+                )
+            except (DockerError, EgressPolicyError) as exc:
+                notes.append(f"demo relaunch: {exc}")
+        live = self._demo_live(demo)
+        return {
+            "command": demo.command,
+            "session_id": demo.session_id,
+            "host_port": demo.host_port,
+            "relaunched": reset,
+            "alive": live.alive if live else None,
+            "listening": live.listening if live else None,
+        }
 
     def _publish_project(self, run_id: str) -> None:
         """Let the operator read the finished project from the host.
@@ -520,6 +1096,7 @@ def serve(settings: Settings | None = None) -> None:
         owner_uid=settings.operator_uid,
         owner_gid=settings.operator_gid,
     )
+    watchdog = controller.deadline_watchdog()
 
     def _shutdown(signum: int, _frame: object) -> None:
         log.info("signal %s: shutting down", signum)
@@ -529,9 +1106,14 @@ def serve(settings: Settings | None = None) -> None:
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
+    # Before anything can resume a run: a deadline that passed while the controller
+    # was down ends that run's agent execution first.
+    watchdog.check_once()
+    watchdog.start()
     server.start()
     log.info("control socket at %s", settings.socket_path)
     try:
         controller.run_forever(stop)
     finally:
+        watchdog.stop()
         server.shutdown()
