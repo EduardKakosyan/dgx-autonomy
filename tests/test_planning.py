@@ -32,7 +32,7 @@ from dgx_autonomy.runtime import (
     planner_container_name,
 )
 
-from fakes import EvaluatorOutcome, Harness, playwright_passes, runner_crashes
+from fakes import EvaluatorOutcome, Harness, playwright_fails, playwright_passes, runner_crashes
 
 REQUEST = "I want a page that greets visitors."
 BRIEF = "# Greeting page\n\nServe a page whose heading says hello.\n"
@@ -483,3 +483,65 @@ def test_a_message_that_starts_like_a_command_is_not_run_as_one() -> None:
     assert control.calls == [] and "takes no argument; nothing was sent" in out.getvalue()
     session.handle(" /draft is wrong, fix it")
     assert control.calls[0] == ("plan.send", {"plan_id": "p1", "text": "/draft is wrong, fix it"})
+
+
+def test_the_dry_run_shows_the_checks_can_pass_against_a_reference_app(
+    harness: Harness,
+) -> None:
+    from dgx_autonomy.evaluation import REFERENCE_URL, SERVE_REFERENCE
+
+    h = harness
+    plan_id = _open_plan(h)
+    d = _write_draft(h, plan_id)
+    digest = h.controller.handle("plan.draft", {"plan_id": plan_id})["digest"]
+
+    # Without a reference, the checks only show that they run.
+    result = h.controller.handle("plan.checks", {"plan_id": plan_id})
+    assert (result["ok"], result["reference"], result["satisfiable"]) == (True, False, False)
+    assert "There is no reference app" in h.conversation.delivered[-1].text
+
+    (d / "reference").mkdir()
+    (d / "reference" / "index.html").write_text("<h1>hello</h1>")
+    view = h.controller.handle("plan.draft", {"plan_id": plan_id})
+    assert view["digest"] == digest  # the reference is not part of the agreement
+    assert view["reference_files"] == ["index.html"]
+
+    h.runtime.completed.clear()
+    result = h.controller.handle("plan.checks", {"plan_id": plan_id})
+    assert (result["ok"], result["satisfiable"]) == (True, True)
+    assert [c["reference_status"] for c in result["checks"]] == ["passed", "passed"]
+    empty, against = h.runtime.completed[:2], h.runtime.completed[2:]
+    assert [s.env["APP_URL"] for s in against] == [REFERENCE_URL] * 2
+    for spec in against:
+        mounts = {m.target: m for m in spec.mounts}
+        assert mounts["/reference"].read_only
+        copy = Path(mounts["/reference"].source)
+        assert (copy / "index.html").read_text() == "<h1>hello</h1>"  # a controller copy
+        assert spec.command[:3] == ("/bin/sh", "-c", SERVE_REFERENCE)
+    assert all("/reference" not in {m.target for m in s.mounts} for s in empty)
+
+    # A check the reference cannot pass is unsatisfiable, or the reference is wrong.
+    h.runtime.reference_outcomes = {"home": playwright_fails("strict mode violation")}
+    result = h.controller.handle("plan.checks", {"plan_id": plan_id})
+    home = result["checks"][0]
+    assert (home["ok"], home["reference_ok"]) == (False, False)
+    assert "FAILS against the reference app" in home["reference_verdict"]
+    assert "strict mode violation" in h.conversation.delivered[-1].text
+
+    # The reference is never frozen into the run.
+    h.runtime.reference_outcomes = {}
+    h.controller.handle("plan.checks", {"plan_id": plan_id})
+    run_id = h.controller.handle(
+        "plan.launch", {"plan_id": plan_id, "digest": digest, "budget_hours": 1}
+    )["run_id"]
+    assert not (h.controller.paths(run_id).frozen_dir / "reference").exists()
+
+
+def test_a_symlink_in_the_reference_refuses_the_draft(harness: Harness) -> None:
+    h = harness
+    plan_id = _open_plan(h)
+    d = _write_draft(h, plan_id)
+    (d / "reference").mkdir()
+    os.symlink("/etc/passwd", d / "reference" / "index.html")
+    view = h.controller.handle("plan.draft", {"plan_id": plan_id})
+    assert view["problem"] is not None and "reference" in view["problem"]

@@ -34,7 +34,7 @@ from __future__ import annotations
 import os
 import stat
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,7 @@ from .agent_files import AgentFileError, open_dir, read_bytes_at
 PLANNER_WORKDIR = "/workspace"
 DRAFT_DIR_NAME = "draft"
 DRAFT_DIR = f"{PLANNER_WORKDIR}/{DRAFT_DIR_NAME}"
+REFERENCE_DIR_NAME = "reference"
 MAX_REQUEST_BYTES = 64 * 1024
 # The dry run's target: the evaluator's own loopback, where nothing listens.
 EMPTY_TARGET = "http://127.0.0.1:3000"
@@ -94,8 +95,15 @@ Acceptance checks
 - Check what a user can observe, not implementation details. If a check relies on a
   particular route, label, role or data-testid, the brief must require it. Do not
   assert on live third-party data values, which change.
+- Playwright locators must match exactly one element. `getByLabel('Total')` also
+  matches "Per-Person Total"; pass `{{ exact: true }}` whenever one label, name or
+  text is contained in another.
 - At least one criterion must be automated. Criteria that need a person (looks,
   feel) are `kind: human_judgment` with no test; the operator judges them later.
+- Prove the checks can pass: write a small throwaway reference app, static files
+  only (index.html with inline JS; fixed sample data instead of live APIs), in
+  {DRAFT_DIR}/{REFERENCE_DIR_NAME}/. The dry run serves it and every automated check
+  must pass against it. It is not part of the agreement: the builder never sees it.
 
 {frozen.CRITERIA_FILE} format:
 
@@ -112,8 +120,8 @@ criteria:
     kind: human_judgment
 
 The operator can type /draft to review your draft, /checks to dry-run the checks
-(every automated check should run, and fail, against an empty target), and /launch
-to freeze the draft and start the run.
+(every automated check must fail against an empty target and pass against your
+reference app), and /launch to freeze the draft and start the run.
 
 The operator's request:
 
@@ -133,6 +141,10 @@ class Draft:
     digest: str | None = None
     criteria: tuple[frozen.Criterion, ...] = ()
     problem: str | None = None
+    # draft/reference/: a throwaway app the dry run checks the checks against. It is
+    # not part of the agreement (not in the digest, never frozen, never shown to the
+    # builder).
+    reference: Mapping[str, bytes] = field(default_factory=dict)
 
     @property
     def launchable(self) -> bool:
@@ -144,6 +156,7 @@ class Draft:
             "problem": self.problem,
             "brief": self.brief.decode("utf-8", "replace") if self.brief is not None else None,
             "files": sorted(self.checks),
+            "reference_files": sorted(self.reference),
             "criteria": [
                 {
                     "key": c.key,
@@ -183,7 +196,23 @@ def read_draft(agent_dir: Path) -> Draft:
         return Draft(None, problem=f"there is no draft yet ({DRAFT_DIR}/{frozen.BRIEF_NAME})")
     except (AgentFileError, frozen.FrozenError) as exc:
         return Draft(None, problem=f"the draft cannot be read: {exc}")
-    return check_draft(brief, checks)
+    draft = check_draft(brief, checks)
+    try:
+        reference = read_reference(agent_dir)
+    except (AgentFileError, frozen.FrozenError) as exc:
+        return replace(draft, problem=draft.problem or f"draft/reference: {exc}")
+    return replace(draft, reference=reference)
+
+
+def read_reference(agent_dir: Path) -> dict[str, bytes]:
+    """draft/reference/ (plain files only), or {} when there is none."""
+    out: dict[str, bytes] = {}
+    try:
+        with open_dir(agent_dir, DRAFT_DIR_NAME, REFERENCE_DIR_NAME) as fd:
+            _walk(fd, "", out)
+    except FileNotFoundError:
+        return {}
+    return out
 
 
 def check_draft(brief: bytes | None, checks: Mapping[str, bytes]) -> Draft:
@@ -251,8 +280,22 @@ def dry_run_verdict(status: str) -> tuple[bool, str]:
     return False, "does not run"
 
 
+def reference_verdict(status: str | None) -> tuple[bool | None, str]:
+    """Whether a check passes against the planner's reference app."""
+    if status is None:
+        return None, "no reference app: not shown that it can pass"
+    if status == "passed":
+        return True, "passes against the reference app"
+    if status == "failed":
+        return False, "FAILS against the reference app: the check or the reference is wrong"
+    return False, "does not run against the reference app"
+
+
 def dry_run_summary(
-    digest: str, criteria: Sequence[frozen.Criterion], results: Mapping[str, Mapping[str, Any]]
+    digest: str,
+    criteria: Sequence[frozen.Criterion],
+    results: Mapping[str, Mapping[str, Any]],
+    reference_results: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     checks = []
     for c in criteria:
@@ -260,34 +303,55 @@ def dry_run_summary(
             continue
         r = results.get(c.key) or {"status": "not_run", "summary": "not run"}
         ok, verdict = dry_run_verdict(str(r.get("status")))
+        ref = (reference_results or {}).get(c.key) if reference_results is not None else None
+        ref_ok, ref_verdict = reference_verdict(str(ref.get("status")) if ref is not None else None)
         checks.append(
             {
                 "key": c.key,
                 "test": c.test,
                 "runner": c.runner,
                 "status": r.get("status"),
-                "ok": ok,
+                "ok": ok and ref_ok is not False,
                 "verdict": verdict,
                 "summary": r.get("summary"),
                 "excerpt": r.get("excerpt"),
+                "reference_status": ref.get("status") if ref is not None else None,
+                "reference_ok": ref_ok,
+                "reference_verdict": ref_verdict,
+                "reference_excerpt": ref.get("excerpt") if ref is not None else None,
             }
         )
-    return {"digest": digest, "ok": bool(checks) and all(c["ok"] for c in checks), "checks": checks}
+    return {
+        "digest": digest,
+        "ok": bool(checks) and all(c["ok"] for c in checks),
+        "reference": reference_results is not None,
+        "satisfiable": reference_results is not None and all(c["reference_ok"] for c in checks),
+        "checks": checks,
+    }
 
 
 def dry_run_message(result: Mapping[str, Any]) -> str:
     """What the planner is told about the operator's dry run."""
     lines = [
         "The operator dry-ran the draft checks against an empty target (no app"
-        " running). A working check fails there; one that errors does not run, and one"
-        " that passes checks nothing."
+        " running), and against your reference app if there is one. A working check"
+        " fails against the empty target and passes against the reference."
     ]
     for c in result.get("checks") or []:
         mark = "ok     " if c["ok"] else "PROBLEM"
-        lines.append(f"{mark} {c['key']} ({c['test']}): {c['verdict']}")
-        if not c["ok"] and c.get("excerpt"):
-            excerpt = str(c["excerpt"])[:1200]
-            lines.append("    " + excerpt.replace("\n", "\n    "))
+        lines.append(f"{mark} {c['key']} ({c['test']}): {c['verdict']}; {c['reference_verdict']}")
+        if c["status"] != "failed" and c.get("excerpt"):
+            lines.append("    " + str(c["excerpt"])[:1200].replace("\n", "\n    "))
+        if c.get("reference_ok") is False and c.get("reference_excerpt"):
+            excerpt = str(c["reference_excerpt"])[:1200]
+            lines.append("    against the reference: " + excerpt.replace("\n", "\n    "))
+    if not result.get("reference"):
+        lines.append(
+            f"There is no reference app in {DRAFT_DIR}/{REFERENCE_DIR_NAME}/, so nothing"
+            " shows that the checks can pass. Write one."
+        )
     if not result.get("ok"):
-        lines.append("Fix the checks that have a problem, then tell the operator.")
+        lines.append(
+            "Fix what has a problem (the checks, or the reference), then tell the operator."
+        )
     return "\n".join(lines)

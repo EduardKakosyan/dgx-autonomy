@@ -7,7 +7,8 @@ dictate the draft) so the test does not depend on the model's product sense:
 2. The controller crashes (fault.inject) mid-plan; the plan, its conversation and
    the draft survive it, as they survive a dropped SSH session.
 3. A second turn changes the heading. The draft follows.
-4. The dry run runs both checks against an empty target: both run and fail.
+4. The dry run runs both checks against an empty target (both run and fail) and
+   against the planner's reference page (both pass).
 5. Launch freezes exactly the reviewed draft. The run gets its deadline then, builds
    the page and finishes VERIFIED. One of the frozen checks asserts, from inside the
    evaluator, that /checks is mounted read-only.
@@ -74,7 +75,7 @@ def test_app_answers_and_checks_are_read_only() -> None:
 
 REQUEST = f"""\
 This is a scripted test of the planning environment; no research or questions are
-needed. Write these four files exactly as given, with your file editor, then reply
+needed. Write these five files exactly as given, with your file editor, then reply
 with the single line: draft written
 
 File /workspace/draft/brief.md:
@@ -92,13 +93,19 @@ File /workspace/draft/checks/home.spec.ts:
 File /workspace/draft/checks/test_read_only.py:
 <<<
 {READ_ONLY_TEST}>>>
+
+File /workspace/draft/reference/index.html:
+<<<
+<h1>hello</h1>
+>>>
 """
 
 SECOND_TURN = (
     "Change the heading from hello to 'hello planner' everywhere it appears: in"
-    " /workspace/draft/brief.md (the <h1> line) and in"
-    " /workspace/draft/checks/home.spec.ts (the toHaveText value). Change nothing else,"
-    " then reply with the single line: draft updated"
+    " /workspace/draft/brief.md (the <h1> line), in"
+    " /workspace/draft/checks/home.spec.ts (the toHaveText value) and in"
+    " /workspace/draft/reference/index.html. Change nothing else, then reply with the"
+    " single line: draft updated"
 )
 
 
@@ -161,11 +168,11 @@ def test_plan_to_launch(control: Callable[..., Any]) -> None:
     dry = control("plan.checks", {"plan_id": plan_id}, timeout=1800)
     print(dry)
     assert dry["digest"] == draft["digest"]
-    assert [(c["key"], c["status"]) for c in dry["checks"]] == [
-        ("home", "failed"),
-        ("checks-read-only", "failed"),
+    assert [(c["key"], c["status"], c["reference_status"]) for c in dry["checks"]] == [
+        ("home", "failed", "passed"),
+        ("checks-read-only", "failed", "passed"),
     ], dry
-    assert dry["ok"] is True
+    assert dry["ok"] is True and dry["satisfiable"] is True
 
     launched = control(
         "plan.launch",

@@ -50,10 +50,21 @@ CriterionStatus = Literal["passed", "failed", "error", "not_run"]
 
 EVALUATOR_CHECKS_DIR = "/checks"
 EVALUATOR_OUT_DIR = "/out"
+EVALUATOR_REFERENCE_DIR = "/reference"
 EVALUATOR_PYTHON = "/opt/evaluator/venv/bin/python"
 EVALUATOR_PLAYWRIGHT = "/opt/evaluator/node_modules/.bin/playwright"
 EVALUATOR_PLAYWRIGHT_CONFIG = "/opt/evaluator/playwright.config.mjs"
 LABEL_CRITERION = f"{LABEL_PREFIX}.criterion"
+REFERENCE_URL = "http://127.0.0.1:3000"
+# Serve /reference on the container's loopback, wait until it listens, then run the
+# check ("$@"). Its log goes next to the check's report.
+SERVE_REFERENCE = (
+    f"{EVALUATOR_PYTHON} -m http.server 3000 --bind 127.0.0.1 --directory"
+    f" {EVALUATOR_REFERENCE_DIR} > {EVALUATOR_OUT_DIR}/reference-server.log 2>&1 &"
+    " i=0; while [ $i -lt 100 ]; do"
+    f" {EVALUATOR_PYTHON} -c 'import socket; socket.create_connection((\"127.0.0.1\", 3000), 1)'"
+    ' 2>/dev/null && break; i=$((i+1)); sleep 0.1; done; exec "$@"'
+)
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 EXCERPT_CHARS = 2000
 LOG_TAIL_LINES = 200
@@ -135,9 +146,14 @@ def check_container_spec(
     checks_dir: Path,
     out_dir: Path,
     url: str,
+    reference_dir: Path | None = None,
 ) -> ContainerSpec:
     """A container that runs one check file against `url` (evaluation, or the
-    planning dry run): the checks read-only at /checks, /out for its report."""
+    planning dry run): the checks read-only at /checks, /out for its report.
+
+    With `reference_dir` (the planning dry run's reference app), the container first
+    serves it on its own loopback, port 3000, and the check runs against that.
+    """
     path = f"{EVALUATOR_CHECKS_DIR}/{test}"
     if runner == "pytest":
         command: tuple[str, ...] = (
@@ -148,16 +164,20 @@ def check_container_spec(
         command = (EVALUATOR_PLAYWRIGHT, "test", f"--config={EVALUATOR_PLAYWRIGHT_CONFIG}", path)
     else:
         raise EvaluationError(f"criterion {key}: unknown runner {runner!r}")
+    mounts = [
+        Mount(str(checks_dir), EVALUATOR_CHECKS_DIR, read_only=True),
+        Mount(str(out_dir), EVALUATOR_OUT_DIR),
+    ]
+    if reference_dir is not None:
+        mounts.append(Mount(str(reference_dir), EVALUATOR_REFERENCE_DIR, read_only=True))
+        command = ("/bin/sh", "-c", SERVE_REFERENCE, "serve-reference", *command)
     return ContainerSpec(
         name=name,
         image=settings.evaluator_image,
         labels=dict(labels),
         networks=(settings.egress_network,),
         dns=settings.agent_dns,
-        mounts=(
-            Mount(str(checks_dir), EVALUATOR_CHECKS_DIR, read_only=True),
-            Mount(str(out_dir), EVALUATOR_OUT_DIR),
-        ),
+        mounts=tuple(mounts),
         env={
             "APP_URL": url,
             "BASE_URL": url,

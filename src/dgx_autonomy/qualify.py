@@ -46,6 +46,7 @@ GIB = 1024**3
 MEMORY_HEADROOM_BYTES = 8 * GIB
 MIN_AVAILABLE_BYTES = 4 * GIB
 MAX_SWAP_GROWTH_BYTES = 1 * GIB
+# Leaves room for the answer (4096 tokens) and for tokenizer estimates that run long.
 LONG_PROMPT_FRACTION = 0.75
 WORKLOAD_BUDGET_HOURS = 0.75
 
@@ -559,7 +560,8 @@ class Qualifier:
                 "model": model.key,
                 "messages": _user(long_prompt(target, secret)),
                 "temperature": 0,
-                "max_tokens": 1024,
+                # Room for a reasoning model to think before it answers.
+                "max_tokens": 4096,
             },
             1800,
         )

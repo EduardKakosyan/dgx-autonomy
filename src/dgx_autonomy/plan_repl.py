@@ -172,13 +172,20 @@ class PlanSession:
         r = self._call("plan.checks", {"plan_id": self.plan_id}, timeout=_CHECK_TIMEOUT_S)
         for c in r["checks"]:
             self.say(f"  {'ok     ' if c['ok'] else 'PROBLEM'} {c['key']:<24} {c['verdict']}")
-            if not c["ok"] and c.get("excerpt"):
+            self.say(f"          {'':<24} {c['reference_verdict']}")
+            if c["status"] != "failed" and c.get("excerpt"):
                 self.say("      " + str(c["excerpt"])[:800].replace("\n", "\n      "))
-        self.say(
-            "all checks run and fail with no app: good"
-            if r["ok"]
-            else "the planner has the results; ask it to fix the checks"
-        )
+            if c.get("reference_ok") is False and c.get("reference_excerpt"):
+                self.say("      " + str(c["reference_excerpt"])[:800].replace("\n", "\n      "))
+        if not r["ok"]:
+            self.say("the planner has the results; ask it to fix what has a problem")
+        elif r.get("satisfiable"):
+            self.say("every check fails with no app and passes against the reference: good")
+        else:
+            self.say(
+                "every check runs and fails with no app, but no reference app shows they"
+                " can pass; ask the planner for one"
+            )
         self.say(f"evidence: {r.get('evidence_dir')}")
 
     def launch(self, arg: str) -> bool:

@@ -59,6 +59,7 @@ from .deadline import DeadlineWatchdog
 from .egress import EgressPolicyError, check_policy, probe, probe_targets
 from .evaluation import (
     LABEL_CRITERION,
+    REFERENCE_URL,
     CriterionResult,
     EvaluationError,
     Evaluator,
@@ -248,8 +249,12 @@ class StopEvidence:
 
 
 def _atomic_write(path: Path, data: str, mode: int) -> None:
+    _atomic_write_bytes(path, data.encode(), mode)
+
+
+def _atomic_write_bytes(path: Path, data: bytes, mode: int) -> None:
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(data)
+    tmp.write_bytes(data)
     os.chmod(tmp, mode)
     os.replace(tmp, path)
 
@@ -2827,33 +2832,32 @@ class Controller:
         attempt.mkdir(mode=0o755)
         # The checks run from a controller-owned copy, exactly the draft's bytes.
         agreement = frozen.freeze(attempt / "agreement", draft.brief, draft.checks)
-        results: dict[str, Any] = {}
+        reference_dir: Path | None = None
+        if draft.reference:
+            reference_dir = attempt / "reference"
+            for rel, data in draft.reference.items():
+                target = reference_dir / rel
+                target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                _atomic_write_bytes(target, data, 0o644)
         automated = [c for c in agreement.criteria if c.kind == "automated"]
-        for index, c in enumerate(automated):
-            out = attempt / f"{index}-{c.key}"
-            out.mkdir(mode=0o755)
-            self._chown(out, self._settings.evaluator_uid, self._settings.evaluator_gid)
-            spec = check_container_spec(
-                self._settings,
-                name=f"dgx-autonomy-dryrun-{plan.id}-{n}-{index}",
-                labels={LABEL_PLAN: plan.id, LABEL_ROLE: "dry-run", LABEL_CRITERION: c.key},
-                key=c.key,
-                runner=c.runner,
-                test=c.test,
-                checks_dir=agreement.checks,
-                out_dir=out,
-                url=planning.EMPTY_TARGET,
+        results = self._run_dry_checks(
+            plan, n, attempt, agreement, automated, url=planning.EMPTY_TARGET, suffix=""
+        )
+        reference_results = None
+        if reference_dir is not None:
+            reference_results = self._run_dry_checks(
+                plan,
+                n,
+                attempt,
+                agreement,
+                automated,
+                url=REFERENCE_URL,
+                suffix="-reference",
+                reference_dir=reference_dir,
             )
-            logs = ""
-            try:
-                code, logs = self._runtime.run_to_completion(spec, self._settings.dry_run_timeout_s)
-            except DockerError as exc:
-                result = CriterionResult("error", f"the check did not complete: {exc}")
-            else:
-                result = classify(c.runner, code, out, logs)
-            _atomic_write(attempt / f"{index}-{c.key}.log", logs, 0o644)
-            results[c.key] = result.as_dict()
-        summary = planning.dry_run_summary(agreement.digest, agreement.criteria, results)
+        summary = planning.dry_run_summary(
+            agreement.digest, agreement.criteria, results, reference_results
+        )
         summary.update(n=n, at=self._clock.now().isoformat(), evidence_dir=str(attempt))
         _atomic_write(attempt / "dry-run.json", json.dumps(summary, indent=2), 0o644)
         make_world_readable(attempt)
@@ -2869,6 +2873,47 @@ class Controller:
             except ConversationError as exc:
                 log.warning("plan %s: cannot tell the planner about the dry run: %s", plan.id, exc)
         return summary
+
+    def _run_dry_checks(
+        self,
+        plan: Plan,
+        n: int,
+        attempt: Path,
+        agreement: frozen.Frozen,
+        automated: list[frozen.Criterion],
+        *,
+        url: str,
+        suffix: str,
+        reference_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        """Each automated check once, in its own evaluator container, against `url`."""
+        results: dict[str, Any] = {}
+        for index, c in enumerate(automated):
+            out = attempt / f"{index}-{c.key}{suffix}"
+            out.mkdir(mode=0o755)
+            self._chown(out, self._settings.evaluator_uid, self._settings.evaluator_gid)
+            spec = check_container_spec(
+                self._settings,
+                name=f"dgx-autonomy-dryrun-{plan.id}-{n}-{index}{suffix}",
+                labels={LABEL_PLAN: plan.id, LABEL_ROLE: "dry-run", LABEL_CRITERION: c.key},
+                key=c.key,
+                runner=c.runner,
+                test=c.test,
+                checks_dir=agreement.checks,
+                out_dir=out,
+                url=url,
+                reference_dir=reference_dir,
+            )
+            logs = ""
+            try:
+                code, logs = self._runtime.run_to_completion(spec, self._settings.dry_run_timeout_s)
+            except DockerError as exc:
+                result = CriterionResult("error", f"the check did not complete: {exc}")
+            else:
+                result = classify(c.runner, code, out, logs)
+            _atomic_write(attempt / f"{index}-{c.key}{suffix}.log", logs, 0o644)
+            results[c.key] = result.as_dict()
+        return results
 
     def plan_launch(self, args: Mapping[str, Any]) -> dict[str, Any]:
         """Freeze exactly the reviewed draft (`digest`) and start the run.

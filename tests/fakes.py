@@ -123,6 +123,7 @@ class FakeRuntime:
         # Dry runs of planning checks (run_to_completion): criterion key -> outcome.
         # None: the check never finishes (a timeout).
         self.dry_run_outcomes: dict[str, EvaluatorOutcome | None] = {}
+        self.reference_outcomes: dict[str, EvaluatorOutcome | None] = {}
         # Called when an evaluator starts, e.g. to have the "agent" change the project.
         self.on_evaluator: list[Callable[[ContainerSpec], None]] = []
         self._next_pid = 100
@@ -250,12 +251,17 @@ class FakeRuntime:
             # A check against an empty target: by default it runs and fails.
             key = spec.labels[LABEL_CRITERION]
             playwright = "playwright" in " ".join(spec.command)
-            default = (
-                playwright_fails("net::ERR_CONNECTION_REFUSED at http://127.0.0.1:3000/")
-                if playwright
-                else pytest_fails("httpx.ConnectError: [Errno 111] Connection refused")
-            )
-            outcome = self.dry_run_outcomes.get(key, default)
+            if any(m.target == "/reference" for m in spec.mounts):
+                # Against the planner's reference app: by default it passes.
+                default = playwright_passes() if playwright else pytest_passes()
+                outcome = self.reference_outcomes.get(key, default)
+            else:
+                default = (
+                    playwright_fails("net::ERR_CONNECTION_REFUSED at http://127.0.0.1:3000/")
+                    if playwright
+                    else pytest_fails("httpx.ConnectError: [Errno 111] Connection refused")
+                )
+                outcome = self.dry_run_outcomes.get(key, default)
             if outcome is None:
                 raise DockerError(f"{spec.name}: no result in {timeout_s:.0f}s")
             out = next(Path(m.source) for m in spec.mounts if m.target == EVALUATOR_OUT_DIR)

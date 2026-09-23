@@ -73,6 +73,17 @@ need an operator with sudo. Everything after this runs as `jim` without Docker a
    llama-server runs as uid 65534. The model directory and files must be
    world-readable (`chmod -R o+rX ~/models/qwen3.6-35b-a3b`).
 
+   The preferred model, Qwen3.8-Flash-Next, is three shards, 83.8 GiB in total. It
+   took about 29 minutes to download on hugo-dgx1. It needs the reservation to run
+   (see [Models: qualification](#models-qualification)):
+
+   ```bash
+   ~/.local/bin/uvx --from huggingface_hub hf download unsloth/Qwen3.8-Flash-Next-GGUF \
+     --include "UD-Q3_K_XL/*" --revision 38bb39ee97821de2c9009abb7e93950eec396e66 \
+     --local-dir ~/models/qwen3.8-flash-next
+   chmod -R o+rX ~/models/qwen3.8-flash-next
+   ```
+
 3. **Build the images and start the controller** as the operator:
 
    ```bash
@@ -175,7 +186,7 @@ model writes the agreement as a draft in its own workspace: `draft/brief.md` and
 ```text
 you> TEXT            a message to the planner; its reply is streamed
 /draft               the draft, its digest, and why it cannot be launched (if so)
-/checks              dry-run every automated check against an empty target
+/checks              dry-run each automated check against nothing, and against the reference app
 /launch [HOURS]      freeze exactly the draft shown and start the run (budget <= 40 h)
 /status  /interrupt  /close  /detach (or Ctrl-D)
 ```
@@ -190,13 +201,20 @@ you> TEXT            a message to the planner; its reply is streamed
   the planner finishes its turn meanwhile. `plan --attach` prints the conversation so
   far and continues it. A planner sandbox that went down (a DGX restart) is started
   again; the next message resumes the conversation.
-- **The dry run proves the checks execute.** `/checks` copies the draft into a
-  controller-owned directory and runs each automated check in an evaluator container
-  (the same image, user and limits as an evaluation) with `APP_URL` pointing at
-  nothing. A working check *fails* there. A check that errors does not run (a syntax
-  error, a wrong file name); one that *passes* checks nothing. The result goes to the
-  operator, and to the planner as context (it does not start a turn). Evidence is in
-  `plans/<id>/dryruns/dry-<n>/`.
+- **The dry run proves the checks execute, and can pass.** `/checks` copies the
+  draft into a controller-owned directory and runs each automated check in an
+  evaluator container (the same image, user and limits as an evaluation). The first
+  pass points `APP_URL` at nothing, where a working check *fails*. A check that
+  errors there does not run (a syntax error, a wrong file name), and one that
+  *passes* checks nothing. The second pass happens when the planner has written a
+  throwaway reference app in `draft/reference/` (static files; fixed sample data
+  instead of live APIs). The container then serves it on its own loopback, and every
+  check must *pass* against it. This catches checks that no app could satisfy. On
+  hugo-dgx1 a planner wrote `getByLabel('Total')` next to a label "Per-Person
+  Total", a strict-mode violation whatever the app does. The reference is not part
+  of the agreement: it is not in the digest, it is never frozen, and the builder
+  never sees it. The result goes to the operator, and to the planner as context (it
+  does not start a turn). Evidence is in `plans/<id>/dryruns/dry-<n>/`.
 - **Launch freezes what the operator reviewed.** `/launch` shows the draft and its
   digest and asks for confirmation (and for `force` when this exact draft has not
   passed a dry run). The controller refuses when the draft on disk no longer has that
