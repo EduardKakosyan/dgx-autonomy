@@ -6,6 +6,7 @@ import json
 import os
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -87,7 +88,7 @@ def test_start_attaches_to_an_existing_conversation_without_resending(
         200, {"items": [{"kind": "MessageEvent"}]}
     )
     adapter = OpenHandsConversations(http)
-    monkeypatch.setattr(adapter, "_create", lambda request: pytest.fail("must not create"))
+    monkeypatch.setattr(adapter, "_create", lambda request, tools: pytest.fail("must not create"))
     from dgx_autonomy.ports import ConversationRequest, LlmEndpoint
 
     request = ConversationRequest(
@@ -107,8 +108,15 @@ def test_start_sends_the_brief_once_after_creating(monkeypatch: pytest.MonkeyPat
     http.routes[BASE] = lambda method, body: HttpResponse(200 if created else 404, {})
     http.routes[f"{BASE}/events/search?source=user&limit=100"] = HttpResponse(200, {"items": []})
     http.routes[f"{BASE}/events"] = HttpResponse(200, {"success": True})
+    http.routes[f"{SERVER.url}/api/tools/"] = HttpResponse(200, ["terminal", "start_demo"])
     adapter = OpenHandsConversations(http)
-    monkeypatch.setattr(adapter, "_create", lambda request: created.append(request.conversation_id))
+    tools: list[tuple[str, ...]] = []
+
+    def create(request: Any, extra: tuple[str, ...]) -> None:
+        created.append(request.conversation_id)
+        tools.append(extra)
+
+    monkeypatch.setattr(adapter, "_create", create)
     from dgx_autonomy.ports import ConversationRequest, LlmEndpoint
 
     request = ConversationRequest(
@@ -120,6 +128,8 @@ def test_start_sends_the_brief_once_after_creating(monkeypatch: pytest.MonkeyPat
     )
     adapter.start(request)
     assert created == [CID]
+    # Only the builder tools this Agent Server registers (an older image lacks some).
+    assert tools == [("start_demo",)]
     posts = [(url, body) for method, url, body in http.calls if method == "POST"]
     assert posts == [
         (
@@ -197,3 +207,60 @@ def test_context_tokens_come_from_the_agents_latest_usage() -> None:
     assert context_tokens({"stats": {"usage_to_metrics": {"agent": {}}}}) is None
     assert context_tokens({"stats": {"usage_to_metrics": {"agent": {
         "accumulated_token_usage": {"per_turn_token": True}}}}}) is None  # fmt: skip
+
+
+def test_a_conversation_created_with_a_missing_tool_is_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dgx_autonomy.ports import ConversationRequest, LlmEndpoint
+
+    http = FakeHttp()
+    sends: list[str] = []
+    http.routes[BASE] = HttpResponse(200, {"success": True})  # exists; DELETE succeeds
+    http.routes[f"{BASE}/events/search?source=user&limit=100"] = HttpResponse(200, {"items": []})
+
+    def events(method: str, body: Any) -> HttpResponse:
+        sends.append(method)
+        if len(sends) == 1:
+            return HttpResponse(
+                500, {"exception": "\"ToolDefinition 'write_handoff' is not registered\""}
+            )
+        return HttpResponse(200, {"success": True})
+
+    http.routes[f"{BASE}/events"] = events
+    http.routes[f"{SERVER.url}/api/tools/"] = HttpResponse(200, ["start_demo"])
+    adapter = OpenHandsConversations(http)
+    created: list[tuple[str, ...]] = []
+    monkeypatch.setattr(adapter, "_create", lambda request, extra: created.append(extra))
+    request = ConversationRequest(
+        server=SERVER,
+        conversation_id=CID,
+        working_dir="/workspace/project",
+        llm=LlmEndpoint("m", "http://inference:8080/v1", 65536),
+        message="the brief",
+    )
+    assert adapter.start(request) == CID
+    assert ("DELETE", BASE, None) in http.calls
+    assert created == [("start_demo",)] and len(sends) == 2
+
+
+def test_idempotent_requests_survive_a_reset_connection() -> None:
+    import httpx
+
+    from dgx_autonomy.inference import HttpxClient
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.method)
+        if len(seen) % 2 == 1:
+            raise httpx.ReadError("Connection reset by peer")
+        return httpx.Response(200, json={"ok": True})
+
+    client = HttpxClient(httpx.MockTransport(handler))
+    assert client.request("DELETE", "http://agent/api/conversations/x").ok
+    assert seen == ["DELETE", "DELETE"]
+    seen.clear()
+    res = client.request("POST", "http://agent/api/conversations/x/events", json_body={})
+    assert res.status == 0 and "Connection reset" in str(res.error)
+    assert seen == ["POST"]  # a message is never sent twice

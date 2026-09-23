@@ -48,6 +48,7 @@ from .ports import (
 )
 
 CONVERSATIONS = "/api/conversations"
+TOOLS = "/api/tools/"
 _NAMESPACE = uuid.UUID("5f0c1d0e-8a57-4d8e-9c55-6a2f3f1d9b21")
 _TEXT_LIMIT = 300
 _EVENT_FILE = re.compile(r"^event-(\d+)-[0-9a-fA-F-]+\.json$")
@@ -163,13 +164,33 @@ class OpenHandsConversations:
 
     def start(self, request: ConversationRequest) -> str:
         cid = request.conversation_id
-        if not self.exists(request.server, cid):
-            self._create(request)
-        if not self._has_user_message(request.server, cid):
-            self._send(request.server, cid, request.message, run=True)
+        server = request.server
+        if not self.exists(server, cid):
+            self._create(request, self._builder_tools(request))
+        if not self._has_user_message(server, cid):
+            try:
+                self._send(server, cid, request.message, run=True)
+            except ConversationError as exc:
+                if "is not registered" not in str(exc):
+                    raise
+                # Created with a tool this Agent Server lacks (a sandbox from an older
+                # image): nothing has run in it yet, so it is replaced.
+                self._call(server, "DELETE", f"{CONVERSATIONS}/{cid}")
+                self._create(request, self._builder_tools(request))
+                self._send(server, cid, request.message, run=True)
         return cid
 
-    def _create(self, request: ConversationRequest) -> None:
+    def _builder_tools(self, request: ConversationRequest) -> tuple[str, ...]:
+        """The builder tools this Agent Server has registered (all of them from the
+        current agent image; a sandbox created from an older image may lack some)."""
+        if not request.builder_tools:
+            return ()
+        res = self._call(request.server, "GET", TOOLS, accept=frozenset({404}))
+        if res.status == 404 or not isinstance(res.body, list):
+            return BUILDER_TOOLS
+        return tuple(t for t in BUILDER_TOOLS if t in res.body)
+
+    def _create(self, request: ConversationRequest, extra_tools: Sequence[str]) -> None:
         # Imported here: the SDK pulls in LiteLLM and the tool registry, which the
         # CLI and the unit tests never need.
         from openhands.sdk import LLM, Conversation
@@ -191,8 +212,8 @@ class OpenHandsConversations:
         from openhands.sdk import Tool
 
         agent = get_default_agent(llm=llm, cli_mode=True)
-        if request.builder_tools:
-            extra = [Tool(name=name) for name in BUILDER_TOOLS]
+        if extra_tools:
+            extra = [Tool(name=name) for name in extra_tools]
             agent = agent.model_copy(update={"tools": [*agent.tools, *extra]})
         workspace = RemoteWorkspace(
             host=request.server.url,

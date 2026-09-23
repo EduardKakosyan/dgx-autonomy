@@ -163,8 +163,8 @@ def _detail(res: HttpResponse) -> str:
 class HttpxClient:
     """HttpClient over httpx. Connection failures become status 0, never exceptions."""
 
-    def __init__(self) -> None:
-        self._client = httpx.Client()
+    def __init__(self, transport: httpx.BaseTransport | None = None) -> None:
+        self._client = httpx.Client(transport=transport)
 
     def request(
         self,
@@ -175,12 +175,21 @@ class HttpxClient:
         headers: Mapping[str, str] | None = None,
         timeout: float = 5.0,
     ) -> HttpResponse:
-        try:
-            resp = self._client.request(
-                method, url, json=json_body, headers=dict(headers or {}), timeout=timeout
-            )
-        except httpx.HTTPError as exc:
-            return HttpResponse(status=0, error=f"{type(exc).__name__}: {exc}")
+        # A server that failed a request may close the pooled connection under the next
+        # one ("connection reset"); idempotent requests get one more try on a new one.
+        attempts = 2 if method.upper() in ("GET", "HEAD", "DELETE") else 1
+        for attempt in range(attempts):
+            try:
+                resp = self._client.request(
+                    method, url, json=json_body, headers=dict(headers or {}), timeout=timeout
+                )
+                break
+            except httpx.TransportError as exc:
+                if attempt + 1 < attempts and not isinstance(exc, httpx.TimeoutException):
+                    continue
+                return HttpResponse(status=0, error=f"{type(exc).__name__}: {exc}")
+            except httpx.HTTPError as exc:
+                return HttpResponse(status=0, error=f"{type(exc).__name__}: {exc}")
         try:
             body: Any = resp.json()
         except ValueError:

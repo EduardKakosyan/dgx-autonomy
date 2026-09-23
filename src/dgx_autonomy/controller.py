@@ -2104,7 +2104,8 @@ class Controller:
             self.paths(run_id).conversations_dir, conversation_id, 0, 60, last=True
         )
         wanted = ("ActionEvent", "MessageEvent", "AgentErrorEvent")
-        picked = [e for e in events if e.kind in wanted and e.source != "user"]
+        # An empty message summarizes to its kind; it says nothing.
+        picked = [e for e in events if e.kind in wanted and e.source != "user" and e.text != e.kind]
         return [f"{e.kind}: {_clip(e.text, 240)}" for e in picked[-limit:]]
 
     def _verified(self, run_id: str) -> dict[str, Any]:
