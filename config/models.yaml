@@ -57,20 +57,27 @@ models:
       - UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf
     gguf: qwen3.8-flash-next/UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
     size_bytes: 89986353824
-    ctx: 65536
+    # Its native context (qwen4exp.context_length). Only 12 of its 48 layers keep a
+    # KV cache (full_attention_interval 4, 2 KV heads of 256): about 13 KB a token at
+    # q8_0, so 256K costs about 3.2 GiB. The rest are fixed-size recurrent state.
+    # Qualified at 65 536 on 2026-09-23 (below); raised for long unattended runs, where
+    # the 64K window filled in under an hour (55 781 tokens on the weather run).
+    ctx: 262144
     parallel: 1
     template: embedded
     cache_type_k: q8_0
     cache_type_v: q8_0
-    # Thinking is bounded (8192), and a response may write a large file after it.
-    max_output_tokens: 24576
-    reasoning_budget: 8192
+    # The run has up to 40 hours: thinking long is fine. The budget only stops a
+    # runaway thinking loop; a response may still write a large file after it.
+    max_output_tokens: 65536
+    reasoning_budget: 32768
     # Its template keeps every turn's thinking in the history by default; in a long
     # agent conversation that fills the context several times faster.
     extra_args: ["--no-reasoning-preserve"]
-    # 24 576 tokens at 19.5 tokens/s (measured at 51K context) plus a full prefill.
-    request_timeout_s: 1800
-    status: qualified
+    # 65 536 tokens at about 15 tokens/s (decode slows as the context grows) plus a
+    # full prefill of 256K.
+    request_timeout_s: 5400
+    status: unqualified
     measured:
       # dgx-autonomy qualify, 2026-09-23T23:20Z (reservation held), record
       # qualification/qwen3.8-flash-next/20260923T232041.json

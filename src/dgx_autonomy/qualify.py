@@ -561,9 +561,10 @@ class Qualifier:
                 "messages": _user(long_prompt(target, secret)),
                 "temperature": 0,
                 # Room for a reasoning model to think before it answers.
-                "max_tokens": 4096,
+                "max_tokens": min(model.max_output_tokens, 16384),
             },
-            1800,
+            # A prompt of most of a 256K context takes minutes to prefill alone.
+            max(1800, model.request_timeout_s),
         )
         usage = answer.get("usage") or {}
         timings = answer.get("timings") or {}

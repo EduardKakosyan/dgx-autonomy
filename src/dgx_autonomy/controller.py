@@ -53,7 +53,13 @@ from pathlib import Path
 from typing import Any
 
 from . import checkpoints, frozen, planning, qualify
-from .agent_files import AgentFileError, make_world_readable, read_json
+from .agent_files import (
+    AgentFileError,
+    make_world_readable,
+    open_dir,
+    read_bytes_at,
+    read_json,
+)
 from .config import ConfigError, ModelCatalog, Settings, load_models
 from .deadline import DeadlineWatchdog
 from .egress import EgressPolicyError, check_policy, probe, probe_targets
@@ -69,6 +75,7 @@ from .evaluation import (
     failure_message,
 )
 from .inference import InferenceError, InferenceManager
+from .notify import Notifier
 from .openhands_adapter import (
     ConversationError,
     conversation_id_for,
@@ -76,6 +83,7 @@ from .openhands_adapter import (
     persisted_events,
     persisted_status,
 )
+from .plan_repl import finish_message
 from .ports import (
     Clock,
     ContainerState,
@@ -140,6 +148,9 @@ FAULT_TARGETS = ("controller", "sandbox", "inference")
 MAX_BRIEF_BYTES = 256 * 1024
 MAX_DEMO_REQUEST_BYTES = 16 * 1024
 MAX_HANDOFF_BYTES = 256 * 1024
+# report_progress appends here (handoff_tool.py); the controller forwards new lines.
+PROGRESS_FILE = "progress.jsonl"
+MAX_PROGRESS_BYTES = 1024 * 1024
 MAX_DEMO_COMMAND = 4096
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # How many recent events to search for the builder's completion claim, and its finish
@@ -276,6 +287,8 @@ def agent_message(brief: str, *, checks: bool = False) -> str:
             " Criteria marked human_judgment are judged by the operator later.\n"
         )
     text += (
+        "When you finish a piece of the work (a feature, a fix, a passing test suite), say so"
+        " with report_progress in a sentence or two; the operator follows these reports.\n"
         "A long task may continue in a fresh conversation: when a message titled HANDOFF"
         " REQUEST arrives, answer it with the write_handoff tool. If no viable path is left"
         " (a missing capability or permission, not a bug you have not fixed yet), say so"
@@ -370,6 +383,45 @@ def _clip(text: str, limit: int = 1500) -> str:
     return text if len(text) <= limit else "…" + text[-limit:]
 
 
+def _roadmap_line(handoff: Mapping[str, Any] | None) -> str:
+    """ "12 roadmap items: 7 done, 2 in progress, 3 todo" (the builder's account)."""
+    items = (handoff or {}).get("roadmap") or []
+    if not isinstance(items, list) or not items:
+        return "no roadmap in the handoff"
+    counts: dict[str, int] = {}
+    for item in items:
+        status = str(item.get("status")) if isinstance(item, dict) else "?"
+        counts[status] = counts.get(status, 0) + 1
+    parts = ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in sorted(counts.items()))
+    return f"{len(items)} roadmap items ({parts}), as the builder reports them"
+
+
+def _evaluation_line(ev: Evaluation) -> str:
+    results = ev.results or {}
+    passed = sorted(k for k, r in results.items() if r.get("status") == "passed")
+    failed = sorted(k for k, r in results.items() if r.get("status") != "passed")
+    line = f"evaluation #{ev.n} ({ev.trigger}) {ev.status}: {len(passed)}/{len(results)} passed"
+    if failed:
+        line += "; not passed: " + ", ".join(failed)
+    # The detail says why checks did not run (no demo, an infrastructure error); for
+    # plain failures the keys above already say it.
+    ran = all(results[k].get("status") in ("passed", "failed") for k in failed)
+    if ev.detail and ev.status != "passed" and not (failed and ran):
+        line += f" ({_clip(ev.detail, 200)})"
+    return line
+
+
+def _dry_run_line(summary: Mapping[str, Any]) -> str:
+    checks = summary.get("checks") or []
+    bad = [c["key"] for c in checks if not c.get("ok")]
+    line = f"dry run #{summary.get('n')}: {len(checks) - len(bad)}/{len(checks)} checks behave"
+    if summary.get("reference"):
+        line += " (fail on nothing, pass on the reference app)"
+    else:
+        line += " (fail on nothing; no reference app, so not shown satisfiable)"
+    return line + (f"; problems: {', '.join(bad)}" if bad else "")
+
+
 def demo_request_problem(command: object, port: object, demo_port: int) -> str | None:
     """Why a start_demo request is refused, or None when it is acceptable."""
     if not isinstance(command, str) or not command.strip():
@@ -426,6 +478,12 @@ class Controller:
         # When each conversation was nudged after an error (in memory: a restarted
         # controller starts counting again).
         self._error_nudges: dict[str, list[datetime]] = {}
+        # The operator's feed (notify.py), and what it last said about each planner's
+        # turn, each builder's progress log and the latest qualification.
+        self._notes = Notifier(settings.state_db.parent / "notifications.jsonl")
+        self._planner_seen: dict[str, tuple[str | None, int]] = {}
+        self._progress_seen: dict[str, int] = {}
+        self._qualify_seen: tuple[str, str] | None = None
         self._projects: SnapshotPort = snapshots if snapshots is not None else GitSnapshots()
         self._qualifier = qualify.Qualifier(
             settings=settings,
@@ -535,6 +593,7 @@ class Controller:
             "retire": self.retire,
             "qualify.start": self.qualify_start,
             "qualify.status": self.qualify_status,
+            "notifications": self.notifications,
         }
         handler = handlers.get(op)
         if handler is None:
@@ -615,6 +674,13 @@ class Controller:
             source,
             len(agreement.criteria),
             agreement.digest,
+        )
+        automated = sum(1 for c in agreement.criteria if c.kind == "automated")
+        self._note(
+            "run.launched",
+            f"launched with {run.model_key}; deadline {run.deadline_at}; {automated} automated"
+            f" check(s), {len(agreement.criteria) - automated} for human judgment",
+            run_id=run.id,
         )
         self._wake.set()
         return {
@@ -1418,8 +1484,13 @@ class Controller:
             for plan in self._state.active_plans():
                 try:
                     self._reconcile_plan(plan)
+                    self._watch_planner(plan)
                 except Exception:
                     log.exception("reconcile plan %s failed", plan.id)
+            try:
+                self._watch_qualification()
+            except Exception:
+                log.exception("qualification watch failed")
             # A demo relaunched for an ended run (by a stop, or at startup) still has
             # to be seen listening; ended runs are not reconciled otherwise.
             for demo in self._state.demos_in_state("starting"):
@@ -1464,6 +1535,7 @@ class Controller:
             if not self._state.try_set_phase(run.id, "running"):
                 return
             log.info("%s is running", run.id)
+            self._note("run.running", "the builder has started working", run_id=run.id)
             run = self._state.get_run(run.id) or run
         if run.phase == "running" and run.conversation_id is not None:
             rollover = self._state.open_rollover(run.id)
@@ -1475,6 +1547,7 @@ class Controller:
                     self._observe(run)
             if self._phase_is(run.id, "running"):
                 self._step_demo(run)
+                self._step_progress(run)
 
     def _fail(self, run: Run, op: Operation, error: str) -> None:
         log.error("%s: %s failed: %s", run.id, op.kind, error)
@@ -1653,6 +1726,11 @@ class Controller:
             if not self._state.try_set_phase(run.id, "finished"):
                 return
             log.info("%s finished", run.id)
+            self._note(
+                "run.ended",
+                "finished; claimed only (the run has no automated checks)",
+                run_id=run.id,
+            )
             self._publish_project(run.id)
         elif snap.status == "stuck":
             # The SDK's stuck detector fired: a fresh conversation, with a diagnosis.
@@ -1763,9 +1841,11 @@ class Controller:
                 rec.id, status="failed", error=str(exc), now=self._clock.now()
             )
             log.error("%s: recovery #%d failed: %s", run.id, rec.n, exc)
+            self._note("recovery", f"recovery #{rec.n} ({rec.cause}) failed: {exc}", run_id=run.id)
             return False
         self._state.finish_recovery(rec.id, status="done", error=None, now=self._clock.now())
         log.info("%s: recovered (#%d): %s", run.id, rec.n, steps)
+        self._note("recovery", f"recovered (#{rec.n}) from {rec.cause}", run_id=run.id)
         return True
 
     def _save_steps(self, rec: Recovery, steps: dict[str, Any]) -> None:
@@ -1918,6 +1998,120 @@ class Controller:
             raise RequestError(f"no qualification of {key or 'any model'} yet")
         return latest
 
+    # --- the operator's feed (notify.py) --------------------------------------------
+
+    def _note(
+        self, kind: str, text: str, *, run_id: str | None = None, plan_id: str | None = None
+    ) -> None:
+        self._notes.emit(kind, text, now=self._clock.now(), run_id=run_id, plan_id=plan_id)
+
+    def notifications(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Notifications after `since` (-1: only new ones), waiting up to `wait_s`."""
+        try:
+            since = int(args.get("since", -1))
+            limit = min(500, max(1, int(args.get("limit", 200))))
+            wait_s = float(args.get("wait_s", 0))
+        except (TypeError, ValueError):
+            raise RequestError("since and limit must be integers, wait_s a number") from None
+        if not 0 <= wait_s <= 300:
+            raise RequestError("wait_s must be in [0, 300]")
+        return self._notes.read(since, limit=limit, wait_s=wait_s)
+
+    def _watch_planner(self, plan: Plan) -> None:
+        """Tell the operator when the planner's turn ends: it is waiting for them."""
+        if not plan.active or plan.conversation_id is None:
+            return
+        status = self._plan_conversation_status(plan)
+        before, seen = self._planner_seen.get(plan.id, (None, 0))
+        self._planner_seen[plan.id] = (status, seen)
+        if status == "running" or before != "running":
+            return
+        said = ""
+        while True:
+            page = self.plan_events({"plan_id": plan.id, "since": seen, "limit": 500})
+            for e in page["events"]:
+                if e["source"] != "agent":
+                    continue
+                if e["kind"] == "MessageEvent":
+                    said = e["text"]
+                elif (message := finish_message(e["text"])) is not None:
+                    said = message
+            if page["next"] == seen:
+                break
+            seen = page["next"]
+        self._planner_seen[plan.id] = (status, seen)
+        self._note(
+            "plan.waiting",
+            f"the planner's turn ended ({status}); it waits for you: {_clip(said, 1200)}",
+            plan_id=plan.id,
+        )
+
+    def _watch_qualification(self) -> None:
+        job = self._qualifier.job
+        if job is None or job.status == "running":
+            return
+        key = (job.model_key, str(job.started_at))
+        if self._qualify_seen == key:
+            return
+        self._qualify_seen = key
+        steps = ", ".join(
+            f"{name} {'ok' if (r or {}).get('ok') else 'FAILED'}" for name, r in job.steps.items()
+        )
+        long_prompt = job.steps.get("long_prompt") or {}
+        speed = (
+            f"; {long_prompt.get('prompt_tokens')}-token prompt at"
+            f" {long_prompt.get('prefill_tokens_per_s')} tok/s prefill,"
+            f" {long_prompt.get('decode_tokens_per_s')} tok/s decode"
+            if long_prompt.get("prompt_tokens")
+            else ""
+        )
+        failures = f"; failures: {'; '.join(job.failures)}" if job.failures else ""
+        self._note("qualify.done", f"{job.model_key} {job.status}: {steps}{speed}{failures}")
+
+    def _step_progress(self, run: Run) -> None:
+        """Forward what the builder reported with report_progress (its own account)."""
+        agent_dir = self.paths(run.id).agent_dir
+        try:
+            size = os.stat(agent_dir / ".dgx" / PROGRESS_FILE, follow_symlinks=False).st_size
+        except OSError:
+            return
+        seen_file = self.paths(run.id).root / "progress.seen"
+        seen = self._progress_seen.get(run.id)
+        if seen is None:
+            try:
+                seen = int(seen_file.read_text().split()[0])
+            except (OSError, ValueError, IndexError):
+                seen = 0
+            self._progress_seen[run.id] = seen
+        if self._progress_seen.get(f"{run.id}:size") == size:
+            return
+        try:
+            with open_dir(agent_dir, ".dgx") as fd:
+                raw = read_bytes_at(fd, PROGRESS_FILE, MAX_PROGRESS_BYTES)
+        except (FileNotFoundError, AgentFileError) as exc:
+            log.warning("%s: cannot read the progress log: %s", run.id, exc)
+            self._progress_seen[f"{run.id}:size"] = size
+            return
+        lines = raw.decode(errors="replace").splitlines()
+        for line in lines[seen : seen + 20]:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status") or "note")[:20]
+            item = str(entry.get("item") or "")[:160]
+            summary = str(entry.get("summary") or "")[:600]
+            self._note(
+                "progress", f"(builder's report) {status}: {item} - {summary}", run_id=run.id
+            )
+        seen = min(len(lines), seen + 20)
+        self._progress_seen[run.id] = seen
+        if seen == len(lines):
+            self._progress_seen[f"{run.id}:size"] = size
+        _atomic_write(seen_file, f"{seen}\n", 0o644)
+
     def _inference_ready(self) -> tuple[bool, str]:
         status = self._inference.status()
         return status.ready, f"{status.container}: {status.health} {status.detail or ''}".strip()
@@ -2040,10 +2234,16 @@ class Controller:
         if handoff is not None and not problems:
             return self._record_checkpoint(run, row, "agent_handoff", handoff, [])
         waited = (self._clock.now() - row.attempted_at).total_seconds()
-        if waited <= self._settings.handoff_timeout_s:
+        # The step in flight finishes before the handoff is written; with a long
+        # thinking budget one response alone can take most of request_timeout_s.
+        timeout = max(
+            self._settings.handoff_timeout_s,
+            self._catalog.get(run.model_key).request_timeout_s + self._settings.handoff_timeout_s,
+        )
+        if waited <= timeout:
             return None
         previous = self._state.get_checkpoint(run.current_checkpoint_id or "")
-        why = f"no valid handoff within {self._settings.handoff_timeout_s / 60:.0f} min"
+        why = f"no valid handoff within {timeout / 60:.0f} min"
         fallback = checkpoints.fallback_handoff(
             previous.handoff if previous else None,
             why=why,
@@ -2167,6 +2367,11 @@ class Controller:
             now=self._clock.now(),
         )
         log.info("%s: checkpoint #%d (%s) recorded", run.id, ckpt.n, source)
+        self._note(
+            "handoff",
+            f"checkpoint #{ckpt.n} ({source}, {row.reason}): {_roadmap_line(handoff)}",
+            run_id=run.id,
+        )
         return ckpt
 
     def _quiet_old_conversation(self, run_id: str, conversation_id: str) -> None:
@@ -2233,6 +2438,11 @@ class Controller:
             if ev.status == "failed" and ev.trigger == "claim" and ev.delivered_at is None:
                 self._state.mark_delivered(ev.id, self._clock.now())
         log.info("%s: conversation #%d (%s) is the run's now", run.id, row.n, row.conversation_id)
+        self._note(
+            "rollover",
+            f"fresh conversation #{row.n} ({row.reason}) continues from the checkpoint",
+            run_id=run.id,
+        )
 
     def _demo_line(self, run_id: str) -> str:
         demo = self._state.get_demo(run_id)
@@ -2289,6 +2499,7 @@ class Controller:
             return
         self._error_nudges[cid] = [*nudges, now]
         log.warning("%s: conversation errored; nudge %d", run.id, len(nudges) + 1)
+        self._note("trouble", f"the conversation errored; nudge {len(nudges) + 1}", run_id=run.id)
 
     def _context_pressure(self, run: Run, snap: ConversationSnapshot) -> str | None:
         if snap.context_tokens is None:
@@ -2375,6 +2586,9 @@ class Controller:
             }
             self._state.record_blocked(run.id, json.dumps(record))
             log.warning("%s: blocker confirmed: %s", run.id, blocker["missing_capability"])
+            self._note(
+                "blocked", f"blocker confirmed: {blocker['missing_capability']}", run_id=run.id
+            )
             self._state.request_stop(run.id, "blocked")
             self.stop_agent(run.id, block=False)
             return
@@ -2443,6 +2657,12 @@ class Controller:
                 claim_text=claim_text,
             )
             log.info("%s: completion claimed; evaluation #%d: %s", run.id, ev.n, claim_text)
+            self._note(
+                "claim",
+                f"the builder claims completion (its words; evaluation #{ev.n} checks it):"
+                f" {_clip(claim_text or '', 400)}",
+                run_id=run.id,
+            )
         self._advance_evaluation(run, ev)
 
     def _evaluation_retry_due(self, same_claim: list[Evaluation]) -> bool:
@@ -2512,6 +2732,7 @@ class Controller:
         if ev.open:
             return
         log.info("%s: evaluation #%d %s: %s", run.id, ev.n, ev.status, ev.detail)
+        self._note("evaluation", _evaluation_line(ev), run_id=run.id)
         run = self._state.get_run(run.id) or run
         if ev.trigger != "claim" or run.phase != "running":
             return
@@ -2601,6 +2822,11 @@ class Controller:
     def _complete(self, run: Run, ev: Evaluation) -> None:
         if self._state.try_set_phase(run.id, "finished"):
             log.info("%s finished: evaluation #%d passed", run.id, ev.n)
+            self._note(
+                "run.ended",
+                f"VERIFIED: evaluation #{ev.n} passed every required check; finished",
+                run_id=run.id,
+            )
             self._publish_project(run.id)
 
     def _deliver_failure(self, run: Run, ev: Evaluation) -> None:
@@ -2673,6 +2899,7 @@ class Controller:
             plan_id=plan_id, model_key=model.key, request=request.strip(), now=now
         )
         log.info("plan %s opened (model %s)", plan_id, model.key)
+        self._note("plan.opened", f"planning with {model.key}", plan_id=plan_id)
         self._wake.set()
         return self._plan_view(plan)
 
@@ -2868,6 +3095,7 @@ class Controller:
         make_world_readable(attempt)
         self._state.record_dry_run(plan.id, summary, self._clock.now())
         log.info("plan %s: dry run #%d %s", plan.id, n, "ok" if summary["ok"] else "has problems")
+        self._note("plan.dryrun", _dry_run_line(summary), plan_id=plan.id)
         if plan.conversation_id is not None:
             try:
                 self._conversations.deliver(
@@ -2971,6 +3199,7 @@ class Controller:
         plan = self._state.set_plan_state(plan.id, "closed", self._clock.now())
         self._remove_planner(plan.id)
         log.info("plan %s closed by the operator", plan.id)
+        self._note("plan.closed", "closed by the operator", plan_id=plan.id)
         return self._plan_view(plan)
 
     def _remove_planner(self, plan_id: str) -> None:
@@ -2983,6 +3212,7 @@ class Controller:
 
     def _fail_plan(self, plan: Plan, error: str) -> None:
         log.error("plan %s failed: %s", plan.id, error)
+        self._note("plan.failed", error, plan_id=plan.id)
         self._state.set_plan_state(plan.id, "failed", self._clock.now(), error=error)
         self._remove_planner(plan.id)
 
@@ -3179,6 +3409,12 @@ class Controller:
         else:
             return
         log.info("%s: demo %s", run.id, demo.state)
+        self._note(
+            "demo",
+            f"demo {demo.state} (DGX 127.0.0.1:{demo.host_port})"
+            + (f": {_clip(demo.message, 300)}" if demo.state != "running" and demo.message else ""),
+            run_id=run.id,
+        )
         self._publish_demo_status(demo)
 
     def _publish_demo_status(self, demo: Demo) -> None:
@@ -3308,6 +3544,13 @@ class Controller:
             notes=notes,
         )
         self._state.record_stop(run.id, json.dumps(asdict(evidence)), verified=not failed)
+        self._note(
+            "run.ended",
+            f"{evidence.reason}: agent execution "
+            + ("could NOT be shown to have ended" if failed else "ended")
+            + ("; the demo stays up" if demo_view else ""),
+            run_id=run.id,
+        )
         if failed:
             log.error("%s: could not show that agent execution ended: %s", run.id, evidence)
         else:

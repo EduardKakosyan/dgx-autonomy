@@ -44,7 +44,10 @@ evaluator containers (uid 10002, no caps, no socket), one per acceptance check:
 The default model is `qwen3.8-flash-next` (Qwen3.8-Flash-Next, Q3, 83.8 GiB, 125B
 total / 6B active). It qualified on hugo-dgx1 with the whole workload running: all
 tool-call probes passed, a 51K-token prompt ran at 633 tokens/s prefill and 19.5 tokens/s
-decode, and at least 23.9 GiB stayed available. It does not fit next to
+decode, and at least 23.9 GiB stayed available. That was at a 64K context; it now
+runs at its native 256K (262 144 tokens) with up to 32K thinking tokens and 64K output
+tokens a response, and needs qualifying again at those settings. Only 12 of its 48
+layers keep a KV cache, so 256K costs about 3.2 GiB. It does not fit next to
 `claude-qwen`, so it needs the reservation (`dgx-autonomy reserve`, see [the
 reservation](#the-inference-reservation)). The controller refuses to load a model that
 the host lacks the memory for. The qualified fallback is `qwen3.6-35b-a3b` (Q3, about
@@ -179,7 +182,31 @@ dgx-autonomy egress [HOST:PORT ...]   # is the egress policy in place / probe th
 dgx-autonomy qualify MODEL            # qualify a model with the whole workload running
 dgx-autonomy qualification [MODEL]    # the latest qualification result
 dgx-autonomy readiness [--only X] [--with-reservation]   # every smoke test, one report
+dgx-autonomy notify [--follow] [--since N] [--run ID]    # the operator's feed of milestones
 ```
+
+### Notifications
+
+Nobody has to poll `status`. The controller appends a line to its feed
+(`state/notifications.jsonl`) whenever something happens that the operator may act on
+or want to know:
+
+| kind | when |
+|---|---|
+| `plan.opened`, `plan.waiting`, `plan.dryrun`, `plan.closed`, `plan.failed` | the planner's turn ended (with what it said), a dry run finished, ... |
+| `run.launched`, `run.running` | a run was frozen and started; the builder began |
+| `progress` | the builder called `report_progress` (its own account, labelled so) |
+| `demo` | the demo came up or failed |
+| `claim`, `evaluation` | the builder claimed completion; the checks decided (per check) |
+| `handoff`, `rollover`, `recovery`, `trouble`, `blocked` | continuity and recovery |
+| `run.ended` | VERIFIED, stopped, expired or blocked |
+| `qualify.done` | a qualification ended, with its speeds |
+
+`dgx-autonomy notify --follow` long-polls the `notifications` op and prints each line as
+it arrives, and waits out a controller restart. It is meant to run for a whole run, in
+a terminal or under a monitor. `report_progress` is a builder tool: the agent is told to
+call it when it finishes a piece of work. It appends to `/workspace/.dgx/progress.jsonl`,
+which the controller reads without following symlinks and forwards once.
 
 ### Planning
 

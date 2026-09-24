@@ -390,9 +390,11 @@ def test_thinking_is_bounded_when_the_model_says_so() -> None:
     catalog = load_models(PACKAGED_MODELS_FILE)
     flash = catalog.get("qwen3.8-flash-next")
     argv = list(inference_command(flash, 8080))
-    assert argv[argv.index("--reasoning-budget") + 1] == "8192"
+    assert flash.reasoning_budget is not None
+    assert flash.reasoning_budget < flash.max_output_tokens  # room to act after thinking
+    assert argv[argv.index("--reasoning-budget") + 1] == str(flash.reasoning_budget)
     assert argv[argv.index("--reasoning-budget-message") + 1] == REASONING_BUDGET_MESSAGE
-    assert argv[argv.index("--n-predict") + 1] == "24576"
+    assert argv[argv.index("--n-predict") + 1] == str(flash.max_output_tokens)
 
     assert "--reasoning-budget" not in inference_command(
         replace(flash, reasoning_budget=None), 8080

@@ -14,6 +14,9 @@ agent can then fix the problems and call the tool again.
     controller -> /dgx-control/handoff.json    {request_id, accepted, problems, message}
     agent -> /workspace/.dgx/blocked.json      {id, missing_capability, ...}
     controller -> /dgx-control/blocked.json    {request_id, accepted, problems, message}
+
+report_progress needs no answer: it appends one line to /workspace/.dgx/progress.jsonl,
+which the controller forwards to the operator's feed as the builder's own report.
 """
 
 from __future__ import annotations
@@ -43,6 +46,8 @@ HANDOFF_REQUEST_PATH = "/workspace/.dgx/handoff.json"
 HANDOFF_STATUS_PATH = "/dgx-control/handoff.json"
 BLOCKED_REQUEST_PATH = "/workspace/.dgx/blocked.json"
 BLOCKED_STATUS_PATH = "/dgx-control/blocked.json"
+PROGRESS_PATH = "/workspace/.dgx/progress.jsonl"
+MAX_PROGRESS_BYTES = 1024 * 1024  # the controller reads at most this much
 WAIT_S = 120.0
 
 HANDOFF_DESCRIPTION = """Hand your work over to the fresh conversation that replaces this one.
@@ -113,6 +118,24 @@ class DeclareBlockedAction(Action):
         description="At least two different approaches you tried, and how each failed."
     )
     needed: str = Field(description="What would be needed to proceed.")
+
+
+PROGRESS_DESCRIPTION = """Tell the operator what you just finished or started.
+
+Call it when a piece of the work is done (a feature works, a bug is fixed, a test suite
+passes), when you start a large piece, or when you change approach. One or two
+sentences; name the feature and how you know it works. The operator follows these
+reports while you work unattended; nobody answers them. They are your account: the
+acceptance checks still decide completion.
+"""
+
+
+class ReportProgressAction(Action):
+    item: str = Field(description="The piece of work, e.g. 'CSV import with duplicate detection'.")
+    status: Literal["done", "started", "changed_approach", "note"] = Field(
+        description="done, started, changed_approach, or note."
+    )
+    summary: str = Field(description="One or two sentences: what, and how you know it works.")
 
 
 class ControllerAnswer(Observation):
@@ -196,6 +219,36 @@ class DeclareBlockedExecutor(ToolExecutor[DeclareBlockedAction, ControllerAnswer
         return _ask(*self.paths, body, self.wait_s, self.poll_s)
 
 
+class ReportProgressExecutor(ToolExecutor[ReportProgressAction, ControllerAnswer]):
+    def __init__(self, path: str = PROGRESS_PATH) -> None:
+        self.path = path
+
+    def __call__(
+        self, action: ReportProgressAction, conversation: LocalConversation | None = None
+    ) -> ControllerAnswer:
+        line = json.dumps(
+            {
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "status": action.status,
+                "item": action.item[:160],
+                "summary": action.summary[:600],
+            }
+        )
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            size = 0
+        if size + len(line) + 1 > MAX_PROGRESS_BYTES:
+            return ControllerAnswer.from_text(
+                "The progress log is full; keep working, reports are no longer forwarded.",
+                is_error=True,
+            )
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "a") as f:
+            f.write(line + "\n")
+        return ControllerAnswer.from_text("Reported to the operator. Keep going.")
+
+
 class WriteHandoffTool(ToolDefinition[WriteHandoffAction, ControllerAnswer]):
     @classmethod
     def create(cls, conv_state: ConversationState | None = None, **params: Any) -> Sequence[Self]:
@@ -236,5 +289,26 @@ class DeclareBlockedTool(ToolDefinition[DeclareBlockedAction, ControllerAnswer])
         ]
 
 
+class ReportProgressTool(ToolDefinition[ReportProgressAction, ControllerAnswer]):
+    @classmethod
+    def create(cls, conv_state: ConversationState | None = None, **params: Any) -> Sequence[Self]:
+        return [
+            cls(
+                description=PROGRESS_DESCRIPTION,
+                action_type=ReportProgressAction,
+                observation_type=ControllerAnswer,
+                annotations=ToolAnnotations(
+                    title="report_progress",
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=False,
+                    openWorldHint=False,
+                ),
+                executor=ReportProgressExecutor(),
+            )
+        ]
+
+
 register_tool(WriteHandoffTool.name, WriteHandoffTool)
+register_tool(ReportProgressTool.name, ReportProgressTool)
 register_tool(DeclareBlockedTool.name, DeclareBlockedTool)

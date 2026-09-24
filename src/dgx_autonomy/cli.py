@@ -20,6 +20,7 @@ from typing import Any
 from . import frozen
 from .config import default_socket_path
 from .control_api import ControlError, call
+from .notify import format_line
 
 MAX_BUDGET_HOURS = 40.0
 DEFAULT_SSH_HOST = "hugo-dgx1"
@@ -733,6 +734,36 @@ def _release_now(args: argparse.Namespace) -> int:
     return 0 if out.get("already") or out.get("configuration_restored") else 1
 
 
+def cmd_notify(args: argparse.Namespace) -> int:
+    """The operator's feed: milestones as they happen (see notify.py).
+
+    `--follow` long-polls and survives controller restarts, so one command can sit in
+    a terminal (or under a monitor) for a whole run.
+    """
+    since = args.since if args.since is not None else (-1 if args.follow else 0)
+    while True:
+        try:
+            page = call(
+                _socket(args),
+                "notifications",
+                {"since": since, "wait_s": 240 if args.follow else 0, "limit": 200},
+                timeout=300,
+            )
+        except (ControlError, OSError) as exc:
+            if not args.follow:
+                raise
+            print(f"(controller unavailable: {exc}; retrying)", file=sys.stderr, flush=True)
+            time.sleep(10)
+            continue
+        for e in page["events"]:
+            if args.run and args.run not in (e.get("run_id"), e.get("plan_id")):
+                continue
+            print(json.dumps(e) if args.json else format_line(e), flush=True)
+        since = page["next"]
+        if not args.follow:
+            return 0
+
+
 def cmd_reservation(args: argparse.Namespace) -> int:
     _print(reservation_helper("status"), args.json)
     return 0
@@ -916,6 +947,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --after: wait in a systemd user unit instead of this session",
     )
     s.set_defaults(func=cmd_release)
+
+    s = sub.add_parser("notify", help="milestones of plans, runs and qualifications")
+    s.add_argument("--follow", action="store_true", help="keep printing new ones as they come")
+    s.add_argument(
+        "--since", type=int, default=None, help="after notification N (default: all, or new)"
+    )
+    s.add_argument("--run", default=None, metavar="ID", help="only this run or plan")
+    s.set_defaults(func=cmd_notify)
 
     s = sub.add_parser("reservation", help="is the DGX inference reserved, and for how long")
     s.set_defaults(func=cmd_reservation)

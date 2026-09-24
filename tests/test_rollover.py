@@ -168,14 +168,18 @@ def test_without_a_handoff_the_controller_records_a_fallback(harness: Harness) -
     )
     h.controller.handle("rollover", {"run_id": run_id})
     h.controller.reconcile_once()
-    h.clock.advance(seconds=h.settings.handoff_timeout_s - 1)
+    # The step in flight may take a whole response before the handoff is written.
+    run = h.state.get_run(run_id)
+    assert run is not None
+    wait = h.settings.handoff_timeout_s + h.controller._catalog.get(run.model_key).request_timeout_s
+    h.clock.advance(seconds=wait - 1)
     h.controller.reconcile_once()
     assert len(h.state.checkpoints(run_id)) == 1
     h.clock.advance(seconds=2)
     h.controller.reconcile_once()
     second = h.state.checkpoints(run_id)[-1]
     assert (second.source, second.supersedes_id) == ("controller_fallback", first.id)
-    assert "no valid handoff within 10 min" in second.problems[0]
+    assert f"no valid handoff within {wait / 60:.0f} min" in second.problems[0]
     # The last valid handoff is carried forward, marked as older; nothing new is done.
     assert second.handoff["previous_handoff"]["roadmap"] == first.handoff["roadmap"]
     assert "roadmap" not in second.handoff
@@ -210,14 +214,17 @@ def test_an_erroring_conversation_is_nudged_then_replaced(harness: Harness) -> N
 def test_a_full_context_rolls_over_but_not_again_right_away(harness: Harness) -> None:
     h = harness
     run_id = _run(h)
-    ctx = 65536
+    run = h.state.get_run(run_id)
+    assert run is not None
+    ctx = h.controller._catalog.get(run.model_key).ctx
     h.conversation.context_tokens = int(ctx * 0.5)
     h.controller.reconcile_once()
     assert h.state.open_rollover(run_id) is None
     h.conversation.context_tokens = int(ctx * 0.9)
     h.controller.reconcile_once()
     row = h.state.open_rollover(run_id)
-    assert row is not None and row.reason == "context" and "58982 of 65536" in str(row.detail)
+    assert row is not None and row.reason == "context"
+    assert f"{int(ctx * 0.9)} of {ctx}" in str(row.detail)
     h.controller.reconcile_once()
     _write(h, run_id, "handoff.json", _handoff(_request_id(h, run_id)))
     h.controller.reconcile_once()
@@ -346,7 +353,7 @@ def test_the_builder_gets_the_handoff_and_blocker_tools(harness: Harness) -> Non
     h = harness
     _run(h)
     assert h.conversation.started[0].builder_tools
-    assert BUILDER_TOOLS == ("start_demo", "write_handoff", "declare_blocked")
+    assert BUILDER_TOOLS == ("start_demo", "write_handoff", "declare_blocked", "report_progress")
 
 
 def test_recovery_during_a_rollover_does_not_resume_the_old_conversation(
