@@ -546,3 +546,23 @@ def test_a_symlink_in_the_reference_refuses_the_draft(harness: Harness) -> None:
     os.symlink("/etc/passwd", d / "reference" / "index.html")
     view = h.controller.handle("plan.draft", {"plan_id": plan_id})
     assert view["problem"] is not None and "reference" in view["problem"]
+
+
+def test_the_repl_waits_out_a_controller_restart() -> None:
+    from dgx_autonomy.control_api import ControlError
+
+    reply = {"events": [_ev("MessageEvent", "agent", "Done.")], "next": 1,
+             "conversation_status": "finished"}  # fmt: skip
+    control = FakeControl([reply], {})
+    failures = iter([True, True, False])
+    real_call = control.__call__
+
+    def flaky(op: str, args: dict[str, Any] | None = None, **kw: Any) -> Any:
+        if op == "plan.events" and next(failures, False):
+            raise ControlError("no controller socket")
+        return real_call(op, args, **kw)
+
+    out = io.StringIO()
+    session = PlanSession(flaky, "p1", out=out, read=lambda _p: "", sleep=lambda _s: None)
+    assert session.handle("hello") is True
+    assert "waiting for it" in out.getvalue() and "planner> Done." in out.getvalue()

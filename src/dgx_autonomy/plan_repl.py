@@ -18,6 +18,8 @@ _CHECK_TIMEOUT_S = 1800.0
 _TAKES_ARGUMENT = frozenset({"/launch"})
 # After a message, how long a planner that shows no sign of work is waited for.
 _START_WAIT_S = 90.0
+# How many times a poll is retried while the controller restarts (a few seconds).
+_CONTROLLER_RETRIES = 30
 HELP = """\
     TEXT               a message to the planner; its reply is streamed
     /draft             the draft brief and checks, and whether they can be launched
@@ -114,13 +116,31 @@ class PlanSession:
                 announced = True
             self._sleep(self._poll_s * 2)
 
+    def _events_page(self) -> dict[str, Any]:
+        """The next page of events; a controller restart (seconds) is waited out."""
+        from .control_api import ControlError
+
+        for attempt in range(_CONTROLLER_RETRIES):
+            try:
+                page: dict[str, Any] = self._call(
+                    "plan.events", {"plan_id": self.plan_id, "since": self.since}
+                )
+                return page
+            except ControlError:
+                if attempt + 1 == _CONTROLLER_RETRIES:
+                    raise
+                if attempt == 0:
+                    self.say("  (the controller is not answering; waiting for it)")
+                self._sleep(self._poll_s * 2)
+        raise AssertionError("unreachable")
+
     def follow(self, *, after_send: bool) -> str | None:
         """Print the planner's events until its turn is over. Returns its status."""
         spoke = False
         saw_running = False
         quiet_polls = 0
         while True:
-            page = self._call("plan.events", {"plan_id": self.plan_id, "since": self.since})
+            page = self._events_page()
             for ev in page["events"]:
                 spoke = self._show(ev, history=False) or spoke
             self.since = page["next"]

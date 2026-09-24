@@ -205,6 +205,7 @@ class OpenHandsConversations:
             api_key=SecretStr("local-llama-server"),
             max_input_tokens=request.llm.max_input_tokens,
             max_output_tokens=request.llm.max_output_tokens,
+            timeout=request.llm.timeout_s,
             usage_id="agent",
         )
         # cli_mode drops the browser tool set; the run needs terminal + file editor,

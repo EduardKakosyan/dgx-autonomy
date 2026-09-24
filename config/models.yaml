@@ -65,7 +65,11 @@ models:
     # Thinking is bounded (8192), and a response may write a large file after it.
     max_output_tokens: 24576
     reasoning_budget: 8192
-    extra_args: []
+    # Its template keeps every turn's thinking in the history by default; in a long
+    # agent conversation that fills the context several times faster.
+    extra_args: ["--no-reasoning-preserve"]
+    # 24 576 tokens at 19.5 tokens/s (measured at 51K context) plus a full prefill.
+    request_timeout_s: 1800
     status: qualified
     measured:
       # dgx-autonomy qualify, 2026-09-23T23:20Z (reservation held), record

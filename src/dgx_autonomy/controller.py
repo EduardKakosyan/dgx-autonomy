@@ -1607,6 +1607,7 @@ class Controller:
                 base_url=f"{self._settings.inference_url}/v1",
                 max_input_tokens=model.ctx,
                 max_output_tokens=model.max_output_tokens,
+                timeout_s=model.request_timeout_s,
             ),
             message=agent_message(
                 Path(run.brief_path).read_text(), checks=bool(self._automated(run.id))
@@ -2215,6 +2216,7 @@ class Controller:
                 base_url=f"{self._settings.inference_url}/v1",
                 max_input_tokens=model.ctx,
                 max_output_tokens=model.max_output_tokens,
+                timeout_s=model.request_timeout_s,
             ),
             message=message,
         )
@@ -3042,6 +3044,7 @@ class Controller:
                 base_url=f"{self._settings.inference_url}/v1",
                 max_input_tokens=model.ctx,
                 max_output_tokens=model.max_output_tokens,
+                timeout_s=model.request_timeout_s,
             ),
             message=planning.planning_message(
                 plan.request,

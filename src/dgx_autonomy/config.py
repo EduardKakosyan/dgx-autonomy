@@ -46,6 +46,12 @@ class ModelConfig:
     # hugo-dgx1 a planner thought through a whole draft for 16 000+ tokens and hit
     # max_output_tokens before writing a single file.
     reasoning_budget: int | None = None
+    # How long OpenHands waits for one response. The SDK's default (300 s) is shorter
+    # than a long response takes at this hardware's decode speed (on hugo-dgx1 a
+    # 16 000-token answer at 26 tokens/s took 10 minutes): the client gave up, retried,
+    # and llama.cpp went on generating the abandoned answer. Cover max_output_tokens
+    # at the measured decode speed plus a full-context prefill.
+    request_timeout_s: int = 1800
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,7 @@ def _model_from(key: str, raw: Mapping[str, Any]) -> ModelConfig:
             extra_args=tuple(str(a) for a in raw.get("extra_args") or ()),
             status=str(raw.get("status", "unqualified")),
             max_output_tokens=int(raw.get("max_output_tokens", 16384)),
+            request_timeout_s=int(raw.get("request_timeout_s", 1800)),
             reasoning_budget=(
                 int(raw["reasoning_budget"]) if raw.get("reasoning_budget") is not None else None
             ),

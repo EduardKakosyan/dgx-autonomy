@@ -244,6 +244,7 @@ class LlmEndpoint:
     base_url: str
     max_input_tokens: int
     max_output_tokens: int | None = None
+    timeout_s: int | None = None
 
 
 @dataclass(frozen=True)
