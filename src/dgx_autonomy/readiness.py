@@ -95,7 +95,7 @@ def run_readiness(
     only: Sequence[str] = (),
     runner: Runner = run_pytest,
     now: Callable[[], datetime] = datetime.now,
-    echo: Callable[[str], None] = print,
+    echo: Callable[[str], None] = lambda line: print(line, flush=True),
 ) -> dict[str, Any]:
     suites = list(SUITES) + ([RESERVATION_SUITE] if with_reservation else [])
     if only:

@@ -41,6 +41,11 @@ class ModelConfig:
     # llama-server's default, so a reasoning loop cannot hold the only slot until the
     # context is full (seen on hugo-dgx1: 10 000+ tokens, 20+ minutes, both runs waiting).
     max_output_tokens: int = 16384
+    # The most tokens a response may spend thinking before llama.cpp ends the
+    # thinking block (`--reasoning-budget`); None leaves thinking unbounded. On
+    # hugo-dgx1 a planner thought through a whole draft for 16 000+ tokens and hit
+    # max_output_tokens before writing a single file.
+    reasoning_budget: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +81,9 @@ def _model_from(key: str, raw: Mapping[str, Any]) -> ModelConfig:
             extra_args=tuple(str(a) for a in raw.get("extra_args") or ()),
             status=str(raw.get("status", "unqualified")),
             max_output_tokens=int(raw.get("max_output_tokens", 16384)),
+            reasoning_budget=(
+                int(raw["reasoning_budget"]) if raw.get("reasoning_budget") is not None else None
+            ),
         )
     except KeyError as missing:
         raise ConfigError(f"model {key}: missing field {missing}") from None

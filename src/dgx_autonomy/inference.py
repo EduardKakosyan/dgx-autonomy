@@ -20,6 +20,10 @@ from .ports import ContainerPort, ContainerSpec, ContainerState, HttpClient, Htt
 from .runtime import LABEL_PREFIX, LABEL_ROLE
 
 LABEL_MODEL = f"{LABEL_PREFIX}.model"
+# Injected before the end of the thinking block when the reasoning budget runs out.
+REASONING_BUDGET_MESSAGE = (
+    "\n\nI have thought about this long enough. Time to act on it, one step at a time.\n"
+)
 MODELS_MOUNT = "/models"
 
 # Paths the diagnostic passthrough may reach. Everything else stays unreachable
@@ -54,6 +58,11 @@ def inference_command(model: ModelConfig, port: int) -> tuple[str, ...]:
         "--jinja",
         "--metrics",
     ]  # fmt: skip
+    if model.reasoning_budget is not None:
+        args += [
+            "--reasoning-budget", str(model.reasoning_budget),
+            "--reasoning-budget-message", REASONING_BUDGET_MESSAGE,
+        ]  # fmt: skip
     if model.template not in ("", "embedded"):
         args += ["--chat-template-file", f"{MODELS_MOUNT}/{model.template}"]
     return (*args, *model.extra_args)

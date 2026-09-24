@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -97,7 +98,7 @@ def test_inference_argv_gets_the_gpu_and_a_read_only_model_dir(settings: Setting
     assert _flag_values(argv, "--model") == [f"/models/{model.gguf}"]
     assert _flag_values(argv, "--ctx-size") == [str(model.ctx)]
     # A response is bounded even when the client sends no max_tokens.
-    assert _flag_values(argv, "--n-predict") == [str(model.max_output_tokens)] == ["16384"]
+    assert _flag_values(argv, "--n-predict") == [str(model.max_output_tokens)]
     assert _flag_values(argv, "--alias") == [model.key]
     assert _flag_values(argv, "--host") == ["0.0.0.0"]
     assert "--jinja" in argv
@@ -380,3 +381,19 @@ def test_a_model_is_not_loaded_without_memory_for_it(tmp_path: Path) -> None:
     meminfo.write_text("MemTotal: 10 kB\nMemAvailable: 2048 kB\n")
     assert mem_available(meminfo) == 2048 * 1024
     assert mem_available(tmp_path / "missing") is None
+
+
+def test_thinking_is_bounded_when_the_model_says_so() -> None:
+    from dgx_autonomy.config import PACKAGED_MODELS_FILE
+    from dgx_autonomy.inference import REASONING_BUDGET_MESSAGE, inference_command
+
+    catalog = load_models(PACKAGED_MODELS_FILE)
+    flash = catalog.get("qwen3.8-flash-next")
+    argv = list(inference_command(flash, 8080))
+    assert argv[argv.index("--reasoning-budget") + 1] == "8192"
+    assert argv[argv.index("--reasoning-budget-message") + 1] == REASONING_BUDGET_MESSAGE
+    assert argv[argv.index("--n-predict") + 1] == "24576"
+
+    assert "--reasoning-budget" not in inference_command(
+        replace(flash, reasoning_budget=None), 8080
+    )

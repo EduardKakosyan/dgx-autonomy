@@ -28,6 +28,7 @@ models:
     cache_type_k: q8_0
     cache_type_v: q8_0
     max_output_tokens: 16384
+    reasoning_budget: 8192
     extra_args: []
     status: qualified
     measured:
@@ -61,7 +62,9 @@ models:
     template: embedded
     cache_type_k: q8_0
     cache_type_v: q8_0
-    max_output_tokens: 16384
+    # Thinking is bounded (8192), and a response may write a large file after it.
+    max_output_tokens: 24576
+    reasoning_budget: 8192
     extra_args: []
     status: qualified
     measured:
