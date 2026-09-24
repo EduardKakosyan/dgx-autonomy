@@ -46,8 +46,11 @@ total / 6B active). It qualified on hugo-dgx1 with the whole workload running: a
 tool-call probes passed, a 51K-token prompt ran at 633 tokens/s prefill and 19.5 tokens/s
 decode, and at least 23.9 GiB stayed available. That was at a 64K context; it now
 runs at its native 256K (262 144 tokens) with up to 32K thinking tokens and 64K output
-tokens a response, and needs qualifying again at those settings. Only 12 of its 48
-layers keep a KV cache, so 256K costs about 3.2 GiB. It does not fit next to
+tokens a response. It qualified again at those settings on 2026-09-24: a 206K-token
+prompt ran at 387 tokens/s prefill and 8.4 tokens/s decode (decode slows as the
+context fills), the full-context prompt recalled a word from its start, and at least
+16.3 GiB stayed available. Only 12 of its 48 layers keep a KV cache, so 256K costs
+about 3.2 GiB. It does not fit next to
 `claude-qwen`, so it needs the reservation (`dgx-autonomy reserve`, see [the
 reservation](#the-inference-reservation)). The controller refuses to load a model that
 the host lacks the memory for. The qualified fallback is `qwen3.6-35b-a3b` (Q3, about

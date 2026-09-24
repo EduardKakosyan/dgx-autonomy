@@ -77,16 +77,18 @@ models:
     # 65 536 tokens at about 15 tokens/s (decode slows as the context grows) plus a
     # full prefill of 256K.
     request_timeout_s: 5400
-    status: unqualified
+    status: qualified
     measured:
-      # dgx-autonomy qualify, 2026-09-23T23:20Z (reservation held), record
-      # qualification/qwen3.8-flash-next/20260923T232041.json
-      load_seconds: 40.4
-      memory_gib: 87.7
+      # dgx-autonomy qualify at 262 144 context, 2026-09-24T12:37Z (reservation held),
+      # record qualification/qwen3.8-flash-next/20260924T123724.json. Decode slows as
+      # the context fills: about 30 tokens/s near empty, 19.5 at 51K (2026-09-23
+      # record 20260923T232041.json, at 65 536), 8.4 at 206K.
+      load_seconds: 60.4
+      memory_gib: 91.2
       tool_call_probes: 5/5
-      long_prompt_tokens: 51457
-      prefill_tokens_per_s: 632.8
-      decode_tokens_per_s_at_51k: 19.5
-      min_available_gib_with_workload: 23.9
+      long_prompt_tokens: 205603
+      prefill_tokens_per_s: 387.5
+      decode_tokens_per_s_at_206k: 8.4
+      min_available_gib_with_workload: 16.3
       swap_growth_gib: 0.0
-      workload_run: 20260923-232304-23ca30 (VERIFIED)
+      workload_run: 20260924-124743-98ffd8 (VERIFIED)
