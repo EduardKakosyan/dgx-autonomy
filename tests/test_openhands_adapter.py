@@ -264,3 +264,22 @@ def test_idempotent_requests_survive_a_reset_connection() -> None:
     res = client.request("POST", "http://agent/api/conversations/x/events", json_body={})
     assert res.status == 0 and "Connection reset" in str(res.error)
     assert seen == ["POST"]  # a message is never sent twice
+
+
+def test_only_the_context_limit_condenses_a_conversation() -> None:
+    """hugo-dgx1: the SDK's 240-event default condensed a 256K planner twice with its
+    window mostly empty."""
+    from openhands.sdk import LLM
+    from openhands.tools.preset.default import get_default_agent
+    from pydantic import SecretStr
+
+    from dgx_autonomy.openhands_adapter import CONDENSER_MAX_EVENTS, with_token_condenser
+
+    llm = LLM(
+        model="openai/m", base_url="http://x", api_key=SecretStr("k"),
+        max_input_tokens=262144, usage_id="agent",
+    )  # fmt: skip
+    agent = with_token_condenser(get_default_agent(llm=llm, cli_mode=True), llm)
+    assert agent.condenser.max_size == CONDENSER_MAX_EVENTS
+    assert agent.condenser.llm.usage_id == "condenser"
+    assert agent.condenser._effective_max_tokens(llm) == 262144

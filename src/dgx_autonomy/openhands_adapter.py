@@ -62,8 +62,29 @@ PROGRESS_TOOL_NAME = "report_progress"
 BUILDER_TOOLS = (DEMO_TOOL_NAME, HANDOFF_TOOL_NAME, BLOCKED_TOOL_NAME, PROGRESS_TOOL_NAME)
 
 
+# The SDK's default condenser summarizes after 240 events, whatever their size. On
+# hugo-dgx1 a planner at 256K context was condensed twice with its window mostly
+# empty, lost track of which edits it had made, and spent an hour re-checking files.
+# The event count is set out of reach, so only the token limit (the model's context)
+# condenses; the controller's handoff and rollover at 85% of it come first.
+CONDENSER_MAX_EVENTS = 100_000
+CONDENSER_KEEP_FIRST = 4
+
+
 class ConversationError(RuntimeError):
     pass
+
+
+def with_token_condenser(agent: Any, llm: Any) -> Any:
+    """The agent with a summarizing condenser that only the context limit triggers."""
+    from openhands.sdk.context.condenser import LLMSummarizingCondenser
+
+    condenser = LLMSummarizingCondenser(
+        llm=llm.model_copy(update={"usage_id": "condenser"}),
+        max_size=CONDENSER_MAX_EVENTS,
+        keep_first=CONDENSER_KEEP_FIRST,
+    )
+    return agent.model_copy(update={"condenser": condenser})
 
 
 def conversation_id_for(run_id: str) -> str:
@@ -213,7 +234,7 @@ class OpenHandsConversations:
         # plus start_demo, which the Agent Server image loads with --import-modules.
         from openhands.sdk import Tool
 
-        agent = get_default_agent(llm=llm, cli_mode=True)
+        agent = with_token_condenser(get_default_agent(llm=llm, cli_mode=True), llm)
         if extra_tools:
             extra = [Tool(name=name) for name in extra_tools]
             agent = agent.model_copy(update={"tools": [*agent.tools, *extra]})
