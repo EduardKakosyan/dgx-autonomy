@@ -473,10 +473,9 @@ class Qualifier:
         info = self._meminfo()
         available = info.get("MemAvailable", 0)
         serving = self._hooks.serving()
-        # The model we would remove frees roughly its weights.
-        freed = 0
-        if serving not in (None, model.key):
-            freed = self._settings_size(serving)
+        # The server we remove frees roughly its weights, also when it serves this
+        # model (it is loaded again, with the settings being qualified).
+        freed = self._settings_size(serving) if serving is not None else 0
         needed = model.size_bytes + MEMORY_HEADROOM_BYTES
         result = {
             "ok": available + freed >= needed,
@@ -502,8 +501,9 @@ class Qualifier:
             return 0
 
     def _load(self, model: ModelConfig) -> dict[str, Any]:
-        serving = self._hooks.serving()
-        if serving not in (None, model.key):
+        # Always a fresh server: one already serving this model may run with other
+        # settings (found on hugo-dgx1: a 64K server kept while qualifying 256K).
+        if self._hooks.serving() is not None:
             self._hooks.remove_inference()
         before = self._meminfo().get("MemAvailable", 0)
         started = time.monotonic()

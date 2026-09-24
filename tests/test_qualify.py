@@ -139,6 +139,18 @@ def test_a_model_that_works_with_the_whole_workload_qualifies(settings: Settings
     assert q.latest("qwen3.8-flash-next")["status"] == "qualified"  # type: ignore[index]
 
 
+def test_a_model_already_served_is_loaded_again_with_the_settings_under_test(
+    settings: Settings,
+) -> None:
+    """hugo-dgx1: Flash-Next served at 64K while 256K was being qualified. Its own
+    weights count as freed, and the server is replaced, not kept."""
+    host = FakeHost(available_gib=27)
+    host.serving = "qwen3.8-flash-next"
+    job = _qualifier(settings, host).start(_flash_next(), background=False)
+    assert job.steps["preflight"]["ok"], job.steps["preflight"]
+    assert host.removed == 1 and host.ensured == ["qwen3.8-flash-next"]
+
+
 def test_not_enough_memory_fails_before_anything_is_swapped(settings: Settings) -> None:
     host = FakeHost(available_gib=60)  # 60 + 15.7 freed < 83.8 + 8
     job = _qualifier(settings, host).start(_flash_next(), background=False)
