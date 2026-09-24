@@ -9,8 +9,10 @@ agent, which runs as the same uid, can neither edit it nor hook its imports.
     ps                     JSON list of processes, each with a role.
     kill-agent             End every `agent` process; print what was there and what
                            survived.
-    demo-start             Start the demo command in a new session (the `demo` group).
-    demo-status            Is the demo session alive, and is its port listening?
+    demo-start             End whatever listens on the demo port, then start the demo
+                           command in a new session (the `demo` group).
+    demo-status            Is the demo session alive, and does it listen on its port
+                           where the evaluator and the operator can reach it?
     demo-stop              End one demo session.
 
 Roles. The controller reaches the sandbox only through `docker exec`, and a process
@@ -201,10 +203,35 @@ def demo_env(port: int) -> dict[str, str]:
     return env
 
 
+def free_port(port: int, grace_s: float = 5.0, root: str = "/proc") -> list[dict[str, object]]:
+    """End the processes that listen on the demo port; it belongs to the demo session.
+
+    Found on hugo-dgx1: the agent's own `python3 -m http.server 3000 --bind 127.0.0.1`
+    outlived its conversation. The relaunched demo could not bind, while the port
+    looked busy, so every check failed against an app nobody outside could reach.
+    Only the listening processes end, not their session: a stray server's shell stays.
+    """
+    procs = {p.pid: p for p in list_procs(root)}
+    owners = socket_owners({s.inode for s in port_listeners(port, root)}, root)
+    holders = sorted({pid for pids in owners.values() for pid in pids if pid != 1})
+    views = [_view(procs[pid]) for pid in holders if pid in procs]
+    _signal(holders, signal.SIGTERM)
+    end = time.monotonic() + grace_s
+    while time.monotonic() < end and any(read_proc(pid, root) for pid in holders):
+        time.sleep(0.2)
+    _signal([pid for pid in holders if read_proc(pid, root)], signal.SIGKILL)
+    return views
+
+
 def demo_start(command: str, port: int, replace_sid: int | None) -> dict[str, object]:
     if replace_sid:
         demo_stop(replace_sid)
+    freed = free_port(port)
     os.makedirs(STATE_DIR, exist_ok=True)
+    if freed:
+        with open(DEMO_LOG, "a") as f:
+            for p in freed:
+                f.write(f"=== ended pid {p['pid']} ({p['cmd']}): it held port {port}\n")
     pid = os.fork()
     if pid == 0:  # the demo session leader
         try:
@@ -220,11 +247,29 @@ def demo_start(command: str, port: int, replace_sid: int | None) -> dict[str, ob
             os.execve("/bin/sh", ["/bin/sh", "-c", command], demo_env(port))
         finally:
             os._exit(127)
-    return {"session_id": pid}
+    return {"session_id": pid, "freed": freed}
 
 
-def listening_ports(root: str = "/proc") -> set[int]:
-    ports: set[int] = set()
+@dataclass(frozen=True)
+class Listener:
+    port: int
+    inode: int
+    loopback: bool  # bound to 127.0.0.0/8 or ::1: unreachable from outside the container
+
+
+def _loopback(hex_addr: str) -> bool:
+    """/proc/net/tcp{,6} addresses are hex in host byte order, 32 bits at a time."""
+    words = [bytes.fromhex(hex_addr[i : i + 8])[::-1] for i in range(0, len(hex_addr), 8)]
+    raw = b"".join(words)
+    if len(raw) == 4:
+        return raw[0] == 127
+    if raw == bytes(15) + b"\x01":
+        return True  # ::1
+    return raw[:12] == bytes(10) + b"\xff\xff" and raw[12] == 127  # ::ffff:127.x.y.z
+
+
+def listeners(root: str = "/proc") -> list[Listener]:
+    out = []
     for table in ("net/tcp", "net/tcp6"):
         try:
             with open(f"{root}/{table}") as f:
@@ -234,8 +279,40 @@ def listening_ports(root: str = "/proc") -> set[int]:
         for line in lines:
             fields = line.split()
             if len(fields) > 3 and fields[3] == "0A":  # TCP_LISTEN
-                ports.add(int(fields[1].rsplit(":", 1)[1], 16))
-    return ports
+                addr, port = fields[1].rsplit(":", 1)
+                inode = int(fields[9]) if len(fields) > 9 else 0
+                out.append(Listener(int(port, 16), inode, _loopback(addr)))
+    return out
+
+
+def port_listeners(port: int, root: str = "/proc") -> list[Listener]:
+    return [s for s in listeners(root) if s.port == port]
+
+
+def listening_ports(root: str = "/proc") -> set[int]:
+    return {s.port for s in listeners(root)}
+
+
+def socket_owners(inodes: set[int], root: str = "/proc") -> dict[int, set[int]]:
+    """inode -> pids holding that socket. Same uid, so the fd links are readable."""
+    owners: dict[int, set[int]] = {}
+    if not inodes:
+        return owners
+    for name in os.listdir(root):
+        if not name.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"{root}/{name}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(f"{root}/{name}/fd/{fd}")
+            except OSError:
+                continue
+            if target.startswith("socket:[") and int(target[8:-1]) in inodes:
+                owners.setdefault(int(target[8:-1]), set()).add(int(name))
+    return owners
 
 
 def tail(path: str, limit: int = 2000) -> str:
@@ -249,10 +326,31 @@ def tail(path: str, limit: int = 2000) -> str:
         return ""
 
 
-def demo_status(sid: int, port: int) -> dict[str, object]:
+def demo_status(sid: int, port: int, root: str = "/proc") -> dict[str, object]:
+    """Listening means: the demo session holds a socket on the port that the evaluator
+    and the operator's tunnel can reach. Anything else on the port is a `problem`."""
+    members = {p.pid for p in session_members(sid, root)}
+    socks = port_listeners(port, root)
+    owners = socket_owners({s.inode for s in socks}, root)
+    ours = [s for s in socks if owners.get(s.inode, set()) & members]
+    problem = ""
+    if not any(not s.loopback for s in ours):
+        others = sorted({pid for s in socks for pid in owners.get(s.inode, set())} - members)
+        if others:
+            cmds = [p.cmd for pid in others if (p := read_proc(pid, root)) is not None]
+            problem = (
+                f"port {port} is held by a process that is not the demo "
+                f"(pid {', '.join(map(str, others))}: {'; '.join(cmds)[:200]})"
+            )
+        elif ours:
+            problem = (
+                f"the demo listens on port {port} on loopback only; bind 0.0.0.0 (HOST) "
+                "so the checks and the operator can reach it"
+            )
     return {
-        "alive": bool(session_members(sid)),
-        "listening": port in listening_ports(),
+        "alive": bool(members),
+        "listening": any(not s.loopback for s in ours),
+        "problem": problem,
         "log_tail": tail(DEMO_LOG),
     }
 

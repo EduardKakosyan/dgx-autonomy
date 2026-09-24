@@ -422,6 +422,7 @@ class DockerRuntime:
             alive=bool(out.get("alive")),
             listening=bool(out.get("listening")),
             log_tail=str(out.get("log_tail") or ""),
+            problem=str(out.get("problem") or ""),
         )
 
 

@@ -173,6 +173,7 @@ dgx-autonomy runs
 dgx-autonomy inference [status|up|stop] [--model M]   # stop, then up, switches models
 dgx-autonomy reserve [--model M]      # displace claude-qwen, start the owned llama-server
 dgx-autonomy release                  # remove the owned llama-server, restore claude-qwen
+dgx-autonomy release --after RUN_ID --detach   # the same, once the run has ended
 dgx-autonomy reservation              # held or not, since when, memory available
 dgx-autonomy egress [HOST:PORT ...]   # is the egress policy in place / probe through it
 dgx-autonomy qualify MODEL            # qualify a model with the whole workload running
@@ -281,6 +282,14 @@ a request into the workspace. The controller validates it (port 3000, a bounded
 command), records it, and runs the command in its own session with `PORT=3000` and
 `HOST=0.0.0.0`. Output goes to `/workspace/.dgx/demo.log`. Processes the agent starts
 itself (`&`, `nohup`) end when agent execution ends.
+
+Port 3000 belongs to the demo. Before a demo starts, the sandbox ends whatever else
+listens on it and notes that in `demo.log`. The demo counts as listening only when a
+process of the demo session listens on the port on an address the evaluator and the
+tunnel can reach (not loopback). Otherwise `status` says what holds the port. Found on
+hugo-dgx1: the agent's own `python3 -m http.server 3000 --bind 127.0.0.1` outlived its
+conversation. The relaunched demo could not bind, the port looked busy, and all seven
+checks of the first claim failed against an app no evaluator could reach.
 
 To open a demo from the laptop, run the command `dgx-autonomy tunnel RUN_ID` prints
 on the DGX, keep it running, and browse to `http://127.0.0.1:<p>/`. The demo is bound
@@ -553,7 +562,13 @@ reserve`, which:
    everything else.
 
 Then the CLI starts the owned llama-server. Finishing, failing or expiring a run
-does not release anything.
+does not release anything by itself. `dgx-autonomy release --after RUN_ID --detach`
+arranges it: a systemd user unit (`dgx-autonomy-release-after@RUN_ID`, jim lingers)
+waits until the run has ended, then releases, and tries again every 5 minutes while
+the release is refused. It needs neither the SSH session nor the laptop, and a DGX
+restart starts the wait again. Without `--detach` the same wait runs in the terminal.
+On hugo-dgx1, `claude-qwen` stayed displaced for 12 hours after the runs it was
+displaced for had ended.
 
 `dgx-autonomy release` removes the owned llama-server. The controller refuses while
 a run is active. The CLI then runs the helper's `release`, which **refuses, and

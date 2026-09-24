@@ -57,7 +57,9 @@ DESCRIPTION = f"""Serve the app so the operator can open it in a browser.
   your work ends, so the operator would never see it.
 * The command must stay in the foreground and serve on port {DEMO_PORT}, host 0.0.0.0.
   PORT={DEMO_PORT} and HOST=0.0.0.0 are set for it. Port {DEMO_PORT} is the only port
-  the operator can reach. Examples: `pnpm start`, `npx serve -l {DEMO_PORT} dist`,
+  the operator can reach, and it belongs to the demo: whatever else listens on it is
+  ended when the demo starts. Test your own servers on other ports.
+  Examples: `pnpm start`, `npx serve -l {DEMO_PORT} dist`,
   `python3 -m http.server {DEMO_PORT} --bind 0.0.0.0`.
 * Build first; the command should start quickly. Calling the tool again replaces the
   running demo.

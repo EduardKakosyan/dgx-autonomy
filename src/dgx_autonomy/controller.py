@@ -1203,6 +1203,7 @@ class Controller:
             "session_id": demo.session_id,
             "alive": live.alive if live else None,
             "listening": live.listening if live else None,
+            "problem": (live.problem or None) if live else None,
         }
 
     def _demo_live(self, demo: Demo) -> DemoStatus | None:
@@ -2568,8 +2569,10 @@ class Controller:
         if demo.state == "running" and live is not None and live.listening:
             steps["demo_ready"] = self._clock.now().isoformat()
             return self._state.record_evaluation_steps(ev.id, steps)
-        why = demo.message or (
-            "the demo is not listening" if live is None or live.alive else "the demo exited"
+        why = (
+            (live.problem if live is not None else "")
+            or demo.message
+            or ("the demo is not listening" if live is None or live.alive else "the demo exited")
         )
         steps["demo_note"] = f"The demo is not serving the app: {why}"
         ev = self._state.record_evaluation_steps(ev.id, steps)
@@ -3163,12 +3166,13 @@ class Controller:
                 now=now,
             )
         elif waited > self._settings.demo_start_timeout_s:
+            why = f" ({live.problem})" if live.problem else ""
             demo = self._state.set_demo_state(
                 run.id,
                 state="failed",
                 message=(
-                    f"not listening on port {demo.port} after {waited:.0f}s; the command is "
-                    f"still running. Last output:\n{_clip(live.log_tail)}"
+                    f"not listening on port {demo.port} after {waited:.0f}s{why}; the command"
+                    f" is still running. Last output:\n{_clip(live.log_tail)}"
                 ),
                 now=now,
             )

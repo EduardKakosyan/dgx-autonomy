@@ -196,6 +196,9 @@ class DemoStatus:
     alive: bool
     listening: bool
     log_tail: str = ""
+    # Why the port is not the demo's to serve: another process holds it, or the demo
+    # listens on loopback only.
+    problem: str = ""
 
 
 class RuntimePort(ContainerPort, Protocol):

@@ -96,3 +96,99 @@ def test_demo_env_drops_the_agent_server_keys(
     assert not any(k.startswith("OH_") for k in env)
     assert env["PORT"] == "3000" and env["HOST"] == "0.0.0.0"
     assert env["PATH"] == "/opt/node22/bin:/usr/bin"
+
+
+def _tcp(root: Path, rows: list[tuple[str, int, int]], table: str = "tcp") -> None:
+    """rows: (local address hex, port, inode), all LISTEN."""
+    net = root / "net"
+    net.mkdir(exist_ok=True)
+    header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when uid inode\n"
+    lines = [
+        f"   {i}: {addr}:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000"
+        f"  10001        0 {inode} 1 0000000000000000 100 0 0 10 0\n"
+        for i, (addr, port, inode) in enumerate(rows)
+    ]
+    (net / table).write_text(header + "".join(lines))
+
+
+def _fd(root: Path, pid: int, inode: int) -> None:
+    fd = root / str(pid) / "fd"
+    fd.mkdir(exist_ok=True)
+    (fd / str(len(list(fd.iterdir())) + 3)).symlink_to(f"socket:[{inode}]")
+
+
+def test_loopback_addresses(sb: ModuleType) -> None:
+    assert sb._loopback("0100007F")  # 127.0.0.1
+    assert not sb._loopback("00000000")  # 0.0.0.0
+    assert not sb._loopback("0200A8C0")  # 192.168.0.2
+    assert sb._loopback("00000000000000000000000001000000")  # ::1
+    assert sb._loopback("0000000000000000FFFF00000100007F")  # ::ffff:127.0.0.1
+    assert not sb._loopback("00000000000000000000000000000000")  # ::
+
+
+def test_a_stray_loopback_server_on_the_demo_port_is_not_the_demo(
+    sb: ModuleType, tmp_path: Path
+) -> None:
+    """hugo-dgx1: the agent's `http.server 3000 --bind 127.0.0.1` held the port."""
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    _proc(proc, 1, 0, 1, "python3 -I dgx_sandbox.py supervise")
+    _proc(proc, 40, 1, 40, "python3 -m http.server 3000 --bind 127.0.0.1")  # agent's
+    _proc(proc, 50, 1, 50, "/bin/sh -c python3 -m http.server 3000 --bind 0.0.0.0")
+    _fd(proc, 40, 111)
+    _tcp(proc, [("0100007F", 3000, 111)])
+
+    status = sb.demo_status(50, 3000, str(proc))
+    assert status["alive"] is True and status["listening"] is False
+    assert "not the demo" in status["problem"] and "pid 40" in status["problem"]
+
+
+def test_the_demo_on_all_addresses_is_listening(sb: ModuleType, tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    _proc(proc, 50, 1, 50, "/bin/sh -c pnpm start")
+    _proc(proc, 51, 50, 50, "node server.js")
+    _fd(proc, 51, 222)
+    _tcp(proc, [], "tcp")
+    _tcp(proc, [("00000000000000000000000000000000", 3000, 222)], "tcp6")
+
+    status = sb.demo_status(50, 3000, str(proc))
+    assert status == {"alive": True, "listening": True, "problem": "", "log_tail": ""}
+
+
+def test_a_demo_on_loopback_only_is_not_reachable(sb: ModuleType, tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    _proc(proc, 50, 1, 50, "/bin/sh -c vite preview --port 3000")
+    _fd(proc, 50, 333)
+    _tcp(proc, [("0100007F", 3000, 333)])
+
+    status = sb.demo_status(50, 3000, str(proc))
+    assert status["listening"] is False and "loopback only" in status["problem"]
+
+
+def test_free_port_ends_only_the_listeners(
+    sb: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    _proc(proc, 1, 0, 1, "python3 -I dgx_sandbox.py supervise")
+    _proc(proc, 40, 1, 40, "bash")
+    _proc(proc, 41, 40, 40, "python3 -m http.server 3000")
+    _proc(proc, 42, 40, 40, "node other.js")
+    _fd(proc, 41, 111)
+    _fd(proc, 42, 444)
+    _tcp(proc, [("00000000", 3000, 111), ("00000000", 5173, 444)])
+    sent: list[tuple[int, int]] = []
+
+    def kill(pid: int, sig: int) -> None:
+        sent.append((pid, sig))
+        if sig in (sb.signal.SIGTERM, sb.signal.SIGKILL):
+            for p in (proc / str(pid)).rglob("*"):
+                if p.is_symlink() or p.is_file():
+                    p.unlink()
+
+    monkeypatch.setattr(sb.os, "kill", kill)
+    freed = sb.free_port(3000, grace_s=0.5, root=str(proc))
+    assert [p["pid"] for p in freed] == [41]
+    assert sent == [(41, sb.signal.SIGTERM)]

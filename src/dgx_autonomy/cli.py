@@ -221,6 +221,8 @@ def _print_status(result: dict[str, Any]) -> None:
             print(f"            command: {demo['command']}")
         if demo.get("message") and demo["state"] != "running":
             print(f"            {demo['message']}")
+        if demo.get("problem"):
+            print(f"            {demo['problem']}")
     if criteria and (criteria["automated"] or criteria["human_judgment"]):
         print(
             f"criteria    {criteria['automated']} automated,"
@@ -234,7 +236,10 @@ def _print_status(result: dict[str, Any]) -> None:
         for key, r in evaluation["results"].items():
             print(f"            {r['status']:<8} {key}  {r.get('summary') or ''}")
     if len(conversations) > 1 or any(c["status"] != "active" for c in conversations):
-        chain = ", ".join(f"#{c['n']} {c['status']} ({c['reason']})" for c in conversations)
+        ended = result.get("phase") in TERMINAL_PHASES
+        chain = ", ".join(
+            f"#{c['n']} {_conv_status(c, ended)} ({c['reason']})" for c in conversations
+        )
         print(f"conversations {chain}")
     if blocked:
         b = blocked["blocker"]
@@ -364,8 +369,10 @@ def print_report(r: dict[str, Any]) -> None:
     conversations = r.get("conversations") or []
     if len(conversations) > 1:
         print("\nConversations (fresh ones continue from checkpoints)")
+        ended = r.get("phase") in TERMINAL_PHASES
         for c in conversations:
-            print(f"  #{c['n']} {c['status']:<9} {c['reason']:<15} from {c['started_at']}")
+            status = _conv_status(c, ended)
+            print(f"  #{c['n']} {status:<9} {c['reason']:<15} from {c['started_at']}")
         for k in r.get("checkpoints") or []:
             problems = f"; {'; '.join(k['problems'])}" if k["problems"] else ""
             print(f"  checkpoint #{k['n']} {k['source']} ({k['reason']}){problems}")
@@ -433,6 +440,11 @@ def cmd_rollover(args: argparse.Namespace) -> int:
             f" (`dgx-autonomy checkpoints {args.run_id}` shows the chain)"
         )
     return 0
+
+
+def _conv_status(c: dict[str, Any], run_ended: bool) -> str:
+    """`active` is the run's current conversation; once the run ended it is the last."""
+    return "last" if run_ended and c["status"] == "active" else str(c["status"])
 
 
 def cmd_checkpoints(args: argparse.Namespace) -> int:
@@ -620,8 +632,86 @@ def cmd_reserve(args: argparse.Namespace) -> int:
     return 0
 
 
+RELEASE_UNIT = "dgx-autonomy-release-after@.service"
+RELEASE_UNIT_TEXT = """\
+[Unit]
+Description=dgx-autonomy: give the DGX back to claude-qwen when run %i ends
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/dgx-autonomy release --after %i
+# Done (released, or nothing to release): the unit does not start again at boot.
+ExecStopPost=/bin/sh -c '[ "$SERVICE_RESULT" = success ] && systemctl --user disable %n || true'
+Restart=on-failure
+RestartSec=300
+
+[Install]
+WantedBy=default.target
+"""
+RELEASE_POLL_S = 60.0
+RELEASE_RETRY_S = 300.0
+
+
+def _release_detached(run_id: str, runner: HelperRunner = _run) -> int:
+    """A systemd user unit (jim lingers) waits for the run, so neither the SSH session
+    nor the laptop has to outlive it, and a DGX restart starts the wait again."""
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    (unit_dir / RELEASE_UNIT).write_text(RELEASE_UNIT_TEXT)
+    instance = RELEASE_UNIT.replace("@", f"@{run_id}")
+    for argv in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", instance],
+    ):
+        proc = runner(argv)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()
+            print(f"dgx-autonomy: {' '.join(argv)}: {detail}", file=sys.stderr)
+            return 1
+    print(f"{instance}: claude-qwen comes back when run {run_id} ends")
+    print(f"  follow it with: journalctl --user -u {instance} -f")
+    return 0
+
+
+def _release_after(args: argparse.Namespace, sleep: Callable[[float], None] = time.sleep) -> int:
+    """Wait until the run has ended, then release; retry while a release is refused
+    (a retained demo holding memory, another run starting)."""
+    run_id = args.after
+    announced = False
+    while True:
+        try:
+            phase = call(_socket(args), "status", {"run_id": run_id})["phase"]
+        except (ControlError, OSError) as exc:
+            print(f"cannot read run {run_id} ({exc}); trying again", flush=True)
+            sleep(RELEASE_POLL_S)
+            continue
+        if phase not in TERMINAL_PHASES:
+            if not announced:
+                print(f"run {run_id} is {phase}; releasing when it ends", flush=True)
+                announced = True
+            sleep(RELEASE_POLL_S)
+            continue
+        print(f"run {run_id} is {phase}; releasing", flush=True)
+        try:
+            code = _release_now(args)
+        except (ControlError, HelperError, OSError) as exc:
+            print(f"release failed ({exc}); trying again", flush=True)
+            code = 1
+        if code == 0:
+            return 0
+        sleep(RELEASE_RETRY_S)
+
+
 def cmd_release(args: argparse.Namespace) -> int:
     """Stop the environment's llama-server and give the DGX back to claude-qwen."""
+    if args.after and args.detach:
+        return _release_detached(args.after)
+    if args.after:
+        return _release_after(args)
+    return _release_now(args)
+
+
+def _release_now(args: argparse.Namespace) -> int:
     stopped = call(_socket(args), "inference.stop", timeout=300)
     if not args.json:
         print(f"owned llama-server {'removed' if stopped['removed'] else 'was not running'}")
@@ -817,6 +907,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_reserve)
 
     s = sub.add_parser("release", help="stop the owned llama-server and restore claude-qwen")
+    s.add_argument(
+        "--after", metavar="RUN_ID", default=None, help="wait until the run ends, then release"
+    )
+    s.add_argument(
+        "--detach",
+        action="store_true",
+        help="with --after: wait in a systemd user unit instead of this session",
+    )
     s.set_defaults(func=cmd_release)
 
     s = sub.add_parser("reservation", help="is the DGX inference reserved, and for how long")
