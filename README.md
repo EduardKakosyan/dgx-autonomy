@@ -1,5 +1,48 @@
 # dgx-autonomy
 
+**A self-governing build loop for one NVIDIA DGX Spark.** A person writes what they want. A local open-weights model builds it unattended for up to 40 hours: it plans, codes, tests, looks at its own screenshots, and commits. The environment around the model decides whether it's done. Frozen acceptance checks run in separate containers, and a product lead reviews the live app and sends feedback about what a user sees, never about the code. The product lead is a person, or a supervising Claude session acting for them. No cloud model writes the code, and nobody answers the builder's questions.
+
+## Built in this loop
+
+| Project | What it is | Builder | Result |
+|---|---|---|---|
+| [**Shoreline**](https://github.com/EduardKakosyan/shoreline) | Beach and fishing verdicts, tides, sea state and weather for a day at the water; mobile-first web app | Qwen3.8-Flash-Next (SGLang / llama.cpp) on the DGX Spark | 3 runs, 42 commits, 19/19 acceptance checks, accepted |
+| **Yahtzee** | A quick Yahtzee game | — | next up |
+
+Each project repo carries its own loop record: the frozen brief and acceptance checks of every run, and every message the operator sent the builder.
+
+## How the loop works
+
+```text
+ request ──► brief + frozen acceptance checks ──► launch (budget ≤ 40 h, deadline fixed)
+                                                     │
+      ┌──────────────────────────────────────────────┘
+      ▼
+ builder (local model in an OpenHands sandbox)
+   plans · codes · runs the checks and its own audits · commits · serves a demo
+   context full? ──► writes a handoff ──► fresh conversation continues from it
+      │
+      ▼ claims "done"
+ evaluator containers run the frozen checks against the live demo
+      │ all required checks pass
+      ▼
+ held for review ──► operator opens the demo on real data
+      │                 ├─ falls short ──► product feedback ──► builder works and claims again
+      │                 └─ good ─────────► accept
+      ▼
+ run ends (verified, expired or stopped): the demo stays up, the GPU goes back to its owner
+```
+
+- **The builder can't grade itself.** Checks are frozen at launch and run in separate evaluator containers after each claim. The builder can read them but can't change them.
+- **Unattended for real.** Nobody answers the builder's questions. The only input after launch is the operator's product feedback, and every word of it is recorded in each project's repo.
+- **Long runs survive context limits.** Near the context limit the builder writes a structured handoff and continues in a fresh conversation. If it doesn't, the environment records a checkpoint from what it can observe.
+- **One machine, shared politely.** The loop reserves the GPU from its everyday owner (`claude-qwen`) for a run and gives it back when the run ends.
+- **Operator log.** [`docs/operator-log.md`](docs/operator-log.md) is the supervising session's running log: every launch, review, failure and fix, with timings. [`docs/design/`](docs/design/) holds the research, PRD, technical design and structure outline the environment was built from.
+
+The rest of this README is the operator's manual.
+
+## The environment
+
 An environment for unattended OpenHands coding runs on the DGX Spark (`hugo-dgx1`).
 It is a Python package with its own toolchain (uv, pytest, ruff).
 
