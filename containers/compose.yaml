@@ -47,7 +47,7 @@ services:
   agent-image:
     image: dgx-autonomy/agent:1.49.4
     build:
-      # autonomy/: the image copies containers/sandbox/ and src/dgx_autonomy/demo_tool.py.
+      # the repository root: the image copies containers/sandbox/ and src/dgx_autonomy/demo_tool.py.
       context: ..
       dockerfile: containers/agent.Dockerfile
     profiles: [images]
@@ -55,7 +55,7 @@ services:
   evaluator-image:
     image: dgx-autonomy/evaluator:1.63.0
     build:
-      # autonomy/: the image copies containers/evaluator/ (lockfiles, Playwright config).
+      # the repository root: the image copies containers/evaluator/ (lockfiles, Playwright config).
       context: ..
       dockerfile: containers/evaluator.Dockerfile
     profiles: [images]

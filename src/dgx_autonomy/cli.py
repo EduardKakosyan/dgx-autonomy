@@ -95,6 +95,10 @@ def cmd_launch(args: argparse.Namespace) -> int:
     if not args.brief:
         print("dgx-autonomy: launch needs --brief or --plan", file=sys.stderr)
         return 2
+    from_run, report = getattr(args, "from_run", None), getattr(args, "report", None)
+    if bool(from_run) != bool(report):
+        print("dgx-autonomy: --from-run and --report go together", file=sys.stderr)
+        return 2
     brief = Path(args.brief)
     # The controller runs in a container and cannot read the operator's files, so
     # the CLI sends their contents, and the digest of what it read. The controller
@@ -115,6 +119,12 @@ def cmd_launch(args: argparse.Namespace) -> int:
             "brief_source": str(brief.resolve()),
             "model_key": args.model,
             "budget_hours": args.budget_hours,
+            "review_hold": getattr(args, "hold", False),
+            **(
+                {"from_run": from_run, "report_text": Path(report).read_text()}
+                if from_run and report
+                else {}
+            ),
         },
     )
     if args.json:
@@ -347,7 +357,13 @@ def print_report(r: dict[str, Any]) -> None:
         print("  none")
     for e in r["evaluations"]:
         relaunched = ", demo relaunched" if e["demo_relaunched"] else ""
-        delivered = ", failures sent to the builder" if e["delivered_at"] else ""
+        delivered = ""
+        if e["delivered_at"]:
+            delivered = (
+                ", held for the operator's review"
+                if e["status"] == "passed"
+                else ", failures sent to the builder"
+            )
         print(
             f"  #{e['n']} {e['trigger']:<9} {e['status']:<12} snapshot"
             f" {str(e['snapshot'])[:12]}{relaunched}{delivered}"
@@ -440,6 +456,42 @@ def cmd_rollover(args: argparse.Namespace) -> int:
             f"conversation #{result['n']} requested; the current one is asked for a handoff"
             f" (`dgx-autonomy checkpoints {args.run_id}` shows the chain)"
         )
+    return 0
+
+
+def cmd_hold(args: argparse.Namespace) -> int:
+    """A claim that passes every check waits for the operator instead of finishing."""
+    result = call(_socket(args), "review.hold", {"run_id": args.run_id, "hold": not args.off})
+    if args.json:
+        _print(result, True)
+    elif args.off:
+        print(f"run {result['run_id']}: not held; a verified claim finishes it")
+    else:
+        print(
+            f"run {result['run_id']}: held; a verified claim waits for"
+            " `dgx-autonomy accept` or `dgx-autonomy feedback`"
+        )
+    return 0
+
+
+def cmd_accept(args: argparse.Namespace) -> int:
+    """Accept held, verified work: the run finishes."""
+    result = call(_socket(args), "review.accept", {"run_id": args.run_id})
+    if args.json:
+        _print(result, True)
+    else:
+        print(f"run {result['run_id']}: accepted; {result['phase']}")
+    return 0
+
+
+def cmd_feedback(args: argparse.Namespace) -> int:
+    """Send the builder product direction; it works on it, then claims again."""
+    text = Path(args.file).read_text()
+    result = call(_socket(args), "feedback", {"run_id": args.run_id, "text": text})
+    if args.json:
+        _print(result, True)
+    else:
+        print(f"run {result['run_id']}: feedback #{result['feedback_n']} sent to the builder")
     return 0
 
 
@@ -828,6 +880,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--budget-hours", type=_budget, default=MAX_BUDGET_HOURS, help="wall-clock budget (≤40)"
     )
+    s.add_argument("--hold", action="store_true", help="hold for your review before finishing")
+    s.add_argument("--from-run", help="continue an ended run's project (with --brief)")
+    s.add_argument("--report", help="with --from-run: your report on it, as text (required)")
     s.set_defaults(func=cmd_launch)
 
     s = sub.add_parser("plan", help="plan a run with the model (interactive)")
@@ -881,6 +936,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("run_id")
     s.add_argument("--detail", help="why, for the record and the next conversation")
     s.set_defaults(func=cmd_rollover)
+
+    s = sub.add_parser("hold", help="hold a run for your review before it finishes")
+    s.add_argument("run_id")
+    s.add_argument("--off", action="store_true", help="stop holding: a verified claim finishes")
+    s.set_defaults(func=cmd_hold)
+
+    s = sub.add_parser("accept", help="accept a held run's verified work; it finishes")
+    s.add_argument("run_id")
+    s.set_defaults(func=cmd_accept)
+
+    s = sub.add_parser("feedback", help="send the builder direction; it works, then claims again")
+    s.add_argument("run_id")
+    s.add_argument("file", help="the feedback, as text")
+    s.set_defaults(func=cmd_feedback)
 
     s = sub.add_parser("checkpoints", help="a run's conversations and checkpoint chain")
     s.add_argument("run_id", nargs="?", help="run id (default: the latest run)")

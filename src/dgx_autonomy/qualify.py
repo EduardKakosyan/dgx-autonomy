@@ -476,7 +476,7 @@ class Qualifier:
         # The server we remove frees roughly its weights, also when it serves this
         # model (it is loaded again, with the settings being qualified).
         freed = self._settings_size(serving) if serving is not None else 0
-        needed = model.size_bytes + MEMORY_HEADROOM_BYTES
+        needed = model.memory_bytes + MEMORY_HEADROOM_BYTES
         result = {
             "ok": available + freed >= needed,
             "available_gib": round(available / GIB, 1),
@@ -496,7 +496,7 @@ class Qualifier:
         from .config import load_models
 
         try:
-            return load_models(self._settings.models_file).get(key).size_bytes
+            return load_models(self._settings.models_file).get(key).memory_bytes
         except Exception:
             return 0
 
@@ -514,7 +514,7 @@ class Qualifier:
             if ready:
                 break
             if time.monotonic() > deadline or detail.startswith("exited"):
-                raise QualificationError(f"llama-server did not become ready: {detail}")
+                raise QualificationError(f"the inference server did not become ready: {detail}")
             self._sleep(5)
         after = self._meminfo().get("MemAvailable", 0)
         return {
@@ -555,19 +555,35 @@ class Qualifier:
     def _long_prompt(self, model: ModelConfig) -> dict[str, Any]:
         target = int(model.ctx * LONG_PROMPT_FRACTION)
         secret = "quartzlight"
+        messages = _user(long_prompt(target, secret))
+        # A prompt of most of a 256K context takes minutes to prefill alone.
+        timeout = max(1800, model.request_timeout_s)
+        prefill_s = None
+        if model.backend != "llama.cpp":
+            # No per-request timings: time a one-token answer (the prefill), then the
+            # full answer, whose prompt is then cached (its time is the decode).
+            started = time.monotonic()
+            self._chat({"model": model.key, "messages": messages, "max_tokens": 1}, timeout)
+            prefill_s = time.monotonic() - started
+        started = time.monotonic()
         answer = self._chat(
             {
                 "model": model.key,
-                "messages": _user(long_prompt(target, secret)),
+                "messages": messages,
                 "temperature": 0,
                 # Room for a reasoning model to think before it answers.
                 "max_tokens": min(model.max_output_tokens, 16384),
             },
-            # A prompt of most of a 256K context takes minutes to prefill alone.
-            max(1800, model.request_timeout_s),
+            timeout,
         )
+        answer_s = time.monotonic() - started
         usage = answer.get("usage") or {}
         timings = answer.get("timings") or {}
+        if prefill_s is not None and usage.get("prompt_tokens") and usage.get("completion_tokens"):
+            timings = {
+                "prompt_per_second": usage["prompt_tokens"] / prefill_s,
+                "predicted_per_second": usage["completion_tokens"] / answer_s,
+            }
         content = str(((answer.get("choices") or [{}])[0].get("message") or {}).get("content"))
         recalled = secret in content.lower()
         out = {

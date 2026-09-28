@@ -8,7 +8,7 @@
 # reaches the demo by the sandbox's name, and the host's egress rules keep it off
 # the DGX, the LAN and the tailnet. No Docker socket, no model, no controller state.
 #
-# Build context: autonomy/ (compose sets it to ..).
+# Build context: the repository root (compose sets it to ..).
 
 # v1.63.0-noble, pinned by the multi-arch index digest (linux/arm64 included). It
 # matches the beach app's @playwright/test and ships the browsers for 1.63.0.

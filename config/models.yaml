@@ -1,4 +1,5 @@
-# Models the controller can serve with its own llama-server.
+# Models the controller can serve with its own inference server (llama.cpp by
+# default; `backend: sglang` for the SGLang entries).
 #
 # `gguf` is relative to the host models directory (DGX_AUTONOMY_MODELS, default
 # /home/jim/models), which the inference container mounts read-only at /models.
@@ -92,3 +93,66 @@ models:
       min_available_gib_with_workload: 16.3
       swap_growth_gib: 0.0
       workload_run: 20260924-124743-98ffd8 (VERIFIED)
+
+  qwen3.8-flash-next-sglang:
+    # The same model served by SGLang from the NVFP4 checkpoint (4-bit, calibrated),
+    # following the SGLang cookbook's single-DGX-Spark low-latency cell. llama.cpp
+    # computes QSA as dense attention under a mask, so its decode falls from 25 to 8
+    # tokens/s between an empty and a 225K context (weather run, 2026-09-25); SGLang
+    # has sparse QSA kernels. The 47.7 GiB N-gram (PLE) table does not fit in memory
+    # next to the weights: it is a sparse file in <data dir>/inference/ple on the NVMe,
+    # rewritten on every boot (about 10 minutes). No reasoning budget: SGLang has no
+    # equivalent of llama.cpp's, so max_output_tokens alone bounds a response.
+    backend: sglang
+    # Pulled 2026-09-25: the arm64 build that knows --ple-offload-backend file.
+    image: lmsysorg/sglang:dev-qwen38-next-local@sha256:9d2a843c706c74bc259c0d9abf360551eb2734e1e7d255ab012a6965f10480b6
+    repo: RadixArk/Qwen3.8-Flash-Next-NVFP4
+    revision: 7b719225242aacd3dbd3f9407468c2ee9a9d2594
+    path: qwen3.8-flash-next-nvfp4
+    # 419 files, 135,253,622,894 bytes (126.0 GiB), 47.7 GiB of it the PLE table.
+    size_bytes: 135253622894
+    # --mem-fraction-static of the GB10's memory: 79.7 GB of weights, 3.8 GB of MTP
+    # draft, the mamba pool (2.5 GB) and the KV pool, about 25 KB a token in bf16. At
+    # 0.80 the KV pool held only 131,712 tokens (first qualification, 2026-09-25) with
+    # 21.7 GiB left free; 0.84 adds about 4.8 GB, room for the full 262K context.
+    mem_fraction: 0.84
+    resident_bytes: 105000000000
+    ctx: 262144
+    # Two requests (the builder, and a planner or qualification probe); the mamba
+    # pool holds 5 states a request with MTP.
+    parallel: 2
+    max_output_tokens: 65536
+    request_timeout_s: 5400
+    extra_args: [
+      "--tp", "1",
+      "--quantization", "modelopt_fp4",
+      "--fp4-gemm-backend", "flashinfer_cutlass",
+      "--page-size", "64",
+      "--chunked-prefill-size", "4096",
+      "--speculative-algorithm", "NEXTN",
+      "--speculative-num-steps", "3",
+      "--speculative-eagle-topk", "1",
+      "--speculative-num-draft-tokens", "4",
+      "--max-mamba-cache-size", "10",
+      "--ple-offload-embedding",
+      "--ple-offload-backend", "file",
+      "--reasoning-parser", "qwen3",
+      "--tool-call-parser", "auto",
+    ]
+    status: qualified
+    measured:
+      # dgx-autonomy qualify, 2026-09-25T16:15Z (reservation held), record
+      # qualification/qwen3.8-flash-next-sglang/20260925T161541.json. At 0.80 the KV
+      # pool held 131,712 tokens and the long prompt was refused (20260925T160148).
+      load_seconds: 714.9
+      memory_gib: 101.2
+      kv_pool_tokens: 279360
+      tool_call_probes: 5/5
+      long_prompt_tokens: 205603
+      prefill_tokens_per_s: 1939.7
+      decode_tokens_per_s_at_206k: 13.6
+      decode_tokens_per_s_near_empty: 19-34 (MTP accepts 3.3-3.7 of 4)
+      # Tighter than llama.cpp (16.3): watch memory on runs with heavy browser tests.
+      min_available_gib_with_workload: 9.26
+      swap_growth_gib: 0.585
+      workload_run: 20260925-162942-331fa7 (VERIFIED in 4 minutes)

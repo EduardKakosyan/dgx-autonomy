@@ -57,7 +57,7 @@ PlanState = Literal["starting", "open", "launched", "closed", "failed"]
 ConversationRowStatus = Literal["handoff", "starting", "active", "ended", "abandoned"]
 CheckpointSource = Literal["agent_handoff", "controller_fallback"]
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 TERMINAL_PHASES: frozenset[str] = frozenset({"stopped", "finished", "failed"})
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "launched": frozenset({"running", "failed", "stopping"}),
@@ -320,6 +320,9 @@ class Run:
     current_checkpoint_id: str | None = None
     # JSON: the blocker a fresh conversation confirmed (outcome `blocked`).
     blocked: str | None = None
+    # The operator reviews the work before the run finishes: a claim that passes every
+    # check waits for `accept` or `feedback` instead of ending the run.
+    review_hold: bool = False
 
     @property
     def terminal(self) -> bool:
@@ -542,6 +545,12 @@ def _migrate(db: sqlite3.Connection) -> None:
                 " case when phase in ('stopped', 'finished', 'failed') then 'ended'"
                 " else 'active' end, 'launch', launched_at, launched_at, launched_at"
                 " from runs where conversation_id is not null"
+            )
+        if version < 7:
+            # v6 -> v7: the operator's review before a verified run finishes.
+            db.execute(
+                "alter table runs add column review_hold integer not null default 0"
+                " check (review_hold in (0, 1))"
             )
         problems = db.execute("pragma foreign_key_check").fetchall()
         if problems:
@@ -1410,6 +1419,16 @@ class StateStore:
             )
         return self._require_conversation(conv_id)
 
+    def note_handoff_reminder(self, conv_id: str) -> ConversationRow:
+        """The same request, asked again. Its timeout still counts from the first."""
+        with self._tx() as db:
+            db.execute(
+                "update conversations set handoff_attempts = handoff_attempts + 1"
+                " where id = ? and status = 'handoff'",
+                (conv_id,),
+            )
+        return self._require_conversation(conv_id)
+
     def retry_rollover(self, conv_id: str, now: datetime) -> ConversationRow:
         """A controller restart: the attempt's timeouts count from now."""
         with self._tx() as db:
@@ -1527,6 +1546,11 @@ class StateStore:
         with self._lock:
             row = self._db.execute("select * from checkpoints where id = ?", (ckpt_id,)).fetchone()
         return _checkpoint(row) if row else None
+
+    def set_review_hold(self, run_id: str, hold: bool) -> Run:
+        with self._tx() as db:
+            db.execute("update runs set review_hold = ? where id = ?", (int(hold), run_id))
+        return self._require_run(run_id)
 
     def record_blocked(self, run_id: str, blocker_json: str) -> Run:
         """The confirmed blocker. Persisted before the stop that ends the run."""
@@ -1683,6 +1707,7 @@ def _run(row: sqlite3.Row) -> Run:
         frozen_digest=row["frozen_digest"],
         current_checkpoint_id=row["current_checkpoint_id"],
         blocked=row["blocked"],
+        review_hold=bool(row["review_hold"]),
     )
 
 

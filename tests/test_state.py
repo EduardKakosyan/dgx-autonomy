@@ -394,7 +394,7 @@ def test_a_phase_4_database_gains_the_frozen_agreement_and_evaluations(tmp_path:
         == 2
     )
     raw = sqlite3.connect(path)
-    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 6
+    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 7
     raw.close()
     store.close()
 
@@ -445,7 +445,12 @@ def test_v4_database_gains_plans_and_a_plan_launches_once(tmp_path: Path) -> Non
     store.close()
 
 
+def _undo_v7(db: sqlite3.Connection) -> None:
+    db.execute("alter table runs drop column review_hold")
+
+
 def _undo_v6(db: sqlite3.Connection) -> None:
+    _undo_v7(db)
     db.execute("drop table conversations")
     db.execute("drop table checkpoints")
     db.execute("alter table runs drop column current_checkpoint_id")
@@ -521,6 +526,30 @@ def test_v5_database_gains_conversation_history_and_checkpoints(tmp_path: Path) 
     assert old is not None and old.conversation_id == "c-old-2"
     assert store.record_blocked("old", '{"x": 1}').blocked == '{"x": 1}'
     raw = sqlite3.connect(path)
-    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 6
+    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 7
+    raw.close()
+    store.close()
+
+
+def test_v6_database_gains_the_review_hold(tmp_path: Path) -> None:
+    path = tmp_path / "v6.sqlite3"
+    store = StateStore(path)
+    store.create_run(
+        run_id="old", model_key="m", launched_at=LAUNCH, deadline_at=DEADLINE, brief_path="b"
+    )
+    store.close()
+    db = sqlite3.connect(path)
+    _undo_v7(db)
+    db.execute("pragma user_version = 6")
+    db.commit()
+    db.close()
+
+    store = StateStore(path)
+    old = store.get_run("old")
+    assert old is not None and old.review_hold is False
+    assert store.set_review_hold("old", True).review_hold is True
+    assert store.set_review_hold("old", False).review_hold is False
+    raw = sqlite3.connect(path)
+    assert raw.execute("pragma user_version").fetchone()[0] == SCHEMA_VERSION == 7
     raw.close()
     store.close()

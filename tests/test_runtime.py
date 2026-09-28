@@ -399,3 +399,77 @@ def test_thinking_is_bounded_when_the_model_says_so() -> None:
     assert "--reasoning-budget" not in inference_command(
         replace(flash, reasoning_budget=None), 8080
     )
+
+
+def test_an_sglang_model_runs_offline_with_its_own_image_and_writable_dirs(
+    settings: Settings,
+) -> None:
+    from dgx_autonomy.config import PACKAGED_MODELS_FILE
+
+    model = load_models(PACKAGED_MODELS_FILE).get("qwen3.8-flash-next-sglang")
+    spec = inference_container_spec(settings, model)
+    argv = docker_run_argv(spec)
+    assert spec.image == model.image
+    assert _flag_values(argv, "--user") == ["65534:65534"]
+    assert _flag_values(argv, "--cap-drop") == ["ALL"]
+    assert _flag_values(argv, "--network") == [settings.internal_network]
+    assert _flag_values(argv, "--shm-size") == ["8g"]
+    root = settings.data_dir / "inference"
+    assert _flag_values(argv, "--mount") == [
+        f"type=bind,source={settings.models_dir},target=/models,readonly",
+        f"type=bind,source={root / 'ple'},target=/ple",
+        f"type=bind,source={root / 'cache'},target=/cache",
+    ]
+    assert "HF_HUB_OFFLINE=1" in _flag_values(argv, "--env")
+    # The old PLE table file is deleted before the server starts (a rewrite is slow).
+    assert _flag_values(argv, "--entrypoint") == ["/bin/sh"]
+    assert 'find /ple -name "ple_table_*.bin" -delete' in argv[argv.index(spec.image) + 2]
+    assert _flag_values(argv, "--model-path") == [f"/models/{model.path}"]
+    assert _flag_values(argv, "--served-model-name") == [model.key]
+    assert _flag_values(argv, "--context-length") == [str(model.ctx)]
+    assert _flag_values(argv, "--mem-fraction-static") == [str(model.mem_fraction)]
+    assert _flag_values(argv, "--tool-call-parser") == ["auto"]
+    assert _flag_values(argv, "--reasoning-parser") == ["qwen3"]
+    assert "--jinja" not in argv and not any(a in ("-p", "--publish") for a in argv)
+
+
+def test_the_memory_check_counts_what_sglang_reserves(tmp_path: Path) -> None:
+    from dgx_autonomy.config import PACKAGED_MODELS_FILE
+    from dgx_autonomy.inference import InferenceError, InferenceManager
+
+    from fakes import FakeHttp, FakeRuntime
+
+    settings = Settings.from_env({})
+    runtime = FakeRuntime(settings)
+    model = load_models(PACKAGED_MODELS_FILE).get("qwen3.8-flash-next-sglang")
+    made: list[Path] = []
+    tight = InferenceManager(
+        settings, runtime, FakeHttp(), available=lambda: 100 * 1024**3, prepare_dir=made.append
+    )
+    with pytest.raises(InferenceError, match="not enough memory"):
+        tight.ensure(model)  # 96.9 GiB resident + 8 GiB headroom
+    roomy = InferenceManager(
+        settings, runtime, FakeHttp(), available=lambda: 110 * 1024**3, prepare_dir=made.append
+    )
+    roomy.ensure(model)
+    assert made == [
+        settings.data_dir / "inference" / "ple",
+        settings.data_dir / "inference" / "cache",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "error"),
+    [
+        ({"backend": "vllm", "gguf": "x.gguf"}, "backend must be one of"),
+        ({"backend": "sglang", "image": "i"}, "missing field 'path'"),
+        ({"backend": "sglang", "path": "m"}, "names its image"),
+        ({"backend": "sglang", "path": "../m", "image": "i"}, "relative to the models directory"),
+    ],
+)
+def test_a_backend_needs_its_own_fields(raw: dict[str, str], error: str) -> None:
+    from dgx_autonomy.config import ConfigError, _model_from
+
+    base = {"repo": "r", "revision": "v", "size_bytes": 1, "ctx": 1024}
+    with pytest.raises(ConfigError, match=error):
+        _model_from("m", {**base, **raw})

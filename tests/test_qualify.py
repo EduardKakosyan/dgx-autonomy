@@ -286,3 +286,29 @@ def test_a_suite_without_a_report_is_an_error(tmp_path: Path) -> None:
         only=["egress"], echo=lambda s: None,
     )  # fmt: skip
     assert report["suites"][0]["status"] == "error" and report["passed"] is False
+
+
+def test_without_server_timings_the_speeds_come_from_two_timed_requests(
+    settings: Settings,
+) -> None:
+    """SGLang answers without llama.cpp's `timings`: the prefill is a one-token answer
+    to the long prompt, the decode the full answer once that prompt is cached."""
+    host = FakeHost(available_gib=250)
+    long_bodies: list[dict[str, Any]] = []
+
+    def sglang_chat(body: dict[str, Any], timeout: float) -> tuple[int, Any]:
+        if "secret word" in str(body["messages"][-1].get("content") or ""):
+            long_bodies.append(body)
+            return 200, {
+                "choices": [{"message": {"content": "quartzlight"}}],
+                "usage": {"prompt_tokens": 196000, "completion_tokens": 400},
+            }
+        return _good_chat(body, timeout)
+
+    host.chat = sglang_chat
+    model = load_models(PACKAGED_MODELS_FILE).get("qwen3.8-flash-next-sglang")
+    job = _qualifier(settings, host).start(model, background=False)
+    assert [b["max_tokens"] for b in long_bodies] == [1, 16384]
+    step = job.steps["long_prompt"]
+    assert step["ok"] and step["prompt_tokens"] == 196000
+    assert step["prefill_tokens_per_s"] > 0 and step["decode_tokens_per_s"] > 0

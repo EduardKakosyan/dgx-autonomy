@@ -1,8 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-.mypy_cache/
 .pytest_cache/
 .ruff_cache/
-# written on the DGX by scripts/deploy.sh
 containers/.env

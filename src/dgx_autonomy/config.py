@@ -19,6 +19,9 @@ PACKAGED_MODELS_FILE = Path(__file__).resolve().parents[2] / "config" / "models.
 BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 
 
+BACKENDS = ("llama.cpp", "sglang")
+
+
 class ConfigError(ValueError):
     """The settings or model catalog are unusable."""
 
@@ -52,6 +55,20 @@ class ModelConfig:
     # and llama.cpp went on generating the abandoned answer. Cover max_output_tokens
     # at the measured decode speed plus a full-context prefill.
     request_timeout_s: int = 1800
+    # The server: "llama.cpp" (the image built from containers/inference.Dockerfile,
+    # weights in `gguf`) or "sglang" (`image`, a Hugging Face checkpoint directory in
+    # `path`, relative to the models directory).
+    backend: str = "llama.cpp"
+    image: str | None = None
+    path: str = ""
+    # What the server holds in memory once loaded, when that is not the size of the
+    # weights: SGLang reserves --mem-fraction-static of the GPU (unified) memory.
+    resident_bytes: int | None = None
+    mem_fraction: float | None = None
+
+    @property
+    def memory_bytes(self) -> int:
+        return self.resident_bytes if self.resident_bytes is not None else self.size_bytes
 
 
 @dataclass(frozen=True)
@@ -70,9 +87,20 @@ class ModelCatalog:
 
 def _model_from(key: str, raw: Mapping[str, Any]) -> ModelConfig:
     try:
-        gguf = str(raw["gguf"])
-        if gguf.startswith("/") or ".." in Path(gguf).parts:
-            raise ConfigError(f"model {key}: gguf must be relative to the models directory")
+        backend = str(raw.get("backend", "llama.cpp"))
+        if backend not in BACKENDS:
+            raise ConfigError(f"model {key}: backend must be one of {', '.join(BACKENDS)}")
+        gguf = str(raw.get("gguf", ""))
+        path = str(raw.get("path", ""))
+        weights = gguf if backend == "llama.cpp" else path
+        if not weights:
+            raise ConfigError(
+                f"model {key}: missing field {'gguf' if backend == 'llama.cpp' else 'path'!r}"
+            )
+        if weights.startswith("/") or ".." in Path(weights).parts:
+            raise ConfigError(f"model {key}: weights must be relative to the models directory")
+        if backend == "sglang" and not raw.get("image"):
+            raise ConfigError(f"model {key}: an sglang model names its image")
         return ModelConfig(
             key=key,
             repo=str(raw["repo"]),
@@ -91,6 +119,11 @@ def _model_from(key: str, raw: Mapping[str, Any]) -> ModelConfig:
             reasoning_budget=(
                 int(raw["reasoning_budget"]) if raw.get("reasoning_budget") is not None else None
             ),
+            backend=backend,
+            image=str(raw["image"]) if raw.get("image") else None,
+            path=path,
+            resident_bytes=int(raw["resident_bytes"]) if raw.get("resident_bytes") else None,
+            mem_fraction=float(raw["mem_fraction"]) if raw.get("mem_fraction") else None,
         )
     except KeyError as missing:
         raise ConfigError(f"model {key}: missing field {missing}") from None
@@ -199,6 +232,11 @@ class Settings:
     # Continuity (checkpoints.py). A conversation is replaced by a fresh one when its
     # latest request used this share of the model's context...
     rollover_context_fraction: float = 0.85
+    # ...or when there is no longer room for a full response (max_output_tokens) and
+    # this much growth before the next request. SGLang refuses a request whose prompt
+    # plus max_tokens exceeds the context: on hugo-dgx1 every request failed from 196,608
+    # prompt tokens (262,144 - 65,536), below 85%, and so did the handoff request.
+    rollover_response_margin_tokens: int = 16384
     # ...when this many completion claims in a row failed the checks...
     failures_before_rollover: int = 3
     # ...or when it errored again after this many nudges within the window (each nudge
@@ -209,6 +247,16 @@ class Settings:
     # How long the old conversation has to write its handoff before the controller
     # records a fallback checkpoint itself.
     handoff_timeout_s: float = 10 * 60.0
+    # A builder that keeps acting instead of writing its handoff is reminded after
+    # this many actions (write_handoff calls do not count), up to handoff_requests
+    # requests in all; if it still does not comply, the fallback checkpoint is taken
+    # at once instead of after the timeout. On hugo-dgx1 a builder at 226K of 262K
+    # tokens ignored the request and went on debugging for over 15 minutes.
+    handoff_actions_before_reminder: int = 3
+    handoff_requests: int = 3
+    # A conversation replaced because it keeps erroring, and still in error, cannot
+    # answer: the fallback is taken after this long, not after the request timeout.
+    handoff_errored_timeout_s: float = 2 * 60.0
     # The least time between rollovers for context and failures, and for the rest
     # (stuck, errors). A forced rollover or a blocker review is never held back.
     rollover_min_interval_s: float = 10 * 60.0

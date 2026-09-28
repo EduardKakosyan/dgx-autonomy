@@ -7,6 +7,7 @@ created and writes what the runner would report); snapshots use the real git.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -578,3 +579,19 @@ def test_the_claim_is_the_finish_action_even_after_a_thought(harness: Harness) -
     _ticks(h)
     [ev] = h.state.evaluations(run_id)
     assert ev.claim_event_id == event.id and ev.claim_text.endswith('finish {"message": "Done."}')
+
+
+def test_the_claim_is_found_when_a_long_thought_clips_the_finish_away(harness: Harness) -> None:
+    """Seen with SGLang: the summary cut at 300 characters before `-> finish`, and a
+    stats update was taken for the claim."""
+    h = harness
+    run_id = _running_with_demo(h)
+    event = h.conversation.claim("Done.")
+    long_thought = "Done. Summary of the work: " + "x" * 400
+    h.conversation.event_log[-1] = replace(event, text=long_thought[:299] + "…", tool="finish")
+    h.conversation.event_log.append(
+        type(event)("ev-stats", "t", "ConversationStateUpdateEvent", "environment", "stats={}")
+    )
+    _ticks(h)
+    [ev] = h.state.evaluations(run_id)
+    assert ev.claim_event_id == event.id

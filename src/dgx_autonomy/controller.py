@@ -77,6 +77,7 @@ from .evaluation import (
 from .inference import InferenceError, InferenceManager
 from .notify import Notifier
 from .openhands_adapter import (
+    HANDOFF_TOOL_NAME,
     ConversationError,
     conversation_id_for,
     persisted_event_count,
@@ -196,6 +197,16 @@ class RunPaths:
         return self.root / "evidence"
 
     @property
+    def seed(self) -> Path:
+        """Where the run's project came from (launch --from-run), and the operator's report."""
+        return self.root / "seed.json"
+
+    @property
+    def feedback(self) -> Path:
+        """The operator's feedback to the builder, one JSON object a line, oldest first."""
+        return self.root / "feedback.jsonl"
+
+    @property
     def snapshots_dir(self) -> Path:
         """Controller-owned git directory with the project snapshots (snapshot.py)."""
         return self.root / "snapshots.git"
@@ -270,7 +281,9 @@ def _atomic_write_bytes(path: Path, data: bytes, mode: int) -> None:
     os.replace(tmp, path)
 
 
-def agent_message(brief: str, *, checks: bool = False) -> str:
+def agent_message(
+    brief: str, *, checks: bool = False, seed: Mapping[str, Any] | None = None
+) -> str:
     text = (
         "You are working unattended; nobody will answer questions until the work is done.\n"
         f"Your project directory is {AGENT_PROJECT_DIR}. The agreed brief is below and is also"
@@ -294,11 +307,17 @@ def agent_message(brief: str, *, checks: bool = False) -> str:
         " (a missing capability or permission, not a bug you have not fixed yet), say so"
         " with declare_blocked; operating restrictions are not blockers to work around.\n"
     )
-    return text + (
-        "Complete the brief, verify the result yourself, then finish.\n\n"
-        "--- BRIEF ---\n"
-        f"{brief.strip()}\n"
-    )
+    if seed:
+        text += (
+            "This run continues earlier work. The project directory already holds the app as"
+            f" run {seed['from_run']} left it, with its git history: read it before changing"
+            " anything, and do not start over. The operator reviewed that app; the report"
+            " below is product direction from the person who accepts the work.\n"
+        )
+    text += "Complete the brief, verify the result yourself, then finish.\n\n"
+    if seed:
+        text += f"--- OPERATOR REPORT ---\n{str(seed['report']).strip()}\n\n"
+    return text + f"--- BRIEF ---\n{brief.strip()}\n"
 
 
 def recovery_notice(cause: str, *, sandbox_restarted: bool, demo_relaunched: bool) -> str:
@@ -589,6 +608,9 @@ class Controller:
             "plan.launch": self.plan_launch,
             "plan.close": self.plan_close,
             "rollover": self.rollover,
+            "review.hold": self.review_hold,
+            "review.accept": self.review_accept,
+            "feedback": self.feedback,
             "checkpoints": self.checkpoint_chain,
             "retire": self.retire,
             "qualify.start": self.qualify_start,
@@ -626,6 +648,7 @@ class Controller:
             model = self._catalog.get(args.get("model_key"))
         except ConfigError as exc:
             raise RequestError(str(exc)) from None
+        seed_from = self._seed_source(args)
 
         now = self._clock.now()
         run_id = _new_run_id(now)
@@ -639,7 +662,60 @@ class Controller:
             frozen_digest=agreement.digest,
             criteria=[c.as_dict() for c in agreement.criteria],
         )
+        if args.get("review_hold"):
+            run = self._state.set_review_hold(run.id, True)
+        if seed_from is not None:
+            self._seed_project(run.id, seed_from, str(args["report_text"]).strip(), now)
         return self._launched(run, agreement, source=str(args.get("brief_source", "?")))
+
+    def _seed_source(self, args: Mapping[str, Any]) -> Run | None:
+        """The ended run whose project a new run continues (`from_run`), checked."""
+        from_run = args.get("from_run")
+        if not from_run:
+            return None
+        prev = self._state.get_run(str(from_run))
+        if prev is None:
+            raise RequestError(f"no run {from_run}")
+        if not prev.terminal:
+            raise RequestError(f"run {prev.id} is {prev.phase}; stop it before continuing it")
+        report = args.get("report_text")
+        if not isinstance(report, str) or not report.strip():
+            raise RequestError("continuing a run needs the operator's report (report_text)")
+        if len(report.encode()) > MAX_FEEDBACK_BYTES:
+            raise RequestError(f"the report is larger than {MAX_FEEDBACK_BYTES} bytes")
+        if not self.paths(prev.id).project_dir.is_dir():
+            raise RequestError(f"run {prev.id} has no project to continue")
+        return prev
+
+    def _seed_project(self, run_id: str, prev: Run, report: str, now: datetime) -> None:
+        """Copy the ended run's project (and its git history) into the new workspace.
+
+        Symlinks are copied as links, never followed. The report is also the run's
+        first operator feedback, so a fresh conversation after a rollover gets it too.
+        """
+        dst = self.paths(run_id).project_dir
+        shutil.copytree(
+            self.paths(prev.id).project_dir,
+            dst,
+            symlinks=True,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("test-results"),
+        )
+        uid, gid = self._settings.agent_uid, self._settings.agent_gid
+        for root, dirs, files in os.walk(dst):
+            for name in (*dirs, *files):
+                p = Path(root, name)
+                if not p.is_symlink():
+                    self._chown(p, uid, gid)
+        paths = self.paths(run_id)
+        _atomic_write(
+            paths.seed,
+            json.dumps({"from_run": prev.id, "at": now.isoformat(), "report": report}),
+            0o644,
+        )
+        with paths.feedback.open("a") as f:
+            f.write(json.dumps({"n": 1, "at": now.isoformat(), "text": report}) + "\n")
+        log.info("%s: project continues run %s", run_id, prev.id)
 
     def _budget_hours(self, args: Mapping[str, Any]) -> float:
         try:
@@ -1252,6 +1328,7 @@ class Controller:
             "brief_path": run.brief_path,
             "conversation_id": run.conversation_id,
             "workspace_dir": str(self.paths(run.id).project_dir),
+            "review_hold": run.review_hold,
         }
 
     def _demo_view(self, run: Run) -> dict[str, Any] | None:
@@ -1684,7 +1761,9 @@ class Controller:
                 timeout_s=model.request_timeout_s,
             ),
             message=agent_message(
-                Path(run.brief_path).read_text(), checks=bool(self._automated(run.id))
+                Path(run.brief_path).read_text(),
+                checks=bool(self._automated(run.id)),
+                seed=self._seed(run.id),
             ),
         )
         try:
@@ -2233,6 +2312,26 @@ class Controller:
         handoff, problems = self._read_handoff(run, row)
         if handoff is not None and not problems:
             return self._record_checkpoint(run, row, "agent_handoff", handoff, [])
+        assert row.handoff_request_id is not None
+        actions = self._actions_since_request(
+            server,
+            old,
+            checkpoints.handoff_request_prefix(row.handoff_request_id, row.handoff_attempts),
+        )
+        if actions is not None and actions >= self._settings.handoff_actions_before_reminder:
+            if row.handoff_attempts >= self._settings.handoff_requests:
+                why = f"the builder ignored {row.handoff_attempts} handoff requests"
+                return self._fallback_checkpoint(run, row, old, why, problems)
+            n = row.handoff_attempts + 1
+            text = checkpoints.handoff_reminder(row.handoff_request_id, n, actions)
+            try:
+                self._conversations.deliver(server, old, EvidenceMessage(text))
+            except ConversationError as exc:
+                log.warning("%s: cannot remind the builder of its handoff: %s", run.id, exc)
+                return None
+            self._state.note_handoff_reminder(row.id)
+            log.info("%s: handoff request %d: %d actions since the last", run.id, n, actions)
+            return None
         waited = (self._clock.now() - row.attempted_at).total_seconds()
         # The step in flight finishes before the handoff is written; with a long
         # thinking budget one response alone can take most of request_timeout_s.
@@ -2240,10 +2339,19 @@ class Controller:
             self._settings.handoff_timeout_s,
             self._catalog.get(run.model_key).request_timeout_s + self._settings.handoff_timeout_s,
         )
+        if row.reason == "errors":
+            snap = self._try_inspect(run)
+            if snap is not None and snap.status == "error":
+                timeout = self._settings.handoff_errored_timeout_s
         if waited <= timeout:
             return None
-        previous = self._state.get_checkpoint(run.current_checkpoint_id or "")
         why = f"no valid handoff within {timeout / 60:.0f} min"
+        return self._fallback_checkpoint(run, row, old, why, problems)
+
+    def _fallback_checkpoint(
+        self, run: Run, row: ConversationRow, old: str, why: str, problems: list[str] | None
+    ) -> Checkpoint:
+        previous = self._state.get_checkpoint(run.current_checkpoint_id or "")
         fallback = checkpoints.fallback_handoff(
             previous.handoff if previous else None,
             why=why,
@@ -2252,6 +2360,27 @@ class Controller:
         return self._record_checkpoint(
             run, row, "controller_fallback", fallback, [why, *(problems or [])]
         )
+
+    def _actions_since_request(
+        self, server: ServerRef, conversation_id: str, prefix: str
+    ) -> int | None:
+        """The builder's actions since the newest handoff request (the message starting
+        with `prefix`), not counting write_handoff calls. None when the events cannot
+        be read or the message is not in them yet."""
+        limit = 100
+        try:
+            events = self._conversations.recent(server, conversation_id, limit)
+        except (ConversationError, OSError) as exc:
+            log.info("cannot read %s's recent events: %s", conversation_id, exc)
+            return None
+        actions = 0
+        for e in events:  # newest first
+            if e.kind == "MessageEvent" and e.text.startswith(prefix):
+                return actions
+            if e.kind == "ActionEvent" and e.source == "agent" and e.tool != HANDOFF_TOOL_NAME:
+                actions += 1
+        # Not found: either not delivered yet, or older than a full page of events.
+        return actions if len(events) >= limit else None
 
     def _read_handoff(
         self, run: Run, row: ConversationRow
@@ -2410,6 +2539,7 @@ class Controller:
                     else self._recent_activity(run.id, ckpt.conversation_id, limit=6)
                 ),
                 blocker=_blocker_of(row),
+                operator_feedback=_feedback_text(self.paths(run.id).feedback),
             ),
             budget_chars=int(model.ctx * self._settings.recovery_context_fraction * 3),
         )
@@ -2504,8 +2634,12 @@ class Controller:
     def _context_pressure(self, run: Run, snap: ConversationSnapshot) -> str | None:
         if snap.context_tokens is None:
             return None
-        ctx = self._catalog.get(run.model_key).ctx
+        model = self._catalog.get(run.model_key)
+        ctx = model.ctx
         limit = int(ctx * self._settings.rollover_context_fraction)
+        room = ctx - model.max_output_tokens - self._settings.rollover_response_margin_tokens
+        if room > 0:
+            limit = min(limit, room)
         if snap.context_tokens < limit:
             return None
         return f"{snap.context_tokens} of {ctx} context tokens in use"
@@ -2619,7 +2753,8 @@ class Controller:
             log.warning("%s: cannot read the completion claim: %s", run.id, exc)
             return None
         for e in recent:
-            if (e.kind == "ActionEvent" and _FINISH_ACTION.search(e.text)) or (
+            finish = e.tool == "finish" or _FINISH_ACTION.search(e.text)
+            if (e.kind == "ActionEvent" and finish) or (
                 e.kind == "MessageEvent" and e.source == "agent"
             ):
                 return e.id, e.text
@@ -2820,6 +2955,9 @@ class Controller:
         return None
 
     def _complete(self, run: Run, ev: Evaluation) -> None:
+        if run.review_hold:
+            self._hold_for_review(run, ev)
+            return
         if self._state.try_set_phase(run.id, "finished"):
             log.info("%s finished: evaluation #%d passed", run.id, ev.n)
             self._note(
@@ -2828,6 +2966,112 @@ class Controller:
                 run_id=run.id,
             )
             self._publish_project(run.id)
+
+    def _seed(self, run_id: str) -> dict[str, Any] | None:
+        return _read_seed(self.paths(run_id).seed)
+
+    def _hold_for_review(self, run: Run, ev: Evaluation) -> None:
+        """The checks passed; the operator decides whether the work is done.
+
+        The builder's conversation has finished, so it waits, and the inference
+        reservation stays. `delivered_at` records that the operator was told, once.
+        """
+        if ev.delivered_at is not None:
+            return
+        self._state.mark_delivered(ev.id, self._clock.now())
+        log.info("%s: evaluation #%d passed; held for the operator's review", run.id, ev.n)
+        self._note(
+            "run.review",
+            f"evaluation #{ev.n} passed every required check; held for your review."
+            f" Accept: `dgx-autonomy accept {run.id}`. Send it back:"
+            f" `dgx-autonomy feedback {run.id} FILE`",
+            run_id=run.id,
+        )
+
+    def _held_evaluation(self, run: Run) -> Evaluation | None:
+        """The passed evaluation of the builder's latest claim, if the run waits on it.
+
+        Only while the builder is idle: after feedback, its last claim is still the old
+        one until it claims again.
+        """
+        if run.phase != "running" or not run.review_hold:
+            return None
+        snap = self._try_inspect(run)
+        if snap is None or snap.status != "finished":
+            return None
+        claim = self._claim(run)
+        if claim is None:
+            return None
+        same = [e for e in self._state.evaluations(run.id) if e.claim_event_id == claim[0]]
+        if same and same[-1].status == "passed":
+            return same[-1]
+        return None
+
+    def review_hold(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Hold the run for the operator's review before it finishes (or stop holding)."""
+        run = self._resolve(args)
+        if run.terminal:
+            raise RequestError(f"run {run.id} is {run.phase}; there is nothing left to hold")
+        hold = bool(args.get("hold", True))
+        self._state.set_review_hold(run.id, hold)
+        log.info("%s: review hold %s by the operator", run.id, "set" if hold else "released")
+        self._wake.set()
+        return self.status({"run_id": run.id})
+
+    def review_accept(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """The operator accepts held, verified work: the run finishes."""
+        run = self._resolve(args)
+        ev = self._held_evaluation(run)
+        if ev is None:
+            raise RequestError(
+                f"run {run.id} is not waiting for review: accept follows a claim that passed"
+                " every required check while the run was held"
+            )
+        run = self._state.set_review_hold(run.id, False)
+        log.info("%s: the operator accepted evaluation #%d", run.id, ev.n)
+        self._complete(run, ev)
+        return self.status({"run_id": run.id})
+
+    def feedback(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Send the operator's direction to the builder, which works on it.
+
+        It is kept with the run, so a fresh conversation after a rollover gets it too.
+        The frozen checks still decide completion; a claim after feedback is evaluated
+        like any other.
+        """
+        run = self._resolve(args)
+        text = args.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise RequestError("feedback needs non-empty text")
+        if len(text.encode()) > MAX_FEEDBACK_BYTES:
+            raise RequestError(f"feedback is larger than {MAX_FEEDBACK_BYTES} bytes")
+        if run.phase != "running" or run.conversation_id is None:
+            raise RequestError(f"run {run.id} is {run.phase}; feedback goes to a running run")
+        if self._state.open_rollover(run.id) is not None:
+            raise RequestError(f"run {run.id} is changing conversations; try again shortly")
+        path = self.paths(run.id).feedback
+        n = len(_read_feedback(path)) + 1
+        now = self._clock.now()
+        try:
+            self._conversations.deliver(
+                self._server_ref(run.id),
+                run.conversation_id,
+                EvidenceMessage(operator_feedback_message(n, text.strip())),
+            )
+        except ConversationError as exc:
+            raise RequestError(f"cannot reach the builder: {exc}") from None
+        with path.open("a") as f:
+            f.write(json.dumps({"n": n, "at": now.isoformat(), "text": text.strip()}) + "\n")
+        log.info("%s: operator feedback #%d delivered", run.id, n)
+        self._note(
+            "feedback",
+            f"operator feedback #{n} sent to the builder: {_clip(text.strip(), 300)}",
+            run_id=run.id,
+        )
+        self._wake.set()
+        view = self.status({"run_id": run.id})
+        view["feedback_n"] = n
+        return view
 
     def _deliver_failure(self, run: Run, ev: Evaluation) -> None:
         """Hand the failures back to the builder, which resumes to repair them.
@@ -3628,6 +3872,41 @@ class Controller:
             make_world_readable(self.paths(run_id).project_dir)
         except OSError as exc:
             log.warning("%s: cannot make the project readable: %s", run_id, exc)
+
+
+MAX_FEEDBACK_BYTES = 32 * 1024
+
+
+def operator_feedback_message(n: int, text: str) -> str:
+    return (
+        f"OPERATOR FEEDBACK #{n}\n"
+        "The operator reviewed the app and sends it back for more work. This is product"
+        " direction from the person who accepts the work: make it true of the app, using"
+        " your own judgment on how. The brief and the acceptance checks still stand and"
+        " still decide completion, so keep them passing. When the app meets this feedback"
+        " and you have verified it, finish again as before.\n\n"
+        f"{text}\n"
+    )
+
+
+def _read_seed(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_feedback(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    return [json.loads(line) for line in lines if line.strip()]
+
+
+def _feedback_text(path: Path) -> str:
+    return "\n\n".join(f"#{f['n']} ({f['at']}):\n{f['text']}" for f in _read_feedback(path))
 
 
 def _crash_now() -> None:

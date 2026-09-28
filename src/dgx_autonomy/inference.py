@@ -1,13 +1,20 @@
-"""The environment's own llama-server: start it, and tell loading from ready from busy.
+"""The environment's own inference server: start it, and tell loading from ready from busy.
 
-llama.cpp separates three things we care about: `/health` answers 503 while the
-model loads and 200 once it can serve; `/slots` reports per-slot activity, so ready
-does not mean free. The server lives only on the internal network; nothing is
-published on the host.
+Two backends serve the OpenAI chat API under the model's key:
+
+- llama.cpp's llama-server (the default). `/health` answers 503 while the model loads
+  and 200 once it can serve; `/slots` reports per-slot activity, so ready does not
+  mean free.
+- SGLang, for checkpoints llama.cpp serves slowly. Its port stays closed while it
+  loads (read as "unreachable": still starting) and `/health` answers 200 once it
+  serves. It has no `/slots`.
+
+The server lives only on the internal network; nothing is published on the host.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +32,16 @@ REASONING_BUDGET_MESSAGE = (
     "\n\nI have thought about this long enough. Time to act on it, one step at a time.\n"
 )
 MODELS_MOUNT = "/models"
+# SGLang's writable directories (host: <data dir>/inference/{ple,cache}). The N-gram
+# (PLE) table of Qwen3.8-Flash-Next lives in a file there, not in memory.
+SGLANG_PLE_MOUNT = "/ple"
+SGLANG_CACHE_MOUNT = "/cache"
+# The table file is rewritten on every boot. Over a populated file that takes about 55
+# minutes (a read-modify-write per page), over a fresh sparse file about 10, so the old
+# one is deleted first.
+SGLANG_START = (
+    'find /ple -name "ple_table_*.bin" -delete; exec python3 -m sglang.launch_server "$@"'
+)
 
 # Paths the diagnostic passthrough may reach. Everything else stays unreachable
 # from the control socket.
@@ -68,7 +85,57 @@ def inference_command(model: ModelConfig, port: int) -> tuple[str, ...]:
     return (*args, *model.extra_args)
 
 
+def sglang_command(model: ModelConfig, port: int) -> tuple[str, ...]:
+    args = [
+        "--model-path", f"{MODELS_MOUNT}/{model.path}",
+        "--served-model-name", model.key,
+        "--host", "0.0.0.0",
+        "--port", str(port),
+        "--context-length", str(model.ctx),
+        "--max-running-requests", str(model.parallel),
+        "--ple-offload-dir", SGLANG_PLE_MOUNT,
+    ]  # fmt: skip
+    if model.mem_fraction is not None:
+        args += ["--mem-fraction-static", str(model.mem_fraction)]
+    return (*args, *model.extra_args)
+
+
+def sglang_dirs(settings: Settings) -> tuple[Path, Path]:
+    root = settings.data_dir / "inference"
+    return root / "ple", root / "cache"
+
+
 def inference_container_spec(settings: Settings, model: ModelConfig) -> ContainerSpec:
+    if model.backend == "sglang":
+        assert model.image is not None
+        ple, cache = sglang_dirs(settings)
+        return ContainerSpec(
+            name=settings.inference_name,
+            image=model.image,
+            labels={LABEL_ROLE: "inference", LABEL_MODEL: model.key},
+            networks=(settings.internal_network,),
+            mounts=(
+                Mount(str(settings.models_dir), MODELS_MOUNT, read_only=True),
+                Mount(str(ple), SGLANG_PLE_MOUNT),
+                Mount(str(cache), SGLANG_CACHE_MOUNT),
+            ),
+            # No network beyond the internal one: nothing may be fetched at runtime.
+            # JIT kernels and compile caches persist in /cache across restarts.
+            env={
+                "HOME": SGLANG_CACHE_MOUNT,
+                "XDG_CACHE_HOME": SGLANG_CACHE_MOUNT,
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "SGLANG_CACHE_DIR": f"{SGLANG_CACHE_MOUNT}/sglang",
+                "TRITON_CACHE_DIR": f"{SGLANG_CACHE_MOUNT}/triton",
+                "TORCHINDUCTOR_CACHE_DIR": f"{SGLANG_CACHE_MOUNT}/inductor",
+            },
+            entrypoint="/bin/sh",
+            command=("-c", SGLANG_START, "sglang", *sglang_command(model, settings.inference_port)),
+            user=settings.inference_user,
+            gpus=True,
+            shm_size="8g",
+        )
     return ContainerSpec(
         name=settings.inference_name,
         image=settings.inference_image,
@@ -131,11 +198,13 @@ class InferenceManager:
         runtime: ContainerPort,
         http: HttpClient,
         available: Callable[[], int | None] = mem_available,
+        prepare_dir: Callable[[Path], None] | None = None,
     ) -> None:
         self._settings = settings
         self._runtime = runtime
         self._http = http
         self._available = available
+        self._prepare_dir = prepare_dir or _owned_by_inference_user(settings)
 
     def ensure(self, model: ModelConfig) -> ContainerState:
         """Start (or keep) the owned llama-server for `model`. Never swaps models silently.
@@ -152,13 +221,16 @@ class InferenceManager:
                 )
         else:
             available = self._available()
-            needed = model.size_bytes + LOAD_HEADROOM_BYTES
+            needed = model.memory_bytes + LOAD_HEADROOM_BYTES
             if available is not None and available < needed:
                 raise InferenceError(
                     f"not enough memory to load {model.key}: {available / 1024**3:.1f} GiB"
                     f" available, {needed / 1024**3:.1f} GiB needed. Hold the reservation"
                     " first (`dgx-autonomy reserve`), or use a smaller model."
                 )
+        if model.backend == "sglang":
+            for d in sglang_dirs(self._settings):
+                self._prepare_dir(d)
         return self._runtime.ensure_container(inference_container_spec(self._settings, model))
 
     def status(self) -> InferenceStatus:
@@ -198,6 +270,18 @@ class InferenceManager:
         return self._http.request(
             method, f"{self._settings.inference_url}{path}", json_body=body, timeout=600.0
         )
+
+
+def _owned_by_inference_user(settings: Settings) -> Callable[[Path], None]:
+    """mkdir, owned by the unprivileged inference user when the controller runs as root."""
+
+    def prepare(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        if os.geteuid() == 0:
+            uid, _, gid = settings.inference_user.partition(":")
+            os.chown(path, int(uid), int(gid or uid))
+
+    return prepare
 
 
 def _detail(res: HttpResponse) -> str:

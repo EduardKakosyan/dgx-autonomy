@@ -96,6 +96,7 @@ class ContainerSpec:
     dns: tuple[str, ...] = ()
     entrypoint: str | None = None
     workdir: str | None = None
+    shm_size: str | None = None
 
 
 @dataclass(frozen=True)
@@ -269,6 +270,8 @@ class EventSummary:
     kind: str
     source: str
     text: str
+    # The tool an ActionEvent calls. The text may be clipped before it names the tool.
+    tool: str | None = None
 
 
 @dataclass(frozen=True)

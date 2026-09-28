@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Sync autonomy/ to the DGX and prepare it as jim. Nothing here needs root.
+# Sync this repository to the DGX and prepare it as jim. Nothing here needs root.
 #
-#   autonomy/scripts/deploy.sh            # rsync, uv sync, write containers/.env
-#   autonomy/scripts/deploy.sh --dry-run  # show what rsync would change, touch nothing
+#   scripts/deploy.sh                     # rsync, uv sync, write containers/.env
+#   scripts/deploy.sh --dry-run           # show what rsync would change, touch nothing
 #
 # Image builds and starting the controller need Docker access, which jim does not
 # have. The script ends by printing those privileged steps for the operator; it

@@ -372,3 +372,102 @@ def test_recovery_during_a_rollover_does_not_resume_the_old_conversation(
     assert not any("restarted" in m.text for m in h.conversation.delivered)
     assert h.state.open_rollover(run_id) is not None
     assert timedelta(0) <= h.clock.now() - h.state.open_rollover(run_id).started_at  # type: ignore[union-attr]
+
+
+def _builder_acts(h: Harness, n: int, tool: str = "terminal") -> None:
+    for _ in range(n):
+        i = len(h.conversation.event_log)
+        h.conversation.event_log.append(
+            EventSummary(f"a{i}", "t", "ActionEvent", "agent", f"{tool} {{}}", tool=tool)
+        )
+
+
+def _request_seen(h: Harness, request_id: str, n: int) -> None:
+    """The builder's conversation now shows the request (or its reminder)."""
+    i = len(h.conversation.event_log)
+    text = f"HANDOFF REQUEST {request_id}" + (
+        f" (reminder {n - 1}). Stop now." if n > 1 else ". Stop."
+    )
+    h.conversation.event_log.append(EventSummary(f"m{i}", "t", "MessageEvent", "user", text))
+
+
+def test_a_builder_that_ignores_the_request_is_reminded_then_replaced(harness: Harness) -> None:
+    h = harness
+    run_id = _run(h)
+    h.controller.handle("rollover", {"run_id": run_id, "detail": "test"})
+    h.controller.reconcile_once()
+    request_id = _request_id(h, run_id)
+    [(_, ask)] = h.conversation.sent_to
+    assert "Your next action must be that write_handoff call" in ask.text
+    _request_seen(h, request_id, 1)
+
+    # Two actions, or write_handoff calls, are not ignoring it yet.
+    _builder_acts(h, 2)
+    _builder_acts(h, 3, tool="write_handoff")
+    h.controller.reconcile_once()
+    assert len(h.conversation.sent_to) == 1
+
+    # A third action: reminded with the same request id, twice at most.
+    _builder_acts(h, 1)
+    h.controller.reconcile_once()
+    reminder = h.conversation.sent_to[-1][1].text
+    assert reminder.startswith(f"HANDOFF REQUEST {request_id} (reminder 1)")
+    assert "taken 3 more actions" in reminder
+    h.controller.reconcile_once()
+    assert len(h.conversation.sent_to) == 2  # counted again from the reminder
+    _request_seen(h, request_id, 2)
+    _builder_acts(h, 3)
+    h.controller.reconcile_once()
+    assert h.conversation.sent_to[-1][1].text.startswith(
+        f"HANDOFF REQUEST {request_id} (reminder 2)"
+    )
+    assert h.state.checkpoints(run_id) == []
+
+    # Ignored three times: the fallback checkpoint now, not after the timeout.
+    _request_seen(h, request_id, 3)
+    _builder_acts(h, 3)
+    h.controller.reconcile_once()
+    [ckpt] = h.state.checkpoints(run_id)
+    assert ckpt.source == "controller_fallback"
+    assert "ignored 3 handoff requests" in " ".join(ckpt.problems)
+    assert len(h.conversation.started) == 2
+
+
+def test_the_context_rolls_over_while_a_full_response_still_fits(harness: Harness) -> None:
+    """SGLang refuses a prompt that leaves no room for max_tokens; 85% was too late."""
+    h = harness
+    run_id = _run(h, model_key="qwen3.8-flash-next-sglang")
+    model = h.controller._catalog.get("qwen3.8-flash-next-sglang")
+    room = model.ctx - model.max_output_tokens - h.settings.rollover_response_margin_tokens
+    assert room < int(model.ctx * h.settings.rollover_context_fraction)
+    h.conversation.context_tokens = room - 1
+    h.controller.reconcile_once()
+    assert h.state.open_rollover(run_id) is None
+    h.conversation.context_tokens = room + 1
+    h.controller.reconcile_once()
+    row = h.state.open_rollover(run_id)
+    assert row is not None and row.reason == "context"
+
+
+def test_an_erroring_conversation_is_replaced_without_waiting_for_a_handoff(
+    harness: Harness,
+) -> None:
+    """It cannot answer the request (on hugo-dgx1 the context itself was the error)."""
+    h = harness
+    run_id = _run(h)
+    for _ in range(h.settings.error_nudges + 2):
+        h.conversation.status = "error"
+        h.controller.reconcile_once()
+        if h.state.open_rollover(run_id) is not None:
+            break
+        h.clock.advance(seconds=h.settings.error_backoff_s * 8)
+    row = h.state.open_rollover(run_id)
+    assert row is not None and row.reason == "errors", row
+    h.conversation.status = "error"
+    h.controller.reconcile_once()
+    assert h.state.checkpoints(run_id) == []
+    h.clock.advance(seconds=h.settings.handoff_errored_timeout_s + 1)
+    h.conversation.status = "error"  # the request ran into the same error
+    h.controller.reconcile_once()
+    [ckpt] = h.state.checkpoints(run_id)
+    assert ckpt.source == "controller_fallback"

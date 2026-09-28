@@ -143,6 +143,7 @@ def summarize_event(raw: Mapping[str, Any], text_limit: int = _TEXT_LIMIT) -> Ev
         kind=kind,
         source=str(raw.get("source", "")),
         text=text,
+        tool=str(raw.get("tool_name")) if kind == "ActionEvent" and raw.get("tool_name") else None,
     )
 
 

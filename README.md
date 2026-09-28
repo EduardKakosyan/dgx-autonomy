@@ -1,8 +1,7 @@
 # dgx-autonomy
 
 An environment for unattended OpenHands coding runs on the DGX Spark (`hugo-dgx1`).
-It is a separate Python package with its own toolchain. The beach app's Next.js
-build, lint, typecheck and Vitest scopes all skip `autonomy/`.
+It is a Python package with its own toolchain (uv, pytest, ruff).
 
 ```text
 dgx-autonomy CLI (jim, over SSH)
@@ -34,7 +33,10 @@ evaluator containers (uid 10002, no caps, no socket), one per acceptance check:
   own workspace, a read-only copy of the brief and a read-only control directory,
   and nothing else from the host. PID 1 is a small supervisor
   (`containers/sandbox/dgx_sandbox.py`) that keeps agent execution and the demo in
-  separate sessions, so ending the agent does not end the demo.
+  separate sessions, so ending the agent does not end the demo. The Agent Server also
+  loads `terminal_grouping.py`: OpenHands refuses terminal input with several
+  statements on separate lines, which includes a heredoc followed by the command that
+  uses it. This module runs such input as one brace group instead.
 - The **inference container** is llama.cpp `f95b0d9`, built for GB10 (`sm_121a`). It
   serves the model in `config/models.yaml` on the internal network only.
 - The **evaluator** is Playwright Test 1.63.0 (Chromium) plus pytest 9.1.1 and httpx.
@@ -59,6 +61,18 @@ the host lacks the memory for. The qualified fallback is `qwen3.6-35b-a3b` (Q3, 
 egress policy are the only host changes the environment makes. Both are installed by
 the operator from `host/`.
 
+`qwen3.8-flash-next-sglang` is the same model served by SGLang
+(`lmsysorg/sglang:dev-qwen38-next-local`) from the NVFP4 checkpoint
+`RadixArk/Qwen3.8-Flash-Next-NVFP4` (126 GiB, in `~/models/qwen3.8-flash-next-nvfp4`,
+`chmod -R o+rX`). llama.cpp computes the model's sparse attention (QSA) as dense
+attention under a mask, so its decode falls from 25 tokens/s near an empty context to
+8 at 225K. SGLang has sparse kernels for it. The 47.7 GiB N-gram table is a file in
+`/var/lib/dgx-autonomy/inference/ple` on the NVMe, deleted and rewritten on every boot
+(about 10 minutes). SGLang runs offline (`HF_HUB_OFFLINE=1`), as the inference user,
+with its JIT and compile caches in `/var/lib/dgx-autonomy/inference/cache`. It has no
+thinking budget: `max_output_tokens` alone bounds a response. It is unqualified until
+`dgx-autonomy qualify qwen3.8-flash-next-sglang` passes.
+
 ## Operator setup (once, privileged)
 
 `jim` is not in the `docker` group, so building images and starting the controller
@@ -67,7 +81,7 @@ need an operator with sudo. Everything after this runs as `jim` without Docker a
 1. **Deploy the code** from the laptop (rsync plus `uv sync`, no sudo):
 
    ```bash
-   autonomy/scripts/deploy.sh            # DGX_HOST=hugo-dgx1 DGX_DEST=dgx-autonomy by default
+   scripts/deploy.sh                     # DGX_HOST=hugo-dgx1 DGX_DEST=dgx-autonomy by default
    ```
 
    The script writes `~/dgx-autonomy/containers/.env` on the DGX with jim's uid/gid
@@ -201,6 +215,7 @@ or want to know:
 | `progress` | the builder called `report_progress` (its own account, labelled so) |
 | `demo` | the demo came up or failed |
 | `claim`, `evaluation` | the builder claimed completion; the checks decided (per check) |
+| `run.review`, `feedback` | a held run passed its checks and waits for the operator; the operator's feedback went to the builder |
 | `handoff`, `rollover`, `recovery`, `trouble`, `blocked` | continuity and recovery |
 | `run.ended` | VERIFIED, stopped, expired or blocked |
 | `qualify.done` | a qualification ended, with its speeds |
@@ -275,7 +290,14 @@ read-only at `/brief` (`/brief/brief.md`, `/brief/checks/`). The project the age
 builds is at `/var/lib/dgx-autonomy/runs/<id>/agent/project`.
 
 `--budget-hours` must be at most 40. The deadline is written once at launch and
-never moves.
+never moves. `--hold` holds the run for the operator's review (see
+[Operator review](#acceptance-checks)).
+
+`--from-run RUN --report FILE` continues an ended run: the controller copies its
+project (with its git history; symlinks copied as links, `test-results/` left out)
+into the new workspace before the builder starts. The report is the operator's
+product direction on that app. The builder gets it before the brief, and it is kept as
+the run's feedback #1, so a fresh conversation after a rollover gets it too.
 
 ### Deadline, stop and the demo
 
@@ -434,6 +456,22 @@ sent anywhere. The operator runs the review, then `review-record` attaches the r
 The report shows the result in its own section. It never changes a check result or
 the verdict.
 
+**Operator review.** By default a claim that passes every required check finishes the
+run. `dgx-autonomy hold RUN` changes that for one run: the passing claim waits, and a
+`run.review` notice asks the operator to look at the demo. The inference reservation
+stays and so does the builder's conversation. Then:
+
+- `dgx-autonomy accept RUN` finishes the run on that evaluation (`VERIFIED`);
+- `dgx-autonomy feedback RUN FILE` sends the builder the text in FILE as product
+  direction, headed `OPERATOR FEEDBACK #n`. The builder works on it and claims again.
+  That claim is evaluated like any other and, on a pass, waits for review again.
+  Feedback is kept in `runs/<id>/feedback.jsonl`, and a fresh conversation after a
+  rollover gets all of it in its first message;
+- `dgx-autonomy hold RUN --off` stops holding, and a passing claim finishes the run.
+
+Feedback also reaches a builder that is still working. It never changes the frozen
+brief or checks: those still decide completion.
+
 ### Continuity: fresh conversations and checkpoints
 
 Inside one conversation, OpenHands manages the context itself: its condenser
@@ -464,8 +502,14 @@ A rollover, one controller tick at a time, each step durable (`conversations` ta
    project path that exists (checked without following symlinks) or `eval:N` for an
    evaluation that exists. A `done` item must name evidence. A `verified` field is
    refused: the environment records verified results itself.
+   A builder that keeps working instead is reminded (same request id) after every 3
+   actions that are not `write_handoff` calls, up to 3 requests in all. On hugo-dgx1 a
+   builder at 226K tokens ignored the request for 43 minutes; the first reminder got
+   its handoff within a minute.
 2. **Checkpoint.** A valid handoff becomes a checkpoint (`agent_handoff`). If none
-   arrives within 10 minutes, the controller records a `controller_fallback`. It
+   arrives, the controller records a `controller_fallback`: at once when the builder
+   has ignored all 3 requests, otherwise after the model's request timeout plus 10
+   minutes (one response in flight may take that long). It
    carries the last valid handoff forward, marked as older, plus the old conversation's
    last actions as observed, and marks nothing done. Each checkpoint records the
    conversation and event position it came from, the project snapshot, what the

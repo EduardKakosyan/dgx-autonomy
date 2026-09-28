@@ -119,6 +119,8 @@ def docker_run_argv(spec: ContainerSpec, *, detach: bool = True) -> list[str]:
         argv += ["--security-opt", "no-new-privileges"]
     if spec.pids_limit is not None:
         argv += ["--pids-limit", str(spec.pids_limit)]
+    if spec.shm_size is not None:
+        argv += ["--shm-size", spec.shm_size]
     if spec.memory is not None:
         argv += ["--memory", spec.memory]
     if spec.cpus is not None:

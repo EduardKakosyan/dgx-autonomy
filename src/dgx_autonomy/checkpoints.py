@@ -322,6 +322,8 @@ class RecoveryInputs:
     recent_failures: str = ""
     recent_activity: Sequence[str] = field(default_factory=list)
     blocker: Mapping[str, Any] | None = None
+    # The operator's feedback so far (the `feedback` op), oldest first.
+    operator_feedback: str = ""
 
 
 _REASON_TEXT = {
@@ -430,6 +432,15 @@ def assemble_recovery_context(inputs: RecoveryInputs, budget_chars: int) -> str:
         Section("BRIEF (the agreement; also at /brief/brief.md)", inputs.brief, 2, 600,
                 pointer="the full brief is at /brief/brief.md"),
     ]  # fmt: skip
+    if inputs.operator_feedback:
+        instructions += (
+            "- The operator reviewed the app and sent it back with the feedback below. It is"
+            " product direction from the person who accepts the work: the app must meet it,"
+            " and the brief and the checks still stand.\n"
+        )
+        sections.append(
+            Section("OPERATOR FEEDBACK (oldest first)", inputs.operator_feedback, 0, 6000)
+        )
     if inputs.blocker:
         tried = "\n".join(f"- {a}" for a in inputs.blocker.get("alternatives_tried") or [])
         sections.append(
@@ -502,5 +513,27 @@ def handoff_request(request_id: str, reason: str, detail: str | None) -> str:
         " status and evidence (paths of project files, or eval:N), the decisions, the"
         " approaches tried and how they went, the open failures, and the next steps. If"
         " the tool reports problems, fix them and call it again. Then finish with the"
-        " message 'handoff written'. Do not do anything else."
+        " message 'handoff written'. Your next action must be that write_handoff call:"
+        " do not run another command first, and do not finish the task you were on."
+        " Unfinished work belongs in next_steps, for the fresh conversation."
+    )
+
+
+def handoff_request_prefix(request_id: str, n: int) -> str:
+    """How the n-th message asking for handoff `request_id` begins."""
+    return (
+        f"HANDOFF REQUEST {request_id}."
+        if n <= 1
+        else f"HANDOFF REQUEST {request_id} (reminder {n - 1})."
+    )
+
+
+def handoff_reminder(request_id: str, n: int, actions: int) -> str:
+    return (
+        f"HANDOFF REQUEST {request_id} (reminder {n - 1}). Since this conversation was"
+        f" asked for its handoff it has taken {actions} more actions and has not called"
+        " write_handoff. It will be replaced whether or not you write one; without it,"
+        " the next conversation starts from a summary the environment writes itself and"
+        " loses your plan. Stop now. Your next action must be write_handoff with"
+        f" request_id {request_id!r}. Put the unfinished work in next_steps."
     )

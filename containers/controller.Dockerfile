@@ -4,7 +4,7 @@
 # mounted (see compose.yaml). It carries the docker CLI and the dgx_autonomy package.
 # It runs no model and no agent tools.
 #
-# Build context: autonomy/ (compose sets it to ..).
+# Build context: the repository root (compose sets it to ..).
 
 FROM python:3.12-slim-bookworm
 
