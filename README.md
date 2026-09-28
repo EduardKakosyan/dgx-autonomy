@@ -6,8 +6,8 @@
 
 | Project | What it is | Builder | Result |
 |---|---|---|---|
-| [**Shoreline**](https://github.com/EduardKakosyan/shoreline) | Beach and fishing verdicts, tides, sea state and weather for a day at the water; mobile-first web app | Qwen3.8-Flash-Next (SGLang / llama.cpp) on the DGX Spark | 3 runs, 42 commits, 19/19 acceptance checks, accepted |
-| **Yahtzee** | A quick Yahtzee game | — | next up |
+| [**Shoreline**](https://github.com/EduardKakosyan/shoreline) ([live](https://eduardkakosyan.github.io/shoreline/)) | Beach and fishing verdicts, tides, sea state and weather for a day at the water; mobile-first web app | Qwen3.8-Flash-Next (SGLang / llama.cpp) on the DGX Spark | 3 runs, 42 commits, 19/19 acceptance checks, accepted |
+| **Yahtzee** | Official-rules Yahtzee for one iPhone passed around a camp table: 1–8 players, game after game with a session tally, installable and offline | Qwen3.8-Flash-Next (SGLang) on the DGX Spark | building now (40 h run) |
 
 Each project repo carries its own loop record: the frozen brief and acceptance checks of every run, and every message the operator sent the builder.
 
