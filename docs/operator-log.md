@@ -169,6 +169,59 @@ The operator's side of the experiments: what is in flight, and what the next ses
   - the controller accepting on deadline when the last claim passed every check;
   - letting `accept` record a verdict on an expired run.
 
+### 2026-09-28: published to GitHub (private)
+
+- The user accepted Shoreline and asked for two linked repos.
+- **`EduardKakosyan/dgx-autonomy`**: the loop.
+  - The history of `autonomy/` was extracted with `git subtree split` (17 commits). On top: one commit with the environment changes that had not been committed (390 tests pass, identical to what is deployed on the DGX), then a README intro, a "Built in this loop" table (Shoreline, and Yahtzee next), `docs/operator-log.md` (this log) and `docs/design/`.
+  - The DGX's Tailscale IP is redacted in the docs.
+  - The hackathon repo itself is unchanged: the environment changes are still uncommitted there.
+- **`EduardKakosyan/shoreline`**: the app. The builder's 42 commits are unedited. One operator commit on top adds the README (built unattended; links back to the loop), `loop/runs/{1-weather-now,2-weather-now-polish,3-shoreline}` (frozen brief, checks and every operator message for each run) and screenshots, and stops tracking `node_modules`.
+- Both repos are **private** until the user decides to make them public. GitHub Pages for a live demo needs a public repo.
+
+### 2026-09-28 13:12 UTC: repos public; Yahtzee launched (40 h)
+
+- Both repos are **public**. Shoreline is live on GitHub Pages at https://eduardkakosyan.github.io/shoreline/, and both READMEs link it.
+- **The user's Yahtzee request:**
+  - the original rules, with a cooler UI and UX;
+  - one iPhone passed around at camp;
+  - more players, and several games in a row;
+  - up to 40 h.
+- **Brief** (`yahtzee-brief.md`):
+  - official rules, with the forced Joker and the 100-point Yahtzee bonus spelled out;
+  - 1–8 players; "Play again" rotates the starting player and keeps a session tally of wins and points;
+  - tapping a box records at once, with no pass-the-phone screen;
+  - a required test hook, `window.__yahtzeeDice`;
+  - a PWA that works offline and uses only relative URLs (for Pages under `/yahtzee/`);
+  - survives a reload.
+- **Checks:** 8 automated specs (24 tests) and 2 human criteria. `visual.ts` is reused from the weather runs, with Yahtzee tap selectors.
+  - Dry run on the Mac: all 24 pass against a throwaway reference, and 72/72 over three repeats. All 24 fail against an empty page.
+  - **Evaluator caveat, found and fixed before launch.** The evaluator reaches the demo over plain http by host name, where service workers are not allowed. The offline check now visits through a localhost pass-through proxy inside the test, and was verified over a LAN IP (5/5).
+  - The reference's faded disabled buttons failed contrast. Kept strict on purpose: players read their card before rolling.
+- **Run `20260928-131204-ca6a13`**: SGLang, fresh project, `--hold`, 40 h. Deadline 2026-09-30 05:12 UTC. Demo port 43033. `release-after` is armed.
+- Next: when it's accepted, publish `EduardKakosyan/yahtzee` with the same loop record, turn on Pages, and update the loop README's table.
+
+### 2026-09-28 18:30 UTC: Yahtzee at 5 h; direction change to real dice
+
+- Progress: all 24 checks green at 15:03, about 2 h in. One rollover at 16:00. Verified twice on the served build at 17:34, with a 7,776-roll oracle unit test. It is called "Camp Yahtzee". Screens: `yahtzee-progress-5h.png`.
+- **The user clarified that the dice are real, at the table; the phone only keeps score.** Feedback #1 (`yahtzee-feedback-1.txt`):
+  - a remembered dice setting (on this phone / real dice at the table). A first visit stays "on this phone", so the frozen checks still apply;
+  - real-dice mode: enter five faces on a big 1–6 keypad, then the scorecard scores them by the same rules;
+  - Undo for the last recorded box;
+  - a scoreboard readable from across the table.
+- **Environment issue:** the first `feedback` attempt failed with a ReadTimeout on the Agent Server POST while the builder was busy in a long terminal command. Nothing was recorded. A retry at 18:28 succeeded. Consider a retry or queue inside `feedback`.
+
+### 2026-09-29 09:25 UTC: Yahtzee claim reviewed; feedback #2 (keypad faces)
+
+- The builder landed real-dice mode, Undo and a standings sheet (`9dc4663..a95e072`), claimed at 22:56 on 09-28, and evaluation #1 passed 8/8. The claim was held for about 10 h without review (no session).
+- The review used a scripted play-through (`/tmp/wreview/yplay.js`): full real-dice games with 3 players and 8 players, 143 turns, 24 Yahtzees and 13 Joker turns. Every shown box value and enabled/disabled state was checked against an independent rules implementation, along with Undo, a dice-mode switch mid-game, a reload mid-entry, the final standings, the winner and the tally. **0 problems, 0 console errors.** The game-over screen and "Tonight's tally" are excellent.
+- **A bug the checks can't see:** an empty `.key-count` badge renders as a solid disc over each keypad key's top-right pip. The 4, 5 and 6 keys read as 3, 4 and 5 (`yahtzee-review1-keypad-bug.png`).
+- Feedback #2 (`yahtzee-feedback-2.txt`), sent about 09:00 UTC on the first try:
+  1. correct faces, with the count off the face and hidden at 0, plus numerals;
+  2. the hand-over banner covers Sixes;
+  3. the Undo label should say what it undoes.
+- Deadline 2026-09-30 05:12 UTC.
+
 ## Operator's role on the weather run (from the user, 2026-09-25)
 
 Act as the product lead (L7). Judge the product, not the code: no code help, no architecture or code-quality notes. When `run.review` arrives:
