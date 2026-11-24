@@ -23,9 +23,9 @@ That's also an argument for **sovereign AI**:
 | Project | What it is | Result |
 |---|---|---|
 | [**Shoreline**](https://github.com/EduardKakosyan/shoreline) · [live](https://eduardkakosyan.github.io/shoreline/) | A mobile-first app for a day at the water: beach and fishing verdicts with reasons, today's tides, sea state, the moon and the forecast. It grew from a weather app over three runs. | 42 commits, 19/19 acceptance checks (78 tests), accepted after product review. The Shoreline brief itself took about 8 hours of a 40-hour budget. |
-| [**Camp Yahtzee**](https://github.com/EduardKakosyan/yahtzee) · [live](https://eduardkakosyan.github.io/yahtzee/) | Official-rules Yahtzee for one iPhone passed around a camp table: 1–8 players, real or on-screen dice, game after game with a session tally, installable and offline. | 18 commits, 24/24 acceptance tests after two review rounds, accepted. All checks were green about 2 hours in. |
+| [**Camp Yahtzee**](https://github.com/EduardKakosyan/yahtzee) · [live](https://eduardkakosyan.github.io/yahtzee/) | Official-rules Yahtzee for one iPhone passed around a camp table: 1–8 players, real or on-screen dice, game after game with a session tally, installable and offline. | 18 commits, 24/24 acceptance tests after two review rounds, accepted. The builder had every check passing about 2 hours in. |
 
-Currently building: **Keeper**, a self-hosted meeting memory (archive, search, REST API and an MCP server) meant to replace a SaaS notetaker. Confidential conversations stay on hardware you own, and the model that builds it runs there too.
+It also wrote the first version of **Keeper**, a self-hosted meeting memory (archive, search, REST API and an MCP server). Keeper has since replaced a SaaS notetaker for my team, and I've developed it further with Claude Code. Its code is private.
 
 Each project repo carries its own loop record: the frozen brief and acceptance checks for every run, and every message the operator sent the builder.
 
@@ -53,7 +53,7 @@ A planning session pairs the operator with the same model that will build the ap
 - **A brief.** What to build and for whom, written so that a builder working alone for 40 hours never needs to ask a question.
 - **Acceptance checks.** Executable Playwright and pytest tests, plus criteria that only a human can judge.
 
-Before launch, a **dry run tests the tests**. Every check must *fail* when no app is running; a check that passes there checks nothing. Every check must also *pass* against a throwaway reference app the planner writes; a check that fails there couldn't be satisfied by any app. That second mistake slipped past careful planning once: a locator that matched two labels on any page.
+Before launch, a **dry run tests the tests**. Every check must *fail* when no app is running; a check that passes there checks nothing. Every check must also *pass* against a throwaway reference app the planner writes; a check that fails there couldn't be satisfied by any app. The reference app exists because that mistake once got through: a planner froze checks with a locator that matched two labels on any page, so no app could ever pass them (commit 908b46a).
 
 At launch the brief and checks are **frozen** with a digest. The builder can read them but not write them, and the digest is checked again before every evaluation.
 
@@ -120,7 +120,7 @@ The builder is **Qwen3.8-Flash-Next**, a 125-billion-parameter open-weights mode
 - **Hybrid attention.** Only 12 of its 48 layers keep a memory of every past token; the rest keep a fixed-size running state. A 256K-token context costs about 3 GB instead of tens.
 - **Sparse attention.** Each new token attends only to the most relevant blocks of the context, not to all of it.
 
-It's served by [SGLang](https://github.com/sgl-project/sglang) from a 4-bit NVFP4 checkpoint. SGLang has real sparse-attention kernels and uses the model's **multi-token prediction** heads for speculative decoding: a small head drafts 4 tokens, and the full model checks them in one pass. The first backend was llama.cpp, which computes the sparse attention densely under a mask. It slowed down as the context filled:
+For the Shoreline and Camp Yahtzee runs it was served by [SGLang](https://github.com/sgl-project/sglang) from a 4-bit NVFP4 checkpoint (`qwen3.8-flash-next-sglang` in `config/models.yaml`; the file's default is still the llama.cpp build). SGLang has real sparse-attention kernels and uses the model's **multi-token prediction** heads for speculative decoding: a small head drafts 4 tokens, and the full model checks them in one pass. The first backend was llama.cpp, which computes the sparse attention densely under a mask. It slowed down as the context filled:
 
 | Context in use | llama.cpp (Q3 GGUF) | SGLang (NVFP4 + MTP) |
 |---|---|---|
@@ -148,7 +148,7 @@ This isn't about replacing frontier models. They're the best supervisors availab
 ## What we learned
 
 - **Verification is the whole game.** Local models claim success early and confidently. A test they can't edit, run from outside the app, turns "I think it works" into evidence.
-- **Test the tests.** Checks that pass with no app, and checks no app can pass, are both easy to write. One of the second kind got past careful planning, and the dry run against a reference app caught it.
+- **Test the tests.** Checks that pass with no app, and checks no app can pass, are both easy to write. One of the second kind got past careful planning and was frozen into a run. Running every check against a reference app before launch now catches it.
 - **Persistence beats speed.** The builder diagnosed its own bugs across conversations. It built a pixel detector to hunt down a visual smudge from feedback, and a 7,776-roll dice oracle to prove its scoring.
 - **Handoffs need enforcement.** One builder ignored a handoff request for 43 minutes while its context filled. A reminder after every three unrelated actions got a handoff within a minute.
 - **Bound everything.** An uncapped response ran 10,000+ tokens of thinking for 20 minutes. Response length, thinking budget and request timeout are now set per model.

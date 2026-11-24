@@ -597,7 +597,7 @@ two bridges:
 - **allowed:** the internet, other containers on the same bridge (the model), and
   replies to connections the host opened (the controller, the demo's loopback port);
 - **rejected at once:** every address of the DGX itself (Docker gateways,
-  `192.168.50.216`, `100.75.80.123`: sshd, open-webui, anything on `0.0.0.0`), the
+  its LAN and tailnet addresses: sshd, open-webui, anything on `0.0.0.0`), the
   LAN, the tailnet (`100.64.0.0/10`, `fd7a:…`), other Docker networks, link-local
   and multicast.
 

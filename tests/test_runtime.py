@@ -206,7 +206,7 @@ def test_inspect_finds_run_containers_by_label(settings: Settings) -> None:
     assert runner.calls[0] == ["docker", "ps", "-a", "-q", "--filter", "label=dgx-autonomy.run=r1"]
 
 
-@pytest.mark.parametrize("host_ip", ["0.0.0.0", "", "192.168.1.5", "100.75.80.123", "::"])
+@pytest.mark.parametrize("host_ip", ["0.0.0.0", "", "192.168.1.5", "100.64.0.7", "::"])
 def test_ports_are_only_published_on_loopback(host_ip: str) -> None:
     spec = ContainerSpec(
         name="x", image="i", user="1:1", ports=(PortBinding(host_ip, 43000, 3000),)

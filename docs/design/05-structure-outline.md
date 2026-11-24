@@ -230,7 +230,7 @@ reservation
 
 #### Implementation notes
 
-The read-only inspection on hugo-dgx1 found the following. `claude-qwen.service` is a system unit at `/etc/systemd/system/` with no drop-ins. It runs as `jim` with `Restart=always`, is enabled, and serves Qwen3.8-27B Q8 plus mmproj on `127.0.0.1:8090` with an API key file. Docker 29.2.1 uses the iptables-nft backend. The host's DNS upstream is the LAN router, `192.168.50.1`. `br_netfilter` is not loaded. `jim` has no passwordless sudo, so every host change below is an operator step.
+The read-only inspection on hugo-dgx1 found the following. `claude-qwen.service` is a system unit at `/etc/systemd/system/` with no drop-ins. It runs as `jim` with `Restart=always`, is enabled, and serves Qwen3.8-27B Q8 plus mmproj on `127.0.0.1:8090` with an API key file. Docker 29.2.1 uses the iptables-nft backend. The host's DNS upstream is the LAN router. `br_netfilter` is not loaded. `jim` has no passwordless sudo, so every host change below is an operator step.
 
 The implementation differs from the outline above in these ways:
 

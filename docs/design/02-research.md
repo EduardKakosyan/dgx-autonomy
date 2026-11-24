@@ -50,7 +50,7 @@ Upstream model repositories and GGUF packs were identified, including the exact 
 
 #### Follow-up on 2026-09-22 establishes access and a live baseline
 
-The earlier failed attempt and original evidence table below are retained as inspection history, not the current access state. SSH configuration at `/Users/eduardkakosyan/.ssh/config:3` defines `hugo-dgx1`, hostname `dgx1`, user `jim`, and an existing NVIDIA Sync identity. Tailscale reports `dgx1.tail31115a.ts.net` at `<tailscale-ip>` online. `ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes hugo-dgx1` succeeded. No private key contents were read, host-key checking weakened, configuration changed, or privilege escalation attempted.
+The earlier failed attempt and original evidence table below are retained as inspection history, not the current access state. The operator's SSH configuration defines `hugo-dgx1`, hostname `dgx1`, user `jim`, and an existing NVIDIA Sync identity. Tailscale reports the machine online at its tailnet name. `ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes hugo-dgx1` succeeded. No private key contents were read, host-key checking weakened, configuration changed, or privilege escalation attempted.
 
 Read-only snapshot around 2026-09-22 14:43 UTC:
 
