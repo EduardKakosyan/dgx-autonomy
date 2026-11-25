@@ -2,13 +2,15 @@
 type: design-tdd
 ---
 
+> **Historical record.** This is the technical design as written before building started (after the 2026-09-22 research, before the first code on 2026-09-23), kept as a record. [README.md](../../README.md) and [docs/operator-manual.md](../operator-manual.md) describe what was built.
+
 # DGX Autonomous Coding Environment
 
 ### System Design
 
 #### A trusted controller supervises an isolated agent workspace
 
-The [PRD](03-prd-dgx-autonomy-environment.md) requires unattended execution, independent acceptance results, and a demo that remains available after agent execution ends. A trusted controller on the DGX owns the execution deadline, recovery, and acceptance-check invocation. The agent operates in a separate sandbox and can modify its project environment, not the controller, acceptance-check definitions, or authoritative results.
+The [PRD](03-prd.md) requires unattended execution, independent acceptance results, and a demo that remains available after agent execution ends. A trusted controller on the DGX owns the execution deadline, recovery, and acceptance-check invocation. The agent operates in a separate sandbox and can modify its project environment, not the controller, acceptance-check definitions, or authoritative results.
 
 The demo runs inside the agent sandbox, not in a separate application container. Stopping autonomous work stops the OpenHands conversation and its agent execution, but retains the sandbox and demo process for later inspection. The user reviews the demo after the agent is done; availability during sandbox recovery is not required. The process-control and persistence mechanisms remain to be designed.
 
@@ -24,13 +26,13 @@ flowchart LR
     Checks --> Results[Controller-owned results]
 ```
 
-The [research](02-research-dgx-autonomy-environment.md) establishes separate application, inference, and SDK capabilities, but no verified experiment controller connecting them. This design adds that supervisory boundary rather than extending the beach application's refresh workflow. Docker is installed on the DGX, but the inspected SSH user lacks daemon access; authorized provisioning remains a prerequisite. Existing unrelated DGX services stay outside the agent's authority.
+The [research](02-research.md) establishes separate application, inference, and SDK capabilities, but no verified experiment controller connecting them. This design adds that supervisory boundary rather than extending the beach application's refresh workflow. Docker is installed on the DGX, but the inspected SSH user lacks daemon access; authorized provisioning remains a prerequisite. Existing unrelated DGX services stay outside the agent's authority.
 
 #### OpenHands owns the agent loop; the controller owns the experiment lifecycle
 
 Use the OpenHands SDK with a separate Agent Server in the agent sandbox. OpenHands supplies the model/tool loop, tool execution, conversation events, and conversation persistence. The controller uses those interfaces to supervise the experiment; it does not implement a competing agent loop. Custom agent loops are explicitly out of scope.
 
-The controller remains responsible for the original wall-clock deadline, recovery coordination, continuity across fresh conversations, and independent acceptance-check execution. As the [research](02-research-dgx-autonomy-environment.md) notes, SDK conversation persistence is not an atomic checkpoint of the whole experiment. Exact compatibility between the selected model, inference runtime, and OpenHands tool calls must be verified during setup.
+The controller remains responsible for the original wall-clock deadline, recovery coordination, continuity across fresh conversations, and independent acceptance-check execution. As the [research](02-research.md) notes, SDK conversation persistence is not an atomic checkpoint of the whole experiment. Exact compatibility between the selected model, inference runtime, and OpenHands tool calls must be verified during setup.
 
 #### One active experiment is an operating convention, not a scheduling feature
 
@@ -56,7 +58,7 @@ laptop browser -> SSH local forward -> DGX loopback port -> demo in agent sandbo
 
 #### Interactive CLI planning freezes the brief at explicit launch
 
-Before unattended execution, the user collaborates with the selected local model through an interactive SSH CLI session backed by OpenHands. Planning context stays with the run rather than requiring an externally authored brief. Explicit launch freezes the agreed brief and acceptance criteria in controller-owned storage; the agent receives a readable copy but cannot rewrite the authoritative agreement during execution. The same selected model serves planning, implementation, and review, per the [PRD](03-prd-dgx-autonomy-environment.md).
+Before unattended execution, the user collaborates with the selected local model through an interactive SSH CLI session backed by OpenHands. Planning context stays with the run rather than requiring an externally authored brief. Explicit launch freezes the agreed brief and acceptance criteria in controller-owned storage; the agent receives a readable copy but cannot rewrite the authoritative agreement during execution. The same selected model serves planning, implementation, and review, per the [PRD](03-prd.md).
 
 ```mermaid
 flowchart LR

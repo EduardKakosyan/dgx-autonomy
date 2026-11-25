@@ -1,3 +1,5 @@
+> **Historical record.** This is the investigation as written on 2026-09-25, before the switch to SGLang, kept as a record. [README.md](../../README.md) and [docs/operator-manual.md](../operator-manual.md) describe what was built.
+
 # Would SGLang serve Qwen3.8-Flash-Next faster than llama.cpp on the DGX?
 
 2026-09-25. Prompted by the SGLang cookbook page for Qwen3.8-Flash-Next (single-DGX-Spark cells).

@@ -2,19 +2,21 @@
 type: design-prd
 ---
 
+> **Historical record.** This is the PRD as written before building started (after the 2026-09-22 research, before the first code on 2026-09-23), kept as a record. [README.md](../../README.md) and [docs/operator-manual.md](../operator-manual.md) describe what was built.
+
 # Autonomous Coding Research on DGX
 
 ## Problem to Solve
 
 A user wants to give a locally hosted model a high-level request, such as "I want to build a weather app," leave it working autonomously for approximately 40 hours, and return to a complete, working setup rather than a partial implementation that requires ongoing human direction. The research question is whether a model in a DGX-based environment can carry that request through to a finished application.
 
-The environment must make it possible to investigate that end-to-end outcome, not merely demonstrate that a model can generate code or stay active for a long time. The [environment research](02-research-dgx-autonomy-environment.md) identifies separate inference, agent, and testing capabilities, but no verified end-to-end experiment environment. The user expects DGX access through SSH; the earlier hostname-resolution failure is an unresolved access check, not evidence that the host is unavailable.
+The environment must make it possible to investigate that end-to-end outcome, not merely demonstrate that a model can generate code or stay active for a long time. The [environment research](02-research.md) identifies separate inference, agent, and testing capabilities, but no verified end-to-end experiment environment. The user expects DGX access through SSH; the earlier hostname-resolution failure is an unresolved access check, not evidence that the host is unavailable.
 
 ## What does business success look like, and how can we measure it?
 
 ### The delivered setup lets the user launch autonomous app-building experiments
 
-The deliverable is a working, Docker-containerized environment on DGX Spark, informed by the [environment research](02-research-dgx-autonomy-environment.md). It is not a single finished example application or a setup tied to one named model. The user can select a supported model, provide a detailed application prompt, collaboratively research and agree on requirements, and explicitly launch autonomous work with a maximum budget of approximately 40 hours.
+The deliverable is a working, Docker-containerized environment on DGX Spark, informed by the [environment research](02-research.md). It is not a single finished example application or a setup tied to one named model. The user can select a supported model, provide a detailed application prompt, collaboratively research and agree on requirements, and explicitly launch autonomous work with a maximum budget of approximately 40 hours.
 
 ### The agent's target outcome is a usable DGX-hosted demo
 
@@ -38,7 +40,7 @@ The first version uses one selected model for the run's planning, implementation
 
 The first version targets Qwen3.8-Flash-Next if it is practical on the Spark, with Qwen3.6-35B-A3B as the accepted fallback. This is a setup-time selection, not a requirement for automatic model switching during a run. Practical fit must account for the complete working environment, including the agent, application, and testing tools, rather than model loading alone.
 
-The [environment research](02-research-dgx-autonomy-environment.md) identifies an approximately 83.8-GiB Q3 artifact for Qwen3.8-Flash-Next and third-party Spark results, but does not establish runtime fit or stability on the target host. Quantization, usable context, and host validation are deferred to technical design and setup; the preferred model is not promised to fit based on download size alone.
+The [environment research](02-research.md) identifies an approximately 83.8-GiB Q3 artifact for Qwen3.8-Flash-Next and third-party Spark results, but does not establish runtime fit or stability on the target host. Quantization, usable context, and host validation are deferred to technical design and setup; the preferred model is not promised to fit based on download size alone.
 
 The environment must allow future model substitution, but a multi-model catalog and formal capability-testing workflow are not first-version priorities. When that workflow is introduced, a model must pass the capability test before being added to the supported list. It is not a test repeated as a prerequisite for each unattended run.
 

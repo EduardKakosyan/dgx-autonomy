@@ -9,6 +9,8 @@ tags: [research, dgx-spark, llama-cpp, openhands, playwright]
 status: complete
 ---
 
+> **Historical record.** This is the research as written on 2026-09-22, before building started, kept as a record (machine names, addresses and paths have since been removed). [README.md](../../README.md) and [docs/operator-manual.md](../operator-manual.md) describe what was built.
+
 # Research: The local application and upstream runtimes exist independently; DGX access is verified
 
 **Date**: 2026-09-22T14:17:00Z
@@ -18,7 +20,7 @@ status: complete
 
 ## Research Question
 
-The source query is `01-research-questions-dgx-autonomy-environment.md`. Its eight areas are:
+The source query is [01-research-questions.md](01-research-questions.md). Its eight areas are:
 
 1. Inspect the actual `dgx-1` operating system, hardware, memory, storage, runtimes, permissions, services, development directories, and inference installations without changing services or exposing credentials.
 2. Separate local and remote implementations, document existing tooling/tests, and record exact frontend styling contracts.

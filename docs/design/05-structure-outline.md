@@ -6,9 +6,11 @@ branch: autonomous-coding-agent-research-environment-on-dgx-s4lt7z
 sha: 999ced58a6bcec55680ca32b81f47a694a62ef72
 ---
 
+> **Historical record.** This is the structure outline as written before building started and updated while building, through 2026-09-24, kept as a record (machine names and a few details have since been removed). [README.md](../../README.md) and [docs/operator-manual.md](../operator-manual.md) describe what was built.
+
 # DGX Autonomous Coding Environment
 
-This outline builds the [TDD](04-tdd-dgx-autonomy-environment.md)'s trusted controller, isolated OpenHands agent sandbox, dedicated llama.cpp inference, and protected evaluator as a self-contained Python package, `autonomy/`, next to the beach app. Phase 1 gets one small unattended run working end-to-end on the DGX. Later phases each add one lifecycle guarantee from the [PRD](03-prd-dgx-autonomy-environment.md): stop and deadline, the operating boundary, crash recovery, protected acceptance checks, planning, and context continuity. The last phase qualifies the model and runs the long readiness experiment.
+This outline builds the [TDD](04-technical-design.md)'s trusted controller, isolated OpenHands agent sandbox, dedicated llama.cpp inference, and protected evaluator as a self-contained Python package, `autonomy/`, next to the beach app. Phase 1 gets one small unattended run working end-to-end on the DGX. Later phases each add one lifecycle guarantee from the [PRD](03-prd.md): stop and deadline, the operating boundary, crash recovery, protected acceptance checks, planning, and context continuity. The last phase qualifies the model and runs the long readiness experiment.
 
 ## Desired End State
 
