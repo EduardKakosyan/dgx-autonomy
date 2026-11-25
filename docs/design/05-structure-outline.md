@@ -8,11 +8,11 @@ sha: 999ced58a6bcec55680ca32b81f47a694a62ef72
 
 # DGX Autonomous Coding Environment
 
-This outline builds the [TDD](04-tdd-dgx-autonomy-environment.md)'s trusted controller, isolated OpenHands agent sandbox, dedicated llama.cpp inference, and protected evaluator as a self-contained Python package, `autonomy/`, next to the beach app. Phase 1 gets one small unattended run working end-to-end on `hugo-dgx1`. Later phases each add one lifecycle guarantee from the [PRD](03-prd-dgx-autonomy-environment.md): stop and deadline, the operating boundary, crash recovery, protected acceptance checks, planning, and context continuity. The last phase qualifies the model and runs the long readiness experiment.
+This outline builds the [TDD](04-tdd-dgx-autonomy-environment.md)'s trusted controller, isolated OpenHands agent sandbox, dedicated llama.cpp inference, and protected evaluator as a self-contained Python package, `autonomy/`, next to the beach app. Phase 1 gets one small unattended run working end-to-end on the DGX. Later phases each add one lifecycle guarantee from the [PRD](03-prd-dgx-autonomy-environment.md): stop and deadline, the operating boundary, crash recovery, protected acceptance checks, planning, and context continuity. The last phase qualifies the model and runs the long readiness experiment.
 
 ## Desired End State
 
-- An operator sets up the DGX once with the privileged steps. After that, `jim` runs every experiment over SSH with the `dgx-autonomy` CLI and needs no Docker group membership.
+- An operator sets up the DGX once with the privileged steps. After that, the operator account (`<user>`) runs every experiment over SSH with the `dgx-autonomy` CLI and needs no Docker group membership.
 - `dgx-autonomy plan` → `launch` → `status` / `logs` / `report` → `stop` → `release` covers the PRD workflow. `tunnel` prints the SSH local-forward command for the demo.
 - A controller container managed by restarts owns SQLite lifecycle state, the fixed deadline, recovery, and evaluator invocation. The agent never gets the Docker socket, the controller state, or the frozen checks.
 - Dedicated inference replaces `claude-qwen` while a reservation is held. Releasing the reservation restores the service's recorded prior configuration.
@@ -54,14 +54,14 @@ The package lives beside the beach app and has its own toolchain. The Next.js bu
 +│   │   └── agent.Dockerfile            + pinned Agent Server image + Node 22 / pnpm for app builds
 +│   ├── src/dgx_autonomy/
 +│   │   ├── cli.py                      + launch --brief, status, logs; talks to the control socket
-+│   │   ├── control_api.py              + JSON-over-unix-socket server, socket mode 0600 for jim
++│   │   ├── control_api.py              + JSON-over-unix-socket server, socket mode 0600 for <user>
 +│   │   ├── controller.py               + reconcile loop: ensure inference → workspace → conversation
 +│   │   ├── state.py                    + SQLite repository (runs, operations)
 +│   │   ├── inference.py                + start owned llama-server container; poll /health and /slots
 +│   │   ├── runtime.py                  + docker CLI adapter behind RuntimePort (injected runner)
 +│   │   └── openhands_adapter.py        + ConversationPort over RemoteConversation / Workspace(host=…)
 +│   ├── scripts/
-+│   │   └── deploy.sh                   + rsync to hugo-dgx1, build images, print privileged compose step
++│   │   └── deploy.sh                   + rsync to the DGX, build images, print privileged compose step
 +│   └── tests/
 +│       ├── fakes.py                    + FakeClock, FakeRuntime, FakeConversation, FakeRunner
 +│       ├── test_state.py               + run creation, deadline immutability
@@ -78,7 +78,7 @@ The package lives beside the beach app and has its own toolchain. The Next.js bu
 
 ```mermaid
 flowchart LR
-    CLI[dgx-autonomy CLI as jim] -->|unix socket| Controller[controller container]
+    CLI[dgx-autonomy CLI as the operator account] -->|unix socket| Controller[controller container]
     Controller -->|docker.sock| Docker[(Docker daemon)]
     Controller -->|REST / WS, private net| Agent[agent container: Agent Server]
     Agent -->|private net| Inference[llama-server container]
@@ -120,11 +120,11 @@ logs    { run_id, follow? }                         -> event stream (SDK events,
 - [x] `cd autonomy && uv run ruff check && uv run mypy src`
 - [x] `cd autonomy && uv run pytest -m "not dgx"`
 - [x] CI `autonomy` job passes alongside the existing `pnpm` job (`autonomy · ruff · mypy · pytest` passed on the Phase 2–3 push, run 35870180163. The `pnpm` job failed there on one web-app e2e test, `e2e/timeline.spec.ts:28` on `webkit-ipad`. It depends on the date: every unrecorded day after the fixture seed's last day, Sep 12, gets a flexible column of the band, so the closed run shrinks below 3× the stub as the date moves. This is not caused by `autonomy/`, and `main` has not run since Sep 14.)
-- [x] `ssh hugo-dgx1 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_tool_calls.py tests/dgx/test_trivial_run.py'` (4 passed; use `~/.local/bin/uv`, bare `uv` is not on the non-interactive SSH PATH)
+- [x] `ssh <dgx> 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_tool_calls.py tests/dgx/test_trivial_run.py'` (4 passed; use `~/.local/bin/uv`, bare `uv` is not on the non-interactive SSH PATH)
 
 #### Manual Verification
 
-- [x] The operator runs the privileged setup from the README once (image builds and `sudo docker compose up -d`), and `jim` can then run `dgx-autonomy status` without Docker group membership
+- [x] The operator runs the privileged setup from the README once (image builds and `sudo docker compose up -d`), and `<user>` can then run `dgx-autonomy status` without Docker group membership
 - [x] `docker inspect` on the agent container shows no socket mount, a non-root user, and dropped capabilities
 - [x] `claude-qwen` keeps serving throughout
 
@@ -142,7 +142,7 @@ This phase adds the controller-owned wall-clock deadline, `stop`, and the retain
  ├── controller.py            ~ deadline/stop transitions; stop_agent sequence
  ├── runtime.py               ~ stop_agent(), ensure_demo(); demo port published on 127.0.0.1 only
 +├── demo_tool.py             + OpenHands tool `start_demo(command, port)` → controller demo operation
- ├── cli.py                   ~ stop, tunnel (prints `ssh -L <p>:127.0.0.1:<p> hugo-dgx1`)
+ ├── cli.py                   ~ stop, tunnel (prints `ssh -L <p>:127.0.0.1:<p> <dgx>`)
  └── containers/agent.Dockerfile ~ small supervisor (s6/tini) owning `agent` and `demo` process groups
  autonomy/tests/
 +├── test_deadline.py         + fake clock: expiry fires while SDK call is blocked
@@ -180,7 +180,7 @@ stop_agent(run_id)
 #### Automated Verification
 
 - [x] `cd autonomy && uv run pytest -m "not dgx" tests/test_deadline.py tests/test_stop_agent.py` (29 passed; full suite 126 passed, ruff and mypy clean)
-- [x] `ssh hugo-dgx1 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_stop_retains_demo.py'` (1 passed in 6 min; the Phase 1 dgx tests still pass on the new image, 4 passed)
+- [x] `ssh <dgx> 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_stop_retains_demo.py'` (1 passed in 6 min; the Phase 1 dgx tests still pass on the new image, 4 passed)
 
 #### Manual Verification
 
@@ -210,7 +210,7 @@ This phase makes the two operator-authorized host changes before the agent does 
  └── tests/
      ├── test_reservation.py   + snapshot round-trip; release restores exact prior unit text
      └── dgx/
-         ├── test_egress.py    + from agent container: pypi.org ok; 100.x, 192.168.x, host ports refused
+         ├── test_egress.py    + from agent container: pypi.org ok; tailnet, LAN, host ports refused
          └── test_reserve_release.py + reserve → claude-qwen port returns busy notice → release → restored
 ```
 
@@ -230,13 +230,13 @@ reservation
 
 #### Implementation notes
 
-The read-only inspection on hugo-dgx1 found the following. `claude-qwen.service` is a system unit at `/etc/systemd/system/` with no drop-ins. It runs as `jim` with `Restart=always`, is enabled, and serves Qwen3.8-27B Q8 plus mmproj on `127.0.0.1:8090` with an API key file. Docker 29.2.1 uses the iptables-nft backend. The host's DNS upstream is the LAN router. `br_netfilter` is not loaded. `jim` has no passwordless sudo, so every host change below is an operator step.
+The read-only inspection on the DGX found the following. `claude-qwen.service` is a system unit at `/etc/systemd/system/` with no drop-ins. It runs as `<user>` with `Restart=always`, is enabled, and serves a dense model on a loopback port. Docker 29.2.1 uses the iptables-nft backend. The host resolves names through the LAN router. `br_netfilter` is not loaded. `<user>` has no passwordless sudo, so every host change below is an operator step.
 
 The implementation differs from the outline above in these ways:
 
 - **No `systemctl mask`.** A unit whose file is in `/etc/systemd/system` cannot be masked in place, and a `--runtime` mask would neither override `/etc` nor survive a reboot. Instead, `reserve` adds one drop-in with `ConditionPathExists=!/var/lib/dgx-autonomy/reservation/record.json`. The unit file is never edited, and the block holds across a manual start, `Restart=always`, and a reboot.
 - **reserve/release live in `reservation.py` plus the CLI, not in `inference.py`.** `reservation.py` is stdlib-only and installed root-owned as `/usr/local/sbin/dgx-autonomy-reservation`. The sudoers entry grants exactly `reserve`, `release` and `status`. The controller only gained `inference.stop` (refused while a run is active) and a `reservation` field in `inference.status`.
-- **The egress policy is its own `inet dgx_autonomy` table, not DOCKER-USER rules.** It has `forward` and `input` hooks at priority `filter - 10` and matches the fixed bridge names `dgx-egress` and `dgx-internal`, which are set in compose. DOCKER-USER covers only forwarding, while the agent → host traffic (sshd, open-webui, `0.0.0.0` listeners) goes through `input`. The table is loaded by `dgx-autonomy-egress.service` before `docker.service`.
+- **The egress policy is its own `inet dgx_autonomy` table, not DOCKER-USER rules.** It has `forward` and `input` hooks at priority `filter - 10` and matches the fixed bridge names `dgx-egress` and `dgx-internal`, which are set in compose. DOCKER-USER covers only forwarding, while the agent → host traffic (sshd and other `0.0.0.0` listeners) goes through `input`. The table is loaded by `dgx-autonomy-egress.service` before `docker.service`.
 - **The agent gets `--dns 1.1.1.1 --dns 9.9.9.9`**, because the host's resolver sits behind the policy.
 - **The controller fails closed.** It creates no agent sandbox unless two checks pass: the loader's marker (`policy/egress.json`) names the current boot, and both networks use the expected bridge names. A `network.probe` op (and `dgx-autonomy egress HOST:PORT…`) runs a throwaway container with the agent's image, networks, DNS and hardening.
 - **Release refuses, and changes nothing, while the memory claude-qwen used plus 8 GiB of headroom is not available.** The footprint is measured as MemAvailable gained at stop, with the weights' size as a floor. After release, differences in the unit are reported, not overwritten.
@@ -246,14 +246,14 @@ The implementation differs from the outline above in these ways:
 
 - [x] `cd autonomy && uv run pytest -m "not dgx" tests/test_reservation.py` (14 passed; full suite 182 passed, ruff and mypy clean)
 - [x] nftables rules: `nft -c` and repeated `nft -f` with nftables 1.0.9 (the DGX's version) in a privileged local container. A behavior check used network namespaces: before loading, the agent reached the internet, LAN, tailnet and all host addresses. After loading, only the internet was reachable, every other target was refused at once (curl exit 7), and host → demo still worked.
-- [x] `ssh hugo-dgx1 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_egress.py tests/dgx/test_reserve_release.py'`
+- [x] `ssh <dgx> 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_egress.py tests/dgx/test_reserve_release.py'`
   - `test_egress.py`: 3 passed, after `sudo host/install.sh`, network recreation, and a controller rebuild on 2026-09-23. From the agent's position, `pypi.org` and the owned model are reachable. Every DGX address, the LAN router, `100.100.100.100` and the Docker gateways fail with "No route to host".
   - `test_reserve_release.py`: 1 passed in 17 s, run with `DGX_AUTONOMY_RESERVATION_TEST=1`. claude-qwen was stopped from 13:56:59 to 13:57:06 UTC. The measured footprint was 39.1 GiB, so release requires 47.1 GiB available. After release, `systemctl cat` was identical, the drop-in directory was gone, and `/health` returned 200.
 
 #### Manual Verification
 
 - [x] The operator reviews the nftables rules and sudoers entry before installing them (the three-action sudoers entry is accepted)
-- [x] After `release`, the usual client of `claude-qwen` works again with no manual fixes (on 2026-09-23 after the release and both Phase 4 reboots, with no manual changes: an authenticated `POST /v1/chat/completions` with the service's own API key file, the way its clients call it, answered `ok` as `qwen3.8-opus`. The unit was unchanged since release, as `systemctl cat` showed right after it. Harshil's own client was not exercised.)
+- [x] After `release`, the usual client of `claude-qwen` works again with no manual fixes (on 2026-09-23 after the release and both Phase 4 reboots, with no manual changes: an authenticated `POST /v1/chat/completions`, the way its clients call it, answered `ok`. The unit was unchanged since release, as `systemctl cat` showed right after it. The service owner's own client was not exercised.)
 
 ---
 
@@ -309,16 +309,16 @@ Reading the pinned Agent Server (1.49.4) changed the plan. When it starts, it lo
 
 #### Automated Verification
 
-- [x] `cd autonomy && uv run pytest -m "not dgx" tests/test_reconcile.py tests/test_offline_expiry.py tests/test_writer_lock.py` (33 passed; full suite 218 passed locally and on hugo-dgx1, ruff and mypy clean)
-- [x] `ssh hugo-dgx1 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_controller_kill.py'` (2 passed in 9.5 min on 2026-09-23, after the controller rebuild. The v2 → v3 migration of the DGX database ran on first start. Controller crash: the new controller took the lock over, reattached to the same conversation and the same agent container, with no recovery and one user message. Whole-stack crash (llama-server + sandbox + controller): recovered in 53 s. The conversation waited 35 s for the dead Agent Server's lease (45 s TTL), then resumed from `error`. The run finished the brief with two user messages.)
-- [x] Regression after the retained-demo fixes: `pytest -m dgx` for `test_tool_calls`, `test_trivial_run`, `test_egress`, `test_stop_retains_demo` and `test_controller_kill` gave 10 passed in 16.5 min on hugo-dgx1. The whole-stack crash recovered in 43 s. `test_reserve_release` was not repeated, because it stops `claude-qwen`.
+- [x] `cd autonomy && uv run pytest -m "not dgx" tests/test_reconcile.py tests/test_offline_expiry.py tests/test_writer_lock.py` (33 passed; full suite 218 passed locally and on the DGX, ruff and mypy clean)
+- [x] `ssh <dgx> 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_controller_kill.py'` (2 passed in 9.5 min on 2026-09-23, after the controller rebuild. The v2 → v3 migration of the DGX database ran on first start. Controller crash: the new controller took the lock over, reattached to the same conversation and the same agent container, with no recovery and one user message. Whole-stack crash (llama-server + sandbox + controller): recovered in 53 s. The conversation waited 35 s for the dead Agent Server's lease (45 s TTL), then resumed from `error`. The run finished the brief with two user messages.)
+- [x] Regression after the retained-demo fixes: `pytest -m dgx` for `test_tool_calls`, `test_trivial_run`, `test_egress`, `test_stop_retains_demo` and `test_controller_kill` gave 10 passed in 16.5 min on the DGX. The whole-stack crash recovered in 43 s. `test_reserve_release` was not repeated, because it stops `claude-qwen`.
 
 #### Manual Verification
 
 - [x] Reboot the DGX during a short run and confirm that it resumes without the laptop connected. Repeat with a deadline that passes during the downtime, and confirm the result is `expired` with the demo kept. (Step by step: `autonomy/tests/dgx/test_reboot.md`.)
   - Resume: run `20260923-154500-eb3c48`, `systemctl reboot` at 15:46:37 during `sleep 300`. The controller was back at 15:47:25 ("the DGX restarted since"). Recovery #1 (`llama-server is exited (exit code 0); the agent sandbox is exited (exit code 137)`, status before `running`): llama-server ready in 30 s. The same sandbox container (`15cf9337e710`) was started again, the demo was relaunched, and the conversation resumed from `error` at 15:48:02, 37 s after the controller started. The demo served `reboot demo ok` again. The agent re-ran the interrupted `sleep 300`, wrote `after-reboot.txt` and finished, with exactly two user messages (the brief and the notice).
   - Offline expiry: a DGX power-off could not be done remotely, so this used a reboot 30 s before the deadline of a 0.1 h run (`20260923-155604-149028`). At startup, 13 s after the deadline, the run was recorded `expired` before anything resumed. The stop was verified with no survivors. The sandbox came back demo-only (supervisor + demo, no Agent Server), and the demo was relaunched and served the page. There was no recovery and no message to the conversation. `claude-qwen` was healthy after both reboots.
-  - Found and fixed afterwards (`tests/test_retained_demos.py`, verified live after a controller rebuild on hugo-dgx1):
+  - Found and fixed afterwards (`tests/test_retained_demos.py`, verified live after a controller rebuild on the DGX):
     - A demo relaunched for an ended run stayed `starting` in `status`. Ended runs are not reconciled; this dates from Phase 2. The loop now checks every `starting` demo of an ended run.
     - An expired run cut off mid-step showed `conversation_status running`, which the killed Agent Server had saved. It now reads `interrupted`. An ended run whose Agent Server is gone falls back to the saved status instead of `None`.
     - The demo of a run that had already *ended* before a reboot did not come back. `reconcile_on_start` now starts such a sandbox again demo-only, if it still exists and its demo had not failed, and relaunches the recorded command. On the controller restart after the rebuild, the two finished runs' demos came back (`reboot demo ok` on 43004), with only the supervisor and the demo in their sandboxes.
@@ -392,8 +392,8 @@ The implementation differs from the outline above in these ways:
 
 #### Automated Verification
 
-- [x] `cd autonomy && uv run pytest -m "not dgx" tests/test_frozen.py tests/test_evaluation.py` (28 + 30 passed, plus `test_snapshot.py` 5 and the v3 → v4 migration in `test_state.py`. The full suite had 286 passed locally and on hugo-dgx1, with ruff, ruff format and mypy clean)
-- [x] `ssh hugo-dgx1 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_protected_eval.py'` (1 passed in 2 min on 2026-09-23. This followed `docker compose --profile images build controller evaluator-image` and a controller restart, and the v3 → v4 migration ran on start. Run `20260923-202108-a78939`: `echo >> /brief/checks/…` and `touch /brief/checks/extra.py` hit "Read-only file system", and `ls /var/lib/dgx-autonomy/runs` got "No such file or directory". Evaluation #1: home passed, version failed on a 404, and the failure was delivered. The agent added `version.txt`. Evaluation #2 relaunched the demo for the new snapshot, and both checks passed, so the run finished VERIFIED. The evidence is root/10002-owned and world-readable, and `snapshots.git` is root 0700.)
+- [x] `cd autonomy && uv run pytest -m "not dgx" tests/test_frozen.py tests/test_evaluation.py` (28 + 30 passed, plus `test_snapshot.py` 5 and the v3 → v4 migration in `test_state.py`. The full suite had 286 passed locally and on the DGX, with ruff, ruff format and mypy clean)
+- [x] `ssh <dgx> 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_protected_eval.py'` (1 passed in 2 min on 2026-09-23. This followed `docker compose --profile images build controller evaluator-image` and a controller restart, and the v3 → v4 migration ran on start. Run `20260923-202108-a78939`: `echo >> /brief/checks/…` and `touch /brief/checks/extra.py` hit "Read-only file system", and `ls /var/lib/dgx-autonomy/runs` got "No such file or directory". Evaluation #1: home passed, version failed on a 404, and the failure was delivered. The agent added `version.txt`. Evaluation #2 relaunched the demo for the new snapshot, and both checks passed, so the run finished VERIFIED. The evidence is root/10002-owned and world-readable, and `snapshots.git` is root 0700.)
 - [x] Regression on the new images: `pytest -m dgx` for `test_tool_calls`, `test_trivial_run`, `test_egress`, `test_stop_retains_demo` and `test_controller_kill` gave 10 passed in 16.7 min. The whole-stack crash recovered in 53 s. `test_reserve_release` was not repeated, because it stops `claude-qwen`.
 
 #### Manual Verification
@@ -449,7 +449,7 @@ The implementation differs from the outline above in these ways:
 #### Automated Verification
 
 - [x] `cd autonomy && uv run pytest -m "not dgx" tests/test_planning.py` (15 passed; full suite 302 passed, ruff, ruff format and mypy clean)
-- [x] `ssh hugo-dgx1 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_plan_to_launch.py'` (1 passed in 3.4 min on 2026-09-23, after a controller rebuild; the v4 → v5 migration ran on start. The planner wrote the dictated draft. `fault.inject controller` crashed the controller mid-plan, and the plan came back `open` with the same conversation and draft digest. A second turn changed the heading. The dry run reported both checks `failed` against the empty target. Launch froze the reviewed digest and removed the planner sandbox. Run `20260923-210034-a4d059` finished VERIFIED, and its `checks-read-only` check proved from inside the evaluator that `/checks` cannot be written.)
+- [x] `ssh <dgx> 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_plan_to_launch.py'` (1 passed in 3.4 min on 2026-09-23, after a controller rebuild; the v4 → v5 migration ran on start. The planner wrote the dictated draft. `fault.inject controller` crashed the controller mid-plan, and the plan came back `open` with the same conversation and draft digest. A second turn changed the heading. The dry run reported both checks `failed` against the empty target. Launch froze the reviewed digest and removed the planner sandbox. Run `20260923-210034-a4d059` finished VERIFIED, and its `checks-read-only` check proved from inside the evaluator that `/checks` cannot be written.)
 
 #### Manual Verification
 
@@ -509,12 +509,12 @@ The implementation differs from the outline above in these ways:
 - **Triggers:** `stuck`, `errors` (after 3 nudges within an hour, with backoff 30/60/120 s), `context` (85%), `failures` (3 failed claims in a row within the active conversation), `blocked-review`, and `forced` (`dgx-autonomy rollover`, which the dgx test uses). **An ERROR or STUCK conversation no longer fails the run.** Only the deadline, a stop, or a confirmed blocker end it, as the PRD requires. At least 10 min must pass between context/failures rollovers, and 1 min between stuck/errors ones.
 - **Fallback:** when there is no valid handoff within 10 minutes, the controller records a `controller_fallback`. It holds the previous valid handoff, marked as older, and the old conversation's last actions as observed. It marks nothing done. The recovery context is at most 25% of `ctx` (about 3 chars per token). Sections are trimmed from the least important up: last actions, then recent failures, then the brief (which points at `/brief/brief.md`), then the checkpoint.
 - **`blocked` requires two conversations:** a valid declaration starts a `blocked-review` rollover, and only a declaration from that fresh conversation stops the run as `blocked`. The run records the blocker, the first declaration, and the confirming conversation.
-- Found on hugo-dgx1 while testing: **nothing capped a response's length.** OpenHands sent no `max_tokens`, and llama-server's `n_predict` was -1. A reasoning loop in the tip-calculator run generated 10 000+ tokens over 20+ minutes on the only slot, while a second run queued behind it. Every model now has `max_output_tokens` (default 16 384). It is sent by the LLM config, and it is llama-server's `--n-predict` default for requests that send none. After the fix, the same loop stopped at 16 384 tokens.
+- Found on the DGX while testing: **nothing capped a response's length.** OpenHands sent no `max_tokens`, and llama-server's `n_predict` was -1. A reasoning loop in the tip-calculator run generated 10 000+ tokens over 20+ minutes on the only slot, while a second run queued behind it. Every model now has `max_output_tokens` (default 16 384). It is sent by the LLM config, and it is llama-server's `--n-predict` default for requests that send none. After the fix, the same loop stopped at 16 384 tokens.
 
 #### Automated Verification
 
 - [x] `cd autonomy && uv run pytest -m "not dgx" tests/test_checkpoints.py tests/test_rollover.py` (10 + 11 passed, plus `test_handoff_tool.py` 4 and the v5 → v6 migration in `test_state.py`; full suite 338 passed, ruff, ruff format and mypy clean)
-- [x] `ssh hugo-dgx1 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_forced_reset.py'` (1 passed in 40 min on 2026-09-23, after the agent image and controller rebuild; the v5 → v6 migration ran on start. The run was `20260923-213805-af5a17`, sharing the single inference slot with the tip-calculator run. The rollover was forced right after `step3.txt` appeared. The builder finished step 4 before it answered the HANDOFF REQUEST, and its first `write_handoff` was accepted. Conversation #2 started from checkpoint #1, wrote steps 5 and 6, and served the demo. Evaluation #1 passed, so the run finished VERIFIED before the same deadline. `step1–3.txt` kept their mtimes.)
+- [x] `ssh <dgx> 'cd ~/dgx-autonomy && uv run pytest -m dgx tests/dgx/test_forced_reset.py'` (1 passed in 40 min on 2026-09-23, after the agent image and controller rebuild; the v5 → v6 migration ran on start. The run was `20260923-213805-af5a17`, sharing the single inference slot with the tip-calculator run. The rollover was forced right after `step3.txt` appeared. The builder finished step 4 before it answered the HANDOFF REQUEST, and its first `write_handoff` was accepted. Conversation #2 started from checkpoint #1, wrote steps 5 and 6, and served the demo. Evaluation #1 passed, so the run finished VERIFIED before the same deadline. `step1–3.txt` kept their mtimes.)
 
 #### Manual Verification
 
@@ -552,7 +552,7 @@ qualify qwen3.8-flash-next
 
 The implementation differs from the outline above in these ways:
 
-- **Qualification runs in the controller** (`qualify.py`, control ops `qualify.start` / `qualify.status`, CLI `qualify MODEL` and `qualification`). Model swaps and runs need Docker, which jim does not have. It runs on a background thread, one step at a time:
+- **Qualification runs in the controller** (`qualify.py`, control ops `qualify.start` / `qualify.status`, CLI `qualify MODEL` and `qualification`). Model swaps and runs need Docker, which `<user>` does not have. It runs on a background thread, one step at a time:
   - **preflight:** no run or plan is active, and there is memory for the weights plus 8 GiB, counting what removing the current model frees.
   - **load:** the owned llama-server is switched to the model.
   - **tool calls:** five probes through llama.cpp's parser: a single argument, a choice between tools, a nested array of objects (the shape of `write_handoff`), a shell command, and a tool-result round trip.
@@ -569,8 +569,8 @@ The implementation differs from the outline above in these ways:
 
 #### Automated Verification
 
-- [x] `ssh hugo-dgx1 'dgx-autonomy qualify qwen3.8-flash-next'` writes measurements and a qualified/failed status (**qualified**, 2026-09-23 23:20–23:27 UTC, with the reservation held. Load took 40 s and 87.7 GiB. The tool-call probes passed 5/5. A 51 457-token prompt ran at 632.8 tokens/s prefill and 19.5 tokens/s decode and recalled the word. Workload run `20260923-232304-23ca30` finished VERIFIED. Minimum MemAvailable was 23.9 GiB, and swap did not grow. The fallback `qwen3.6-35b-a3b` also qualified: 20 s, 17.6 GiB, 5/5, 2119.8 / 52.5 tokens/s, run `20260923-232902-394983` VERIFIED. `models.yaml` now marks both qualified, and the default is `qwen3.8-flash-next`.)
-- [x] `ssh hugo-dgx1 'dgx-autonomy readiness'` passes on the default model (**PASSED** on `qwen3.8-flash-next`, 2026-09-23 23:34 → 2026-09-24 00:15 UTC, report `~/dgx-autonomy/readiness/20260923T233455/report.md`. 8 suites and 15 tests: tool calls, a trivial run, egress, deadline stop keeping the demo, controller and whole-stack crashes, protected checks, planning to launch (the reference app passed), and the forced reset. `test_reserve_release.py` was not rerun, because the reservation was held at the time. The reboot checks remain the Phase 4 manual record.)
+- [x] `ssh <dgx> 'dgx-autonomy qualify qwen3.8-flash-next'` writes measurements and a qualified/failed status (**qualified**, 2026-09-23 23:20–23:27 UTC, with the reservation held. Load took 40 s and 87.7 GiB. The tool-call probes passed 5/5. A 51 457-token prompt ran at 632.8 tokens/s prefill and 19.5 tokens/s decode and recalled the word. Workload run `20260923-232304-23ca30` finished VERIFIED. Minimum MemAvailable was 23.9 GiB, and swap did not grow. The fallback `qwen3.6-35b-a3b` also qualified: 20 s, 17.6 GiB, 5/5, 2119.8 / 52.5 tokens/s, run `20260923-232902-394983` VERIFIED. `models.yaml` now marks both qualified, and the default is `qwen3.8-flash-next`.)
+- [x] `ssh <dgx> 'dgx-autonomy readiness'` passes on the default model (**PASSED** on `qwen3.8-flash-next`, 2026-09-23 23:34 → 2026-09-24 00:15 UTC, report `~/dgx-autonomy/readiness/20260923T233455/report.md`. 8 suites and 15 tests: tool calls, a trivial run, egress, deadline stop keeping the demo, controller and whole-stack crashes, protected checks, planning to launch (the reference app passed), and the forced reset. `test_reserve_release.py` was not rerun, because the reservation was held at the time. The reboot checks remain the Phase 4 manual record.)
 
   Further findings while running the readiness experiment on Flash-Next, all fixed and deployed:
   - **The SDK's LLM timeout (300 s) was shorter than a long answer takes** (16 000 tokens at 26 tokens/s is about 10 min). The client abandoned and retried; the planner looked idle for 25 minutes while llama.cpp generated abandoned answers. Each model now has a `request_timeout_s` (1800 s).
@@ -597,7 +597,7 @@ The implementation differs from the outline above in these ways:
 
 - Which model loads first in Phase 1: Qwen3.6-35B-A3B, so it can coexist with `claude-qwen`, or is displacing `claude-qwen` acceptable from day one? That choice decides whether the reservation stays in Phase 3.
 - Where does the operator's privileged setup live? Options: a root-owned systemd unit that runs `docker compose`, or the compose file's restart policy on its own. And is the narrow sudoers entry in Phase 3 acceptable, or should reserve/release stay manual operator steps?
-  - Answered in Phase 3: the sudoers entry that allows only `reserve`, `release` and `status` is accepted. `claude-qwen` (Qwen3.8-27B Q8, dense) belongs to Harshil. The environment runs its own sparse-MoE instance: Qwen3.6-35B-A3B now, and Qwen3.8-Flash-Next once Phase 8 qualifies it. Displacing `claude-qwen` only frees its memory.
-- Egress policy: is an nftables DOCKER-USER allowlist on the DGX acceptable, given that it sits alongside Caddy, cloudflared, and Tailscale rules?
+  - Answered in Phase 3: the sudoers entry that allows only `reserve`, `release` and `status` is accepted. `claude-qwen` (a dense model) is another model service on the machine. The environment runs its own sparse-MoE instance: Qwen3.6-35B-A3B now, and Qwen3.8-Flash-Next once Phase 8 qualifies it. Displacing `claude-qwen` only frees its memory.
+- Egress policy: is an nftables DOCKER-USER allowlist on the DGX acceptable, given that it sits alongside other services' firewall rules?
 - Can `pause()` on Agent Server v1.49.4 reliably kill tool subprocesses? If not, is the supervisor-owned `agent` process group the enforcement point (Phase 2)?
-  - Answered in Phase 2 (`test_stop_retains_demo.py` on hugo-dgx1): no. After `/interrupt` and `/pause` the conversation reported `paused` and the foreground tool call was cancelled, but the tmux server, its bash, and a backgrounded `nohup sleep` all survived, along with the Agent Server and its openvscode-server. The enforcement point is the controller's kill of every sandbox process outside PID 1, the demo session, and `docker exec` processes. A process-tree kill of the Agent Server would miss tmux, which reparents itself to PID 1.
+  - Answered in Phase 2 (`test_stop_retains_demo.py` on the DGX): no. After `/interrupt` and `/pause` the conversation reported `paused` and the foreground tool call was cancelled, but the tmux server, its bash, and a backgrounded `nohup sleep` all survived, along with the Agent Server and its openvscode-server. The enforcement point is the controller's kill of every sandbox process outside PID 1, the demo session, and `docker exec` processes. A process-tree kill of the Agent Server would miss tmux, which reparents itself to PID 1.

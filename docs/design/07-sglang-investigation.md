@@ -1,4 +1,4 @@
-# Would SGLang serve Qwen3.8-Flash-Next faster than llama.cpp on hugo-dgx1?
+# Would SGLang serve Qwen3.8-Flash-Next faster than llama.cpp on the DGX?
 
 2026-09-25. Prompted by the SGLang cookbook page for Qwen3.8-Flash-Next (single-DGX-Spark cells).
 
@@ -38,7 +38,7 @@ SGLang implements QSA with dedicated kernels. Qwen reports up to 6.6x decode spe
 - Measured at 1,024 in / 256 out: **27.5 tok/s single-stream with MTP** (TPOT 33.6 ms), **15.9 tok/s without MTP**. MTP accepts 3.5–3.7 of 4 draft tokens on normal output, about 2.5 on thinking output. Our agent output is mostly thinking, so the MTP gain for us is smaller.
 - Boot rewrites the whole table file. On a fresh sparse file boot takes about 10 minutes; on a populated one about 55 minutes, so the old file must be deleted before each boot. Our llama.cpp loads in 60 s.
 - The page warns that exhausting unified memory "can take the whole box down and needs a power cycle to recover".
-- Image `lmsysorg/sglang:dev-qwen38-next-local` has an arm64 build (checked the manifest). hugo-dgx1 has 1.3 TB free on NVMe.
+- Image `lmsysorg/sglang:dev-qwen38-next-local` has an arm64 build (checked the manifest). The DGX has 1.3 TB free on NVMe.
 
 ## What switching would take
 

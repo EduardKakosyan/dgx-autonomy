@@ -40,7 +40,7 @@ There is no "implementation" section - that is intentional.
 
 The inspected repository is `is-the-beach-open`, a Next.js 16.3.5 / React 19.2.8 beach-status application. Its persistence, refresh jobs, test infrastructure, and simulator CLI concern beach data and browser behavior. No autonomy harness, inference launcher, experiment supervisor, agent SDK integration, or model evaluation pipeline was found in the inspected application source. Its existing browser suite is useful evidence of an application testing contract, not evidence of an installed DGX research environment.
 
-The initial SSH attempt failed because `dgx-1` is not the configured hostname. A user-requested follow-up succeeded through the existing `hugo-dgx1` alias as `jim`, reaching Tailscale host `dgx1`. The host runs Ubuntu 24.04.4 on ARM64 with GB10, driver 580.159.03, and CUDA compiler 13.0.88. Existing inference is active. Docker is installed but direct daemon access is denied to the tested user. The section 1 follow-up supersedes the original access limitation; remote autonomy repository contents remain uninspected.
+The initial SSH attempt failed because `dgx-1` is not the configured hostname. A user-requested follow-up through the operator's existing SSH configuration succeeded. The host runs Ubuntu 24.04.4 on ARM64 with GB10, driver 580.159.03, and CUDA compiler 13.0.88. Another model service is already active on it. Docker is installed but direct daemon access is denied to the tested user. The section 1 follow-up supersedes the original access limitation; remote autonomy repository contents remain uninspected.
 
 Upstream model repositories and GGUF packs were identified, including the exact Q3 shard set for Qwen3.8-Flash-Next. Artifact bytes and advertised context limits do not establish runtime residency or throughput. A follow-up pass located third-party, artifact-pinned Q3 Spark results using a patched runtime, but not full raw benchmark evidence or validation on the target host. OpenHands and llama.cpp independently expose events, persistence, health, usage, and tool interfaces; no inspected local code connects them into a durable experiment lifecycle.
 
@@ -50,31 +50,27 @@ Upstream model repositories and GGUF packs were identified, including the exact 
 
 #### Follow-up on 2026-09-22 establishes access and a live baseline
 
-The earlier failed attempt and original evidence table below are retained as inspection history, not the current access state. The operator's SSH configuration defines `hugo-dgx1`, hostname `dgx1`, user `jim`, and an existing NVIDIA Sync identity. Tailscale reports the machine online at its tailnet name. `ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes hugo-dgx1` succeeded. No private key contents were read, host-key checking weakened, configuration changed, or privilege escalation attempted.
+The earlier failed attempt and original evidence table below are retained as inspection history, not the current access state. The follow-up used the operator's existing SSH configuration with strict host-key checking. No private key contents were read, host-key checking weakened, configuration changed, or privilege escalation attempted.
 
-Read-only snapshot around 2026-09-22 14:43 UTC:
+Read-only snapshot around 2026-09-22 14:43 UTC, summarized. The machine's names, its services, ports, addresses and home-directory paths are left out of this public copy.
 
 | Check | Direct result |
 |---|---|
 | OS / kernel / architecture | Ubuntu 24.04.4 LTS; `6.17.0-1026-nvidia`; `aarch64` |
 | GPU / driver | NVIDIA GB10; 580.159.03; nvidia-smi CUDA compatibility 13.0 |
-| CUDA compiler | `/usr/local/cuda/bin/nvcc`: V13.0.88; bare `nvcc` absent from noninteractive PATH |
-| Existing inference | Active `claude-qwen.service`; nvidia-smi lists a llama-server process under a `...claude/build/bin/` path at 37,238 MiB reported process memory |
-| Host memory | 121 GiB total, 42 GiB used, 78 GiB available; 15 GiB swap with 550 MiB used |
-| Root storage | `/dev/nvme0n1p3`: displayed 1.9T total, 383G used, 1.4T available |
+| CUDA compiler | nvcc V13.0.88, installed but not on the noninteractive PATH |
+| Existing inference | Another model service is active; its llama-server process reports about 37 GB of memory |
+| Host memory | 121 GiB total, 42 GiB used, 78 GiB available; 15 GiB swap |
+| Root storage | NVMe, 1.9 TB, 1.4 TB available |
 | Docker / Compose CLI | 29.2.1 / v5.0.2 |
-| Docker permission | Daemon socket access denied; `/var/run/docker.sock` is root:docker, mode 0660; jim lacks docker group membership |
+| Docker permission | The tested user is not in the `docker` group, so the daemon socket is denied |
 | Python / Git | 3.12.3 / 2.43.0 |
-| uv | `/home/jim/.local/bin/uv` exists; bare command absent from SSH PATH; version not checked |
-| Node / npm / pnpm | Bare commands absent from SSH PATH; no standard NVM version path found; machine-wide absence not established |
-| Active service names | claude-qwen, Docker, containerd, Caddy, cloudflared, Tailscale, DGX dashboard/admin, SSH, plus OS services |
-| Loopback TCP listeners | 8090, 8081, 11434, 11000, 20241, 39987, plus system DNS/printing ports |
-| Other TCP listeners | IPv4 wildcard 8080 and 8710; wildcard SSH 22; Tailscale-address 443 and dynamic listeners |
+| uv | Installed for the tested user; not on the noninteractive SSH PATH |
+| Node / npm / pnpm | Not on the SSH PATH; machine-wide absence not established |
+| Other services | Several other services and listeners already run on the host; the environment must not depend on or disturb them |
 | Requested port 8000 | No TCP listener in the snapshot; not a reservation or future guarantee |
-| Source directories | `/home/jim/src/llama.cpp/`, `/home/jim/src/llama.cpp-claude/` |
-| Other development directories | `/home/jim/hugo/`, `/home/jim/hugo-worktrees/`, `/home/jim/onprem-agent/`, `/home/jim/models/`, `/home/jim/logs/`, `/home/jim/dgx-audit/` |
 
-Aggregate GPU memory usage reports `Not Supported`, consistent with the UMA caveat. Snapshot availability is not a model-fit benchmark. Empty formatted Docker fields accompanying permission denial are not real daemon metadata. Listener ownership and endpoints were not inferred from port numbers. Directory/service names establish existence, not implementation contents. No model request, benchmark, container launch, service modification, or remote test suite ran.
+Aggregate GPU memory usage reports `Not Supported`, consistent with the UMA caveat. Snapshot availability is not a model-fit benchmark. Empty formatted Docker fields accompanying permission denial are not real daemon metadata. No model request, benchmark, container launch, service modification, or remote test suite ran.
 
 #### Initial attempt history
 
@@ -430,7 +426,7 @@ Upstream OpenHands separates model-provider calls from workspace-server calls an
 
 ## Open Questions
 
-1. What do the remote repositories and existing inference service implement, and what Docker/runtime configuration applies beyond the tested user's denied socket access? SSH access is now resolved through `hugo-dgx1`; installed baseline and listeners are recorded in section 1.
+1. What do the remote repositories and existing inference service implement, and what Docker/runtime configuration applies beyond the tested user's denied socket access? SSH access is now resolved; the installed baseline is summarized in section 1.
 2. What end-to-end tool-call compatibility results exist for the named GGUFs with the pinned llama.cpp and OpenHands versions? Static architecture support is established, but runtime integration was not exercised.
 3. What exact SDK parsing-failure events, tagged token-budget/default thresholds, subprocess cleanup guarantees, and corresponding persistence/parser tests apply at v1.49.4? Public API and event-count condensation examples are established; the targeted deeper source pass failed.
 4. Which exact Playwright agent CLI release and Chromium binary revision apply to a resolved Linux ARM64 installation? Supported distributions and CLI/Test behavior are documented, but installed versions are unavailable.

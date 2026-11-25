@@ -1,19 +1,19 @@
-# Governance log: unattended runs on hugo-dgx1
+# Governance log: unattended runs on the DGX
 
 The operator's side of the experiments: what is in flight, and what the next session does. Update it at every hand-over.
 
 ## How to follow the DGX without polling
 
-- Feed: `ssh hugo-dgx1 '~/.local/bin/dgx-autonomy notify --follow'` (all milestones: `plan.waiting`, `plan.dryrun`, `run.launched`, `progress`, `claim`, `evaluation`, `handoff`, `rollover`, `recovery`, `run.ended`, `qualify.done`).
+- Feed: `ssh <dgx> '~/.local/bin/dgx-autonomy notify --follow'` (all milestones: `plan.waiting`, `plan.dryrun`, `run.launched`, `progress`, `claim`, `evaluation`, `handoff`, `rollover`, `recovery`, `run.ended`, `qualify.done`).
 - Laptop helper: `/tmp/dgx-notify.sh` (resumes after the number in `/tmp/dgx-notify.since`; run it under Monitor and re-arm every 30 min). The formatter is `/tmp/dgx-notify-fmt.py`.
-- SSH without the key agent: `ssh -o IdentityAgent=none hugo-dgx1`. Privileged steps: `/tmp/dgxsudo.sh 'cmd'` (password from `/tmp/.dgx-sudo`, 0600, supplied by the user on 2026-09-22 for operator steps).
-- Check-in: run `/tmp/dgx-watch.sh` under Monitor (30-min timeout; re-arm on expiry). It prints a `HEARTBEAT` line at start and every 30 minutes (from `/tmp/dgx-heartbeat.py` on the DGX), then every feed milestone. A line ending in `!!` needs the operator: a planner waiting, or no agent event for 45+ minutes. A new session's first action is to re-arm it. Cloud `/schedule` routines cannot do this job: the DGX is reachable only over Tailscale, with the SSH key on this Mac.
+- SSH without the key agent: `ssh -o IdentityAgent=none <dgx>`.
+- Check-in: run `/tmp/dgx-watch.sh` under Monitor (30-min timeout; re-arm on expiry). It prints a `HEARTBEAT` line at start and every 30 minutes (from `/tmp/dgx-heartbeat.py` on the DGX), then every feed milestone. A line ending in `!!` needs the operator: a planner waiting, or no agent event for 45+ minutes. A new session's first action is to re-arm it.
 - **A `plan.waiting` notice needs an answer.** The planner does nothing until the operator replies (`/tmp/plansend.py PLAN_ID FILE`, or `dgx-autonomy plan --attach`). On 2026-09-24 a session ended right after one, and the planner waited over an hour while claude-qwen stayed displaced.
 
 ## State (2026-09-24 14:15 UTC)
 
 - Model: Qwen3.8-Flash-Next, qualified at 256K context (record `20260924T123724.json`): 206K-token prompt at 387 tok/s prefill, 8.4 tok/s decode. Thinking budget 32K, output 64K per response.
-- Reservation: **held** since 11:57 UTC; claude-qwen displaced (busy notice on :8090).
+- Reservation: **held** since 11:57 UTC; claude-qwen displaced (busy notice on its port).
 - Plan in flight: `20260924-125324-f96a94`, the weather app rebuilt with a UI/UX bar (tmux session `weather2` on the DGX). The planner agreed 7 proposals; answered at 14:14 UTC. Previous checks are copied into its workspace at `/workspace/previous/`.
 - Queued next: the personal budget tracker. Its request is ready at `/tmp/budget-request2.txt` on the DGX; it is seeded with the earlier draft brief, `~/budget-brief-v0.md`.
 
@@ -118,7 +118,7 @@ The operator's side of the experiments: what is in flight, and what the next ses
 ### 11:42 UTC: Shoreline launched (40 h, SGLang)
 
 - The user asked why the fishing and beach request never reached the builder. It had been parked in `weather-backlog.md`, because the old frozen brief allowed only two hosts. The user now wants the app **oriented to the beach and fishing, not just weather**, with a 40 h run and "pure determination to take this to the next level".
-- The operator wrote the brief and checks by hand, not with the planner. `launch --plan` can't take `--from-run`, and jim can't write into a planner's workspace without root (docker needs sudo).
+- The operator wrote the brief and checks by hand, not with the planner. `launch --plan` can't take `--from-run`, and the operator account can't write into a planner's workspace without root (docker needs sudo).
 - **Brief** (`shoreline-brief.md`): the app becomes *Shoreline*. The weather contract is carried over word for word. New:
   - the Marine API (`marine-api.open-meteo.com/v1/marine`); a place is coastal when `current.wave_height` is a number;
   - Good/Fair/Poor verdicts for the beach and for fishing, with exact rules and reason keywords;
@@ -134,7 +134,7 @@ The operator's side of the experiments: what is in flight, and what the next ses
   - The current app fails every new test and passes the old ones. One old test (`errors` "Try again") failed once under parallel load, then passed 3/3 alone.
 - Reserved the DGX for `qwen3.8-flash-next-sglang` (claude-qwen displaced). It was ready at 11:42.
 - **Run `20260926-114212-325c20`**: launched with `--from-run 20260925-163449-24c587`, report `weather5-report.txt` (the review's three small issues and the new direction), `--hold`, 40 h. Deadline 2026-09-28 03:42 UTC. Demo port 43032. `release-after` is armed.
-- The brief bundle is at `~jim/briefs/shoreline` on the DGX. The local copy is `/tmp/wnext` (draft, reference and harness). Watch out: a macOS `tar` adds `._*` files, and `launch` rejects them as non-UTF-8.
+- The brief bundle is at `~<user>/briefs/shoreline` on the DGX. The local copy is `/tmp/wnext` (draft, reference and harness). Watch out: a macOS `tar` adds `._*` files, and `launch` rejects them as non-UTF-8.
 - The watcher is `dgx-autonomy notify --follow --run 20260926-114212-325c20` under a Claude Monitor. It dies with the session, so re-arm it in each new session.
 
 ### 2026-09-27 20:34 UTC: Shoreline claim reviewed; feedback #2
@@ -234,5 +234,5 @@ Act as the product lead (L7). Judge the product, not the code: no code help, no 
 
 1. **Weather run `20260925-163449-24c587` (SGLang).** On `run.review`: review against `weather4-report.txt` (five points), then accept or send feedback. Watch the heartbeat's free-memory figure. Compare how the builder behaves on SGLang with the llama.cpp runs: decode speed through the run, how far the context grows, and thinking length (no reasoning budget here).
    *(Done 16:35: the steps below.)* Wait for both downloads, then `chmod -R o+rX ~/models/qwen3.8-flash-next-nvfp4`. Check that the image's `python3 -m sglang.launch_server --help` knows `--ple-offload-backend`, `--ple-offload-dir`, `--tool-call-parser auto` and `--fp4-gemm-backend`. Run `dgx-autonomy qualify qwen3.8-flash-next-sglang`. If it qualifies: `dgx-autonomy launch --brief /var/lib/dgx-autonomy/runs/20260924-180353-eabd48/frozen --model qwen3.8-flash-next-sglang --from-run 20260924-180353-eabd48 --report weather4-report.txt --hold`, then `dgx-autonomy release --after NEW_RUN --detach`. If not: the same launch with the llama.cpp model.
-2. Then the budget tracker: plan it (its request is `/tmp/budget-request2.txt` on the DGX), dry-run, `/launch 40`, `dgx-autonomy hold RUN`, and as jim `dgx-autonomy release --after RUN_ID --detach`. It is the first run with the heredoc fix.
+2. Then the budget tracker: plan it (its request is `/tmp/budget-request2.txt` on the DGX), dry-run, `/launch 40`, `dgx-autonomy hold RUN`, and as `<user>` `dgx-autonomy release --after RUN_ID --detach`. It is the first run with the heredoc fix.
 3. Commit the two environment changes when the user agrees.

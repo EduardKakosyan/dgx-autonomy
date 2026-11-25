@@ -37,7 +37,7 @@ table inet dgx_autonomy {
 			169.254.0.0/16,   # link-local, cloud metadata
 			172.16.0.0/12,    # RFC 1918, including every other Docker network
 			192.0.0.0/24,     # IETF protocol assignments
-			192.168.0.0/16,   # RFC 1918: the LAN (192.168.50.0/24) and its router
+			192.168.0.0/16,   # RFC 1918: the LAN and its router
 			198.18.0.0/15,    # benchmarking
 			224.0.0.0/4,      # multicast
 			240.0.0.0/4       # reserved, broadcast
@@ -50,7 +50,7 @@ table inet dgx_autonomy {
 		elements = {
 			::/128, ::1/128,
 			::ffff:0.0.0.0/96, # IPv4-mapped: same policy as above, no bypass
-			fc00::/7,          # ULA: the LAN's fd21:… and Tailscale's fd7a:115c:a1e0::/48
+			fc00::/7,          # ULA: the LAN's ULA prefix and Tailscale's fd7a:115c:a1e0::/48
 			fe80::/10,         # link-local
 			ff00::/8           # multicast
 		}
