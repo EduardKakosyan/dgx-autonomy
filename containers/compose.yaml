@@ -1,4 +1,5 @@
-# The operator runs this once, with sudo (see ../README.md):
+# The operator runs this once, with sudo (see docs/operator-manual.md, Operator
+# setup, step 4):
 #
 #   sudo docker compose --profile images build
 #   sudo docker compose up -d controller

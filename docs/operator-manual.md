@@ -1,15 +1,15 @@
 # Operator manual
 
-This is the full manual for the reference deployment: one DGX Spark named `hugo-dgx1`, an unprivileged operator account `jim`, and a shared inference service, `claude-qwen`, that the environment borrows the GPU from. Host names, user names, paths and the reservation are specific to that machine. The mechanisms are not. For an overview, start with the [README](../README.md).
+This is the full manual for the reference deployment: one DGX Spark (`<dgx>` below, its SSH host), an unprivileged operator account (`<user>`), and a shared inference service, `claude-qwen` (the unit name in `reservation.py`), that the environment borrows the GPU from. Host names, user names, paths and the reservation are specific to that machine. The mechanisms are not. For an overview, start with the [README](../README.md); [Adapting it to another machine](../README.md#adapting-it-to-another-machine) lists the files that hold the machine's values.
 
 ## The environment
 
-An environment for unattended OpenHands coding runs on the DGX Spark (`hugo-dgx1`).
+An environment for unattended OpenHands coding runs on the DGX Spark.
 It is a Python package with its own toolchain (uv, pytest, ruff).
 
 ```text
-dgx-autonomy CLI (jim, over SSH)
-   │  unix socket, mode 0600, owned by jim
+dgx-autonomy CLI (<user>, over SSH)
+   │  unix socket, mode 0600, owned by <user>
    ▼
 controller container ── docker.sock ──► Docker daemon
    │ REST, private network                │
@@ -41,14 +41,15 @@ evaluator containers (uid 10002, no caps, no socket), one per acceptance check:
   loads `terminal_grouping.py`: OpenHands refuses terminal input with several
   statements on separate lines, which includes a heredoc followed by the command that
   uses it. This module runs such input as one brace group instead.
-- The **inference container** is llama.cpp `f95b0d9`, built for GB10 (`sm_121a`). It
-  serves the model in `config/models.yaml` on the internal network only.
+- The **inference container** is llama.cpp `f95b0d9`, built for GB10 (`sm_121a`), or,
+  for a `backend: sglang` entry, the SGLang image pinned in `config/models.yaml`. It
+  serves the selected model on the internal network only.
 - The **evaluator** is Playwright Test 1.63.0 (Chromium) plus pytest 9.1.1 and httpx.
   The controller starts one disposable evaluator per automated acceptance check when
   the builder claims completion (see [Acceptance checks](#acceptance-checks)).
 
 The default model is `qwen3.8-flash-next` (Qwen3.8-Flash-Next, Q3, 83.8 GiB, 125B
-total / 6B active). It qualified on hugo-dgx1 with the whole workload running: all
+total / 6B active). It qualified on the DGX with the whole workload running: all
 tool-call probes passed, a 51K-token prompt ran at 633 tokens/s prefill and 19.5 tokens/s
 decode, and at least 23.9 GiB stayed available. That was at a 64K context; it now
 runs at its native 256K (262 144 tokens) with up to 32K thinking tokens and 64K output
@@ -61,52 +62,78 @@ about 3.2 GiB. It does not fit next to
 reservation](#the-inference-reservation)). The controller refuses to load a model that
 the host lacks the memory for. The qualified fallback is `qwen3.6-35b-a3b` (Q3, about
 17 GB, 52.5 tokens/s decode at 51K). It runs next to `claude-qwen`: pass
-`--model qwen3.6-35b-a3b` to `plan` or `launch`. The reservation and the agent's
-egress policy are the only host changes the environment makes. Both are installed by
-the operator from `host/`.
+`--model qwen3.6-35b-a3b` to `plan` or `launch`.
+
+Outside Docker and `/var/lib/dgx-autonomy`, these are the environment's host
+changes. The operator installs the egress policy, the reservation helper, the busy notice and the sudoers
+entry from `host/` with `host/install.sh`, and enables lingering for `<user>` (setup
+step 5). `scripts/deploy.sh` links the CLI into `~/.local/bin`, and
+`release --after RUN_ID --detach` writes one systemd user unit,
+`~/.config/systemd/user/dgx-autonomy-release-after@.service`.
 
 `qwen3.8-flash-next-sglang` is the same model served by SGLang
-(`lmsysorg/sglang:dev-qwen38-next-local`) from the NVFP4 checkpoint
-`RadixArk/Qwen3.8-Flash-Next-NVFP4` (126 GiB, in `~/models/qwen3.8-flash-next-nvfp4`,
-`chmod -R o+rX`). llama.cpp computes the model's sparse attention (QSA) as dense
-attention under a mask, so its decode falls from 25 tokens/s near an empty context to
-8 at 225K. SGLang has sparse kernels for it. The 47.7 GiB N-gram table is a file in
-`/var/lib/dgx-autonomy/inference/ple` on the NVMe, deleted and rewritten on every boot
-(about 10 minutes). SGLang runs offline (`HF_HUB_OFFLINE=1`), as the inference user,
-with its JIT and compile caches in `/var/lib/dgx-autonomy/inference/cache`. It has no
-thinking budget: `max_output_tokens` alone bounds a response. It qualified on
-2026-09-25 (see `config/models.yaml`), and every run since has used it: pass
-`--model qwen3.8-flash-next-sglang` to `plan` or `launch`.
+(`lmsysorg/sglang:dev-qwen38-next-local`, pinned by digest in `config/models.yaml`)
+from the NVFP4 checkpoint `RadixArk/Qwen3.8-Flash-Next-NVFP4` (126 GiB, in
+`~/models/qwen3.8-flash-next-nvfp4`, `chmod -R o+rX`). llama.cpp computes the model's
+sparse attention (QSA) as dense attention under a mask, so its decode falls from 25
+tokens/s near an empty context to 8 at 225K. SGLang has sparse kernels for it. The
+47.7 GiB N-gram table is a file in `/var/lib/dgx-autonomy/inference/ple` on the NVMe,
+deleted and rewritten each time the SGLang container starts (about 10 minutes of its
+load). SGLang runs offline (`HF_HUB_OFFLINE=1`), as the inference user, with its JIT
+and compile caches in `/var/lib/dgx-autonomy/inference/cache`. It has no thinking
+budget: `max_output_tokens` alone bounds a response. It qualified on 2026-09-25 (see
+`config/models.yaml`), and every run since has used it. The default in
+`config/models.yaml` is still `qwen3.8-flash-next` (llama.cpp), so pass
+`--model qwen3.8-flash-next-sglang` to `plan`, `launch` and `reserve`.
 
 ## Operator setup (once, privileged)
 
-`jim` is not in the `docker` group, so building images and starting the controller
-need an operator with sudo. Everything after this runs as `jim` without Docker access.
+`<user>` is not in the `docker` group, so installing the host pieces, building images
+and starting the controller need an operator with sudo. Everything after this runs as
+`<user>` without Docker access. Do the steps in this order: the controller creates no
+agent or planner sandbox until step 2 has loaded the egress policy.
 
 1. **Deploy the code** from the laptop (rsync plus `uv sync`, no sudo):
 
    ```bash
-   scripts/deploy.sh                     # DGX_HOST=hugo-dgx1 DGX_DEST=dgx-autonomy by default
+   DGX_HOST=<dgx> scripts/deploy.sh      # DGX_DEST=dgx-autonomy by default
    ```
 
-   The script writes `~/dgx-autonomy/containers/.env` on the DGX with jim's uid/gid
-   and the host paths. Compose reads it.
+   uv must be at `~/.local/bin/uv` on the DGX. The script writes
+   `~/dgx-autonomy/containers/.env` on the DGX with `<user>`'s uid/gid and the host
+   paths (Compose reads it), and links the CLI into `~/.local/bin`.
 
-2. **Download the model** as `jim`. This is unprivileged and about 17 GB:
+2. **Install the host pieces** (egress policy, reservation helper, busy notice,
+   sudoers entry). Review every file in `host/` first. Then:
+
+   ```bash
+   sudo ~<user>/dgx-autonomy/host/install.sh
+   ```
+
+   It checks the sudoers entry with `visudo -c` and the rules with `nft -c`,
+   installs root-owned copies, enables `dgx-autonomy-egress.service` (loaded before
+   Docker on every boot) and `dgx-autonomy-busy-notice.service` (runs only while a
+   reservation is held), and loads the rules now. It does not touch `claude-qwen`.
+   The reservation helper and the busy notice are installed even on a machine
+   without another model service; they do nothing until `dgx-autonomy reserve`.
+
+3. **Download the models** as `<user>`. This is unprivileged. llama-server and SGLang
+   run as uid 65534, so every model directory and file must be world-readable.
+
+   The fallback, Qwen3.6-35B-A3B, is about 17 GB:
 
    ```bash
    ~/.local/bin/uvx --from huggingface_hub hf download unsloth/Qwen3.6-35B-A3B-GGUF \
      Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
      --revision a483e9e6cbd595906af30beda3187c2663a1118c \
      --local-dir ~/models/qwen3.6-35b-a3b
+   chmod -R o+rX ~/models/qwen3.6-35b-a3b
    ```
 
-   llama-server runs as uid 65534. The model directory and files must be
-   world-readable (`chmod -R o+rX ~/models/qwen3.6-35b-a3b`).
-
-   The preferred model, Qwen3.8-Flash-Next, is three shards, 83.8 GiB in total. It
-   took about 29 minutes to download on hugo-dgx1. It needs the reservation to run
-   (see [Models: qualification](#models-qualification)):
+   Qwen3.8-Flash-Next for llama.cpp (`qwen3.8-flash-next`, the config default) is
+   three shards, 83.8 GiB in total. It took about 29 minutes to download on the DGX.
+   It needs the reservation to run (see
+   [Models: qualification](#models-qualification)):
 
    ```bash
    ~/.local/bin/uvx --from huggingface_hub hf download unsloth/Qwen3.8-Flash-Next-GGUF \
@@ -115,20 +142,61 @@ need an operator with sudo. Everything after this runs as `jim` without Docker a
    chmod -R o+rX ~/models/qwen3.8-flash-next
    ```
 
-3. **Build the images and start the controller** as the operator:
+   Qwen3.8-Flash-Next for SGLang (`qwen3.8-flash-next-sglang`, used by every run
+   since 2026-09-25) is the NVFP4 checkpoint, 126 GiB, plus the SGLang image. Pull
+   the image beforehand as the operator: otherwise the controller's `docker run` has
+   to pull it within the 300 s it allows. This model needs the reservation too:
+
+   ```bash
+   ~/.local/bin/uvx --from huggingface_hub hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+     --revision 7b719225242aacd3dbd3f9407468c2ee9a9d2594 \
+     --local-dir ~/models/qwen3.8-flash-next-nvfp4
+   chmod -R o+rX ~/models/qwen3.8-flash-next-nvfp4
+   sudo docker pull lmsysorg/sglang:dev-qwen38-next-local@sha256:9d2a843c706c74bc259c0d9abf360551eb2734e1e7d255ab012a6965f10480b6
+   ```
+
+4. **Build the images and start the controller** as the operator:
 
    ```bash
    sudo install -d -m 0755 /var/lib/dgx-autonomy
-   cd ~jim/dgx-autonomy/containers
+   cd ~<user>/dgx-autonomy/containers
    sudo docker compose --profile images build     # controller, inference (sm_121a check), agent, evaluator
    sudo docker compose up -d controller
    sudo docker compose logs -f controller          # expect "control socket at ..."
    ```
 
    The inference build fails on purpose if the compiled CUDA code does not contain
-   `sm_121a`.
+   `sm_121a`. Then, as `<user>`, `dgx-autonomy egress` should print
+   `egress policy in place`.
 
-4. **Check isolation** after the first run creates an agent container:
+5. **Enable lingering** for `<user>`, so that the user unit that
+   `dgx-autonomy release --after RUN_ID --detach` writes keeps running with nobody
+   logged in, and starts again after a reboot:
+
+   ```bash
+   sudo loginctl enable-linger <user>
+   ```
+
+6. **Only for a deployment from before the bridges had fixed names:** recreate the
+   networks with their fixed bridge names (`dgx-egress`, `dgx-internal`). Networks
+   that an older `containers/compose.yaml` created keep Docker's generated bridge
+   names. The rules match the fixed names, and the controller refuses to create an
+   agent container while they differ. Agent containers from earlier runs are still
+   attached to the old networks, so remove them first. This takes their retained
+   demos down too:
+
+   ```bash
+   cd ~<user>/dgx-autonomy/containers
+   sudo docker ps -a --filter label=dgx-autonomy.role --format '{{.Names}}'   # review
+   sudo docker rm -f $(sudo docker ps -aq --filter label=dgx-autonomy.role)
+   sudo docker compose down
+   sudo docker compose --profile images build controller
+   sudo docker compose up -d controller
+   ```
+
+   Then, as `<user>`, `dgx-autonomy egress` should print `egress policy in place`.
+
+7. **Check isolation** after the first run creates an agent container:
 
    ```bash
    sudo docker inspect dgx-autonomy-agent-<run-id> --format \
@@ -143,38 +211,14 @@ need an operator with sudo. Everything after this runs as `jim` without Docker a
    `docker.sock`, and one port binding:
    `3000/tcp` on `127.0.0.1:<host port>` (43000 and up, one per run).
 
-5. **Install the host pieces** (egress policy, reservation helper, busy notice,
-   sudoers entry). Review every file in `host/` first. Then:
+## CLI (as `<user>`, over SSH)
 
-   ```bash
-   sudo ~jim/dgx-autonomy/host/install.sh
-   ```
+The CLI runs on the DGX. `scripts/deploy.sh` links it into `~/.local/bin`; to do it
+by hand: `ln -sf ~/dgx-autonomy/.venv/bin/dgx-autonomy ~/.local/bin/`.
 
-   It checks the sudoers entry with `visudo -c` and the rules with `nft -c`,
-   installs root-owned copies, enables `dgx-autonomy-egress.service` (loaded before
-   Docker on every boot) and `dgx-autonomy-busy-notice.service` (runs only while a
-   reservation is held), and loads the rules now. It does not touch `claude-qwen`.
-
-6. **Recreate the networks with their fixed bridge names** (`dgx-egress`,
-   `dgx-internal`) if they were created before Phase 3. The rules match those
-   names, and the controller refuses to create an agent container while they
-   differ. Agent containers from earlier runs are still attached to the old networks,
-   so remove them first. This takes their retained demos down too:
-
-   ```bash
-   cd ~jim/dgx-autonomy/containers
-   sudo docker ps -a --filter label=dgx-autonomy.role --format '{{.Names}}'   # review
-   sudo docker rm -f $(sudo docker ps -aq --filter label=dgx-autonomy.role)
-   sudo docker compose down
-   sudo docker compose --profile images build controller
-   sudo docker compose up -d controller
-   ```
-
-   Then, as jim, `dgx-autonomy egress` should print `egress policy in place`.
-
-## CLI (as jim, over SSH)
-
-Put the CLI on the PATH once: `ln -sf ~/dgx-autonomy/.venv/bin/dgx-autonomy ~/.local/bin/`.
+Two options go before the command: `--json` (machine-readable output, for example
+`dgx-autonomy --json status RUN_ID`) and `--socket PATH` (the control socket; default
+`$DGX_AUTONOMY_SOCKET`, then `/var/lib/dgx-autonomy/control/control.sock`).
 
 ```bash
 dgx-autonomy plan [--request TEXT] [--model M]      # plan a run with the model (interactive)
@@ -182,30 +226,40 @@ dgx-autonomy plan --attach [PLAN_ID]      # continue a plan (after a dropped SSH
 dgx-autonomy plan --close PLAN_ID         # abandon a plan
 dgx-autonomy plans                        # planning sessions and the runs they became
 dgx-autonomy launch --plan PLAN_ID [--budget-hours 40] [--yes [--skip-dry-run]]
-dgx-autonomy launch --brief DIR|brief.md [--budget-hours 40] [--model qwen3.6-35b-a3b]
+dgx-autonomy launch --brief DIR|brief.md [--budget-hours 40] [--model M] [--hold]
+dgx-autonomy launch --brief DIR --from-run RUN_ID --report FILE [--model M] [--hold]
+                                      # continue an ended run's project (see below)
 dgx-autonomy status [RUN_ID]          # phase, outcome, deadline, demo, evaluation, stop evidence, recoveries
 dgx-autonomy report [RUN_ID]          # claims, check results, human judgment, evaluations, reviews
 dgx-autonomy evaluate RUN_ID          # run the frozen checks again on an ended run
+dgx-autonomy hold RUN_ID [--off]      # hold a passing claim for your review (or stop holding)
+dgx-autonomy accept RUN_ID            # accept a held run's passing claim: VERIFIED
+dgx-autonomy feedback RUN_ID FILE     # send the builder product direction; it claims again
 dgx-autonomy review-request RUN_ID [--note TEXT]    # bundle for a manual stronger-model review
 dgx-autonomy review-record RUN_ID N --reviewer M --file review.md
-dgx-autonomy logs RUN_ID [--follow]   # summarized OpenHands events (the active conversation)
+dgx-autonomy logs RUN_ID [-f|--follow] [--since N]  # summarized OpenHands events (the active conversation)
 dgx-autonomy checkpoints [RUN_ID]     # conversations and the checkpoint chain
 dgx-autonomy rollover RUN_ID [--detail TEXT]   # continue in a fresh conversation now
 dgx-autonomy stop RUN_ID              # end agent execution now; the demo stays up
-dgx-autonomy tunnel [RUN_ID]          # prints: ssh -N -L <p>:127.0.0.1:<p> hugo-dgx1
+dgx-autonomy retire RUN_ID ... | --all-ended   # take ended runs' demos down (removes their sandboxes)
+dgx-autonomy tunnel [RUN_ID] [--ssh-host H] [--local-port P]
+                                      # prints: ssh -N -L <p>:127.0.0.1:<p> <dgx>
 dgx-autonomy ps [RUN_ID]              # the sandbox's processes, by role
 dgx-autonomy runs
 dgx-autonomy inference [status|up|stop] [--model M]   # stop, then up, switches models
-dgx-autonomy reserve [--model M]      # displace claude-qwen, start the owned llama-server
-dgx-autonomy release                  # remove the owned llama-server, restore claude-qwen
-dgx-autonomy release --after RUN_ID --detach   # the same, once the run has ended
+dgx-autonomy reserve [--model M] [--no-inference]     # displace claude-qwen, start the owned model server
+dgx-autonomy release                  # remove the owned model server, restore claude-qwen
+dgx-autonomy release --after RUN_ID [--detach]   # the same, once the run has ended
 dgx-autonomy reservation              # held or not, since when, memory available
 dgx-autonomy egress [HOST:PORT ...]   # is the egress policy in place / probe through it
-dgx-autonomy qualify MODEL            # qualify a model with the whole workload running
+dgx-autonomy qualify MODEL [--no-follow]   # qualify a model with the whole workload running
 dgx-autonomy qualification [MODEL]    # the latest qualification result
-dgx-autonomy readiness [--only X] [--with-reservation]   # every smoke test, one report
+dgx-autonomy readiness [--only X ...] [--with-reservation] [--out DIR]   # every smoke test, one report
 dgx-autonomy notify [--follow] [--since N] [--run ID]    # the operator's feed of milestones
 ```
+
+`tunnel` prints the SSH host from `--ssh-host`, then `$DGX_AUTONOMY_SSH_HOST`, then
+the default in `src/dgx_autonomy/cli.py`.
 
 ### Notifications
 
@@ -222,7 +276,7 @@ or want to know:
 | `claim`, `evaluation` | the builder claimed completion; the checks decided (per check) |
 | `run.review`, `feedback` | a held run passed its checks and waits for the operator; the operator's feedback went to the builder |
 | `handoff`, `rollover`, `recovery`, `trouble`, `blocked` | continuity and recovery |
-| `run.ended` | VERIFIED, stopped, expired or blocked |
+| `run.ended` | VERIFIED, finished as claimed only, stopped, expired or blocked (a run whose launch step failed gets none) |
 | `qualify.done` | a qualification ended, with its speeds |
 
 `dgx-autonomy notify --follow` long-polls the `notifications` op and prints each line as
@@ -267,7 +321,7 @@ you> TEXT            a message to the planner; its reply is streamed
   throwaway reference app in `draft/reference/` (static files; fixed sample data
   instead of live APIs). The container then serves it on its own loopback, and every
   check must *pass* against it. This catches checks that no app could satisfy. On
-  hugo-dgx1 a planner wrote `getByLabel('Total')` next to a label "Per-Person
+  the DGX a planner wrote `getByLabel('Total')` next to a label "Per-Person
   Total", a strict-mode violation whatever the app does. The reference is not part
   of the agreement: it is not in the digest, it is never frozen, and the builder
   never sees it. The result goes to the operator, and to the planner as context (it
@@ -288,7 +342,7 @@ accepts a brief without checks; a planned run needs at least one automated check
 
 `--brief` takes a brief file, or a directory with `brief.md` and `checks/` (see
 [Acceptance checks](#acceptance-checks)). The CLI sends the contents, because the
-controller cannot read jim's files, together with the sha256 digest of what it read.
+controller cannot read `<user>`'s files, together with the sha256 digest of what it read.
 The controller freezes its own copy in `/var/lib/dgx-autonomy/runs/<id>/frozen/` and
 refuses the launch unless the digest of that copy matches. The agent sees it
 read-only at `/brief` (`/brief/brief.md`, `/brief/checks/`). The project the agent
@@ -327,7 +381,7 @@ controller created with `docker exec`, and the demo session. That includes what
 daemonized away from the Agent Server, such as the terminal tool's tmux server.
 
 **`pause()` alone does not end the tools' processes (Agent Server 1.49.4, measured
-on hugo-dgx1).** After `/interrupt` and `/pause` the conversation reported `paused`
+on the DGX).** After `/interrupt` and `/pause` the conversation reported `paused`
 right away. The foreground tool call was cancelled ("Tool call interrupted before
 completion"), but seven agent processes were still alive: the Agent Server (2),
 its openvscode-server (2), the tmux server, its bash, and a `nohup sleep 100000 &`
@@ -344,7 +398,7 @@ Port 3000 belongs to the demo. Before a demo starts, the sandbox ends whatever e
 listens on it and notes that in `demo.log`. The demo counts as listening only when a
 process of the demo session listens on the port on an address the evaluator and the
 tunnel can reach (not loopback). Otherwise `status` says what holds the port. Found on
-hugo-dgx1: the agent's own `python3 -m http.server 3000 --bind 127.0.0.1` outlived its
+the DGX: the agent's own `python3 -m http.server 3000 --bind 127.0.0.1` outlived its
 conversation. The relaunched demo could not bind, the port looked busy, and all seven
 checks of the first claim failed against an app no evaluator could reach.
 
@@ -487,15 +541,19 @@ its sandbox, its demo and its project stay; the conversation is replaced.
 | trigger | when |
 |---|---|
 | `stuck` | the SDK's stuck detector fired (repeating actions or errors, monologue) |
-| `errors` | the conversation errored again after 3 nudges within an hour (the nudges wait 30 s, 60 s, 120 s) |
-| `context` | its latest LLM request used 85% of the model's context |
+| `errors` | the conversation errored again after 3 nudges within an hour (the first nudge at once, the second at least 30 s later, the third at least 60 s after that) |
+| `context` | its latest LLM request used the lower of 85% of the model's context and `ctx − max_output_tokens − 16384` tokens (room for a full response). For Qwen3.8-Flash-Next (262,144 context, 65,536 output) that is 180,224 tokens, about 69% |
 | `failures` | 3 completion claims in a row failed the acceptance checks |
 | `blocked-review` | the builder declared itself blocked (see below) |
 | `forced` | `dgx-autonomy rollover RUN_ID` |
 
-A conversation that errors or gets stuck no longer fails the run. Only the deadline,
-a stop, or a confirmed blocker end a run. Rollovers for `context` and `failures` are
-at least 10 minutes apart; for `stuck` and `errors`, at least 1 minute.
+A conversation that errors or gets stuck no longer fails the run. Once a run is
+running, only the deadline, a stop, or a confirmed blocker end it. Before that, a
+launch step that fails (loading the model, creating the sandbox, starting the
+conversation) ends the run as `failed`, with the error on the step in `status`. No
+`run.ended` notification is sent for that, so check `status` after a launch.
+Rollovers for `context` and `failures` are at least 10 minutes apart; for `stuck` and
+`errors`, at least 1 minute.
 
 A rollover, one controller tick at a time, each step durable (`conversations` table):
 
@@ -508,7 +566,7 @@ A rollover, one controller tick at a time, each step durable (`conversations` ta
    evaluation that exists. A `done` item must name evidence. A `verified` field is
    refused: the environment records verified results itself.
    A builder that keeps working instead is reminded (same request id) after every 3
-   actions that are not `write_handoff` calls, up to 3 requests in all. On hugo-dgx1 a
+   actions that are not `write_handoff` calls, up to 3 requests in all. On the DGX a
    builder at 226K tokens ignored the request for 43 minutes; the first reminder got
    its handoff within a minute.
 2. **Checkpoint.** A valid handoff becomes a checkpoint (`agent_handoff`). If none
@@ -597,7 +655,7 @@ two bridges:
 - **allowed:** the internet, other containers on the same bridge (the model), and
   replies to connections the host opened (the controller, the demo's loopback port);
 - **rejected at once:** every address of the DGX itself (Docker gateways,
-  its LAN and tailnet addresses: sshd, open-webui, anything on `0.0.0.0`), the
+  its LAN and tailnet addresses: sshd and anything else on `0.0.0.0`), the
   LAN, the tailnet (`100.64.0.0/10`, `fd7a:…`), other Docker networks, link-local
   and multicast.
 
@@ -619,9 +677,10 @@ internet was, and host-to-demo still worked.
 
 ### The inference reservation
 
-`claude-qwen` (`/etc/systemd/system/claude-qwen.service`, as jim, `Restart=always`,
-enabled) serves Qwen3.8-27B Q8 on `127.0.0.1:8090` and uses about 37 GB. Larger
-models for the environment only fit after it is displaced. That is
+`claude-qwen` (`/etc/systemd/system/claude-qwen.service`, as `<user>`,
+`Restart=always`, enabled) is another model service on the DGX. It serves a dense
+27B model on a loopback port and uses about 37 GB. Larger models for the environment
+only fit after it is displaced. That is
 operator-authorized, and only for this service.
 
 `dgx-autonomy reserve` runs `sudo -n /usr/local/sbin/dgx-autonomy-reservation
@@ -640,14 +699,17 @@ reserve`, which:
    environment", as an Anthropic error for `/v1/messages` and an OpenAI error for
    everything else.
 
-Then the CLI starts the owned llama-server. Finishing, failing or expiring a run
+Then the CLI starts the owned model server, unless `--no-inference` is given (a
+launch or a qualification starts it anyway). Finishing, failing or expiring a run
 does not release anything by itself. `dgx-autonomy release --after RUN_ID --detach`
-arranges it: a systemd user unit (`dgx-autonomy-release-after@RUN_ID`, jim lingers)
-waits until the run has ended, then releases, and tries again every 5 minutes while
-the release is refused. It needs neither the SSH session nor the laptop, and a DGX
-restart starts the wait again. Without `--detach` the same wait runs in the terminal.
-On hugo-dgx1, `claude-qwen` stayed displaced for 12 hours after the runs it was
-displaced for had ended.
+arranges it: a systemd user unit (`dgx-autonomy-release-after@RUN_ID`) waits until
+the run has ended, then releases, and tries again every 5 minutes while the release
+is refused. It needs neither the SSH session nor the laptop, and a DGX restart starts
+the wait again. That needs lingering for `<user>` (setup step 5): without it, the
+unit stops when `<user>`'s last session ends and does not start at boot. Without
+`--detach` the same wait runs in the terminal. On the DGX, before this existed,
+`claude-qwen` stayed displaced for 12 hours after the runs it was displaced for had
+ended.
 
 `dgx-autonomy release` removes the owned llama-server. The controller refuses while
 a run is active. The CLI then runs the helper's `release`, which **refuses, and
@@ -658,7 +720,7 @@ restores the prior enabled state, starts the service if it was running, and wait
 for `/health`. Differences are reported, not overwritten: someone else made them. The
 record is archived under `reservation/released/`.
 
-The sudoers entry (`host/sudoers-autonomy`) lets jim run exactly `reserve`,
+The sudoers entry (`host/sudoers-autonomy`) lets `<user>` run exactly `reserve`,
 `release` and `status`. The helper is a root-owned, standard-library-only copy of
 `src/dgx_autonomy/reservation.py`, run with `python3 -I`, and it takes no options.
 
@@ -702,7 +764,7 @@ checks are manual (`tests/dgx/test_reboot.md`). The reservation test runs only w
 
 ```text
 /var/lib/dgx-autonomy/            controller-owned (root), mounted at the same path in the controller
-  control/control.sock            0600, owned by jim
+  control/control.sock            0600, owned by <user>
   state/controller.sqlite3        runs, operations, demos, recoveries, criteria, evaluations,
                                   reviews, plans, conversations, checkpoints
                                   (never mounted into agent, inference or evaluator)
@@ -711,6 +773,8 @@ checks are manual (`tests/dgx/test_reboot.md`). The reservation test runs only w
   reservation/record.json         present while claude-qwen is displaced (host helper)
   reservation/prior/              the unit text and `systemctl cat` before reserve
   qualification/<model>/<t>.json  model qualification: steps, measurements, memory samples
+  inference/ple/                  SGLang's N-gram table file (47.7 GiB), rewritten at each start
+  inference/cache/                SGLang's JIT and compile caches
   runs/<id>/frozen/               the agreement, frozen at launch; read-only at /brief in the agent
     brief.md, checks/, manifest.json   (checks/ is also read-only at /checks in evaluators)
   runs/<id>/evidence/eval-<n>/    evaluation evidence (controller-owned; never mounted into the agent)
@@ -728,13 +792,15 @@ checks are manual (`tests/dgx/test_reboot.md`). The reservation test runs only w
                                   once the Agent Server is gone
     .dgx/                         start_demo, write_handoff and declare_blocked requests;
                                   the demo's log
-/home/jim/models/                 GGUFs, mounted read-only into inference at /models
+/home/<user>/models/              GGUFs and the NVFP4 checkpoint, mounted read-only into
+                                  inference at /models
 ```
 
 ## Development
 
+From the repository root:
+
 ```bash
-cd autonomy
 uv sync
 uv run ruff check && uv run ruff format --check
 uv run mypy src
@@ -745,15 +811,15 @@ Target-host smoke tests (on the DGX, controller running, model downloaded). `uv`
 not on the non-interactive SSH PATH, so call it by its full path:
 
 ```bash
-ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_tool_calls.py tests/dgx/test_trivial_run.py'
-ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_stop_retains_demo.py -s'
-ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_egress.py'
-ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_controller_kill.py -s'
-ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_protected_eval.py -s'
-ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_plan_to_launch.py -s'
-ssh hugo-dgx1 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_forced_reset.py -s'
-# stops claude-qwen for a few minutes; opt in explicitly:
-ssh hugo-dgx1 'cd ~/dgx-autonomy && DGX_AUTONOMY_RESERVATION_TEST=1 ~/.local/bin/uv run pytest -m dgx tests/dgx/test_reserve_release.py -s'
+ssh <dgx> 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_tool_calls.py tests/dgx/test_trivial_run.py'
+ssh <dgx> 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_stop_retains_demo.py -s'
+ssh <dgx> 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_egress.py'
+ssh <dgx> 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_controller_kill.py -s'
+ssh <dgx> 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_protected_eval.py -s'
+ssh <dgx> 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_plan_to_launch.py -s'
+ssh <dgx> 'cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx/test_forced_reset.py -s'
+# stops claude-qwen for a few seconds; opt in explicitly:
+ssh <dgx> 'cd ~/dgx-autonomy && DGX_AUTONOMY_RESERVATION_TEST=1 ~/.local/bin/uv run pytest -m dgx tests/dgx/test_reserve_release.py -s'
 ```
 
 `test_stop_retains_demo.py` takes about 6 minutes (a 0.1 h budget). With `-s` it

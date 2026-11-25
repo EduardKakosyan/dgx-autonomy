@@ -2,6 +2,8 @@
 type: research-questions
 ---
 
+> **Historical record.** These are the research questions as written on 2026-09-22, before building started, kept as a record. [README.md](../../README.md) and [docs/operator-manual.md](../operator-manual.md) describe what was built.
+
 # Research Questions
 
 1. What environment actually exists on `dgx-1`, and what access and resource constraints apply? Through read-only SSH inspection, record OS/kernel/architecture, NVIDIA driver and CUDA toolkit, unified-memory availability and measurement caveats, storage/filesystems, Docker/Compose/runtime configuration and permissions, Python/venv/uv, Git, Node/npm, active services, development-directory conventions, and existing llama.cpp installations or NVIDIA-specific optimizations. Which findings come from direct inspection versus documentation, and which checks are blocked by permissions or unavailable tooling? Do not expose credentials or alter existing services.

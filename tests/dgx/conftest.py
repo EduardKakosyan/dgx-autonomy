@@ -1,10 +1,10 @@
-"""Target-host smoke tests. Run on hugo-dgx1 as the operator:
+"""Target-host smoke tests. Run on the DGX as the operator:
 
     cd ~/dgx-autonomy && ~/.local/bin/uv run pytest -m dgx tests/dgx
 
 They drive the real controller through its control socket, exactly as the CLI does,
-so they need the controller running (README, privileged setup) and the model files
-downloaded. They are deselected in CI with `-m "not dgx"`.
+so they need the controller running (docs/operator-manual.md, Operator setup) and
+the model files downloaded. They are deselected in CI with `-m "not dgx"`.
 """
 
 from __future__ import annotations

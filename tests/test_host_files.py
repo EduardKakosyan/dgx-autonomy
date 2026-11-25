@@ -53,11 +53,11 @@ def test_bridge_names_agree_between_compose_rules_and_settings() -> None:
     [
         "10.0.0.0/8",
         "172.16.0.0/12",
-        "192.168.0.0/16",  # the DGX's LAN, 192.168.50.0/24
+        "192.168.0.0/16",  # RFC 1918: the LAN
         "100.64.0.0/10",  # Tailscale, including 100.100.100.100
         "169.254.0.0/16",
         "127.0.0.0/8",
-        "fc00::/7",  # the LAN's fd21:… and Tailscale's fd7a:…
+        "fc00::/7",  # ULA: the LAN's ULA prefix and Tailscale's fd7a:…
         "fe80::/10",
         "::ffff:0.0.0.0/96",
     ],
