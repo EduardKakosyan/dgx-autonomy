@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the Phase 3 host pieces on the DGX. Run by the operator, with sudo, after
+# Install the host pieces on the DGX. Run by the operator, with sudo, after
 # reviewing every file in this directory:
 #
 #   sudo ~jim/dgx-autonomy/host/install.sh
@@ -57,7 +57,8 @@ sudo -u jim sudo -n -l /usr/local/sbin/dgx-autonomy-reservation status > /dev/nu
 cat <<'EOF'
 
 ==> The egress rules match the bridges by name (dgx-egress, dgx-internal). If the
-    compose networks predate those names, recreate them (README, operator setup step 6):
+    compose networks predate those names, recreate them (docs/operator-manual.md,
+    Operator setup, step 6):
 
       cd ~jim/dgx-autonomy/containers
       sudo docker ps -a --filter label=dgx-autonomy.role --format '{{.Names}}'  # review

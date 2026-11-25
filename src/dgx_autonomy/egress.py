@@ -87,7 +87,8 @@ def check_policy(settings: Settings, runtime: RuntimePort) -> PolicyCheck:
     except FileNotFoundError:
         problems.append(
             f"the host egress policy is not loaded (no {settings.egress_marker}); the"
-            " operator installs it with `sudo host/install.sh` (README, Phase 3)"
+            " operator installs it with `sudo host/install.sh` (docs/operator-manual.md,"
+            " Operator setup, step 2)"
         )
     except (OSError, ValueError) as exc:
         problems.append(f"cannot read {settings.egress_marker}: {exc}")
@@ -117,7 +118,8 @@ def check_policy(settings: Settings, runtime: RuntimePort) -> PolicyCheck:
         elif actual != expected:
             problems.append(
                 f"Docker network {network} uses bridge {actual!r}, not {expected!r}, so the"
-                " egress rules do not apply to it; recreate the compose networks (README)"
+                " egress rules do not apply to it; recreate the compose networks"
+                " (docs/operator-manual.md, Operator setup, step 6)"
             )
     return PolicyCheck(not problems, tuple(problems), marker, bridges)
 

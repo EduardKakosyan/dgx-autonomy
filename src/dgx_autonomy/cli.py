@@ -52,7 +52,8 @@ def reservation_helper(action: str, runner: HelperRunner = _run) -> dict[str, An
         detail = (proc.stderr or proc.stdout).strip()
         raise HelperError(
             f"cannot run the reservation helper ({detail or f'exit {proc.returncode}'})."
-            " The operator installs it with `sudo host/install.sh` (README, Phase 3)."
+            " The operator installs it with `sudo host/install.sh`"
+            " (docs/operator-manual.md, Operator setup, step 2)."
         ) from None
     if not isinstance(out, dict):
         raise HelperError(f"reservation helper: unexpected answer {out!r}")

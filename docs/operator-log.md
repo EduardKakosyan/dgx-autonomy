@@ -1,5 +1,7 @@
 # Governance log: unattended runs on the DGX
 
+> This is the build log from 2026-09-22 to 2026-09-29, kept as written apart from removed machine details and a few corrections. It ends mid-review: Camp Yahtzee's later review and release are recorded in [its own repo](https://github.com/EduardKakosyan/yahtzee). [README.md](../README.md) and [operator-manual.md](operator-manual.md) describe the environment as built.
+
 The operator's side of the experiments: what is in flight, and what the next session does. Update it at every hand-over.
 
 ## How to follow the DGX without polling
@@ -20,7 +22,7 @@ The operator's side of the experiments: what is in flight, and what the next ses
 ### 16:52 UTC
 
 - Still planning, 4 hours in. The planner never wrote `brief.md`. Its memory was condensed twice (16:23, 16:38) by OpenHands' 240-event default, and it began suspecting its files had been replaced. At 16:50 it was told exactly what is on disk and the order to finish in.
-- Fixed for every new conversation (commit bbb2d1f): only the context limit condenses. The running planner keeps its old condenser.
+- Fixed for every new conversation (commit a14d543): only the context limit condenses. The running planner keeps its old condenser.
 - The checks on disk: 7 carried-over specs (errors extended), `fixtures.ts`, `visual.ts`, and 8 new specs (contrast, background coverage, overflow, tap targets, theme persisted, theme follows system, loading skeleton, extended data). Reference app: `reference/index.html` (24 KB).
 
 ### 18:04 UTC: weather rebuild launched
@@ -35,7 +37,7 @@ The operator's side of the experiments: what is in flight, and what the next ses
 - Friction seen repeatedly: the terminal tool rejects heredocs ("Cannot execute multiple commands at once"). The builder then writes a helper file instead. It costs a turn each time, but the builder has not got stuck on it.
 - `dgx-autonomy logs RUN` shows only the first 200 events. For recent ones, use `--since N` (the run was at about 560 events).
 
-### 00:40 UTC: two environment changes (uncommitted, deployed)
+### 00:40 UTC: two environment changes (deployed; committed later in 39f2783)
 
 - **Heredoc fix** (`autonomy/src/dgx_autonomy/terminal_grouping.py`, loaded by the Agent Server with `--import-modules`). The cause was not heredocs as such. All 21 refusals in this run were a heredoc followed by a second line (write a file, then run it). OpenHands 1.49.4 refuses any input with more than one top-level statement on separate lines, and `&&` cannot follow a heredoc terminator. The module wraps such input in `{ ...\n}`, which runs in the same shell, line by line. Verified inside the rebuilt agent image's own bundle (tmux backend). **Only new sandboxes get it.** The weather run keeps its old image, including across its rollover.
 - **Operator review** (schema v7, controller restarted 00:33, DB backed up to `state/backup-pre-v7-*`). `dgx-autonomy hold RUN`: a claim that passes every check waits (`run.review` notice, marked `!!` in the feed) instead of finishing. The reservation stays. `dgx-autonomy feedback RUN FILE`: sends product direction (`OPERATOR FEEDBACK #n`); the builder works, then claims again and is re-evaluated. Kept in `runs/<id>/feedback.jsonl` and carried into rollover context. `dgx-autonomy accept RUN`: finishes as VERIFIED. **The weather run is held.**
@@ -72,7 +74,7 @@ The operator's side of the experiments: what is in flight, and what the next ses
 - Fixed a claim bug that SGLang exposed: long thoughts cut the finish action out of the 300-character event summary, so a stats update was taken as the claim. `_claim` now uses the event's tool name.
 - **Run `20260925-163449-24c587`**: qwen3.8-flash-next-sglang, from-run `20260924-180353-eabd48`, report `weather4-report.txt`, **held**, 12 h budget (deadline 2026-09-26 04:34 UTC). The frozen digest is identical to the original run's. `dgx-autonomy-release-after@20260925-163449-24c587` returns claude-qwen when it ends.
 - Retired the two qualification sandboxes. About 10 GiB is free with the run going. The heartbeat now reports free memory and flags `!!` below 6 GiB (`/tmp/dgx-heartbeat.py`; backup at `.bak`).
-- All the environment changes since 00:40 are deployed but **not committed**. That includes the heredoc grouping, review hold and feedback, handoff reminders, the SGLang backend, `--from-run` and the claim fix. 388 tests pass.
+- All the environment changes since 00:40 are deployed but **not committed** yet (they were committed on 2026-09-28 in 39f2783). That includes the heredoc grouping, review hold and feedback, handoff reminders, the SGLang backend, `--from-run` and the claim fix. 388 tests pass.
 
 ### 21:58 UTC: SGLang run's claim reviewed; feedback #2
 
@@ -174,7 +176,7 @@ The operator's side of the experiments: what is in flight, and what the next ses
 - The user accepted Shoreline and asked for two linked repos.
 - **`EduardKakosyan/dgx-autonomy`**: the loop.
   - The history of `autonomy/` was extracted with `git subtree split` (17 commits). On top: one commit with the environment changes that had not been committed (390 tests pass, identical to what is deployed on the DGX), then a README intro, a "Built in this loop" table (Shoreline, and Yahtzee next), `docs/operator-log.md` (this log) and `docs/design/`.
-  - The DGX's Tailscale IP is redacted in the docs.
+  - The DGX's private addresses were not yet removed from the docs at this point; that happened on 2026-11-24 (d69edde).
   - The hackathon repo itself is unchanged: the environment changes are still uncommitted there.
 - **`EduardKakosyan/shoreline`**: the app. The builder's 42 commits are unedited. One operator commit on top adds the README (built unattended; links back to the loop), `loop/runs/{1-weather-now,2-weather-now-polish,3-shoreline}` (frozen brief, checks and every operator message for each run) and screenshots, and stops tracking `node_modules`.
 - Both repos are **private** until the user decides to make them public. GitHub Pages for a live demo needs a public repo.
