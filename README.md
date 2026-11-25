@@ -92,7 +92,7 @@ When the builder finishes, the controller:
 1. **pins** the project in its own git store (not the builder's, whose hooks it doesn't trust);
 2. makes sure the demo serves exactly that snapshot;
 3. runs each frozen check in its own disposable, unprivileged evaluator container, against the live demo;
-4. snapshots again, and rejects the result if anything changed mid-test.
+4. snapshots again. If anything changed mid-test, the result is inconclusive: nothing is sent to the builder, and the same claim is evaluated again.
 
 If every required check passes, the run is **VERIFIED** (unless it is held for review; see below). Otherwise the builder receives each failure with the assertion's expected and received values, and keeps going.
 
